@@ -1,0 +1,330 @@
+x-zws-env: &zws-env
+  NODE_ENV: production
+  ZWS_RUNTIME: docker
+  HOME: /tmp
+  COREPACK_HOME: /tmp/corepack
+  XDG_CACHE_HOME: /tmp/.cache
+  ZWS_STARTUP_STRICT: ${ZWS_STARTUP_STRICT:-1}
+  DATABASE_MODE: ${DATABASE_MODE:-external}
+  DATABASE_TUNNEL_HOSTNAME: ${DATABASE_TUNNEL_HOSTNAME:-db.myrdphub.com}
+  DATABASE_TUNNEL_PORT: ${DATABASE_TUNNEL_PORT:-15432}
+  DATABASE_NAME: ${DATABASE_NAME:-zwscloud}
+  DATABASE_USER: ${DATABASE_USER:-zwscloud_app}
+  DATABASE_URL: ${DOCKER_DATABASE_URL:-${DATABASE_URL:-}}
+  EXTERNAL_DATABASE_URL: ${DOCKER_EXTERNAL_DATABASE_URL:-}
+  LOCAL_DATABASE_URL: ${DOCKER_LOCAL_DATABASE_URL:-}
+  POSTGRES_DB: ${POSTGRES_DB:-zwscloud}
+  POSTGRES_USER: ${POSTGRES_USER:-zwscloud_app}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-CHANGE_ME}
+  REDIS_URL: ${DOCKER_REDIS_URL:-redis://redis:6379/0}
+  SITE_DOMAIN: ${SITE_DOMAIN:-localhost}
+  APP_URL: ${APP_URL:-http://localhost}
+  NEXT_PUBLIC_APP_URL: ${NEXT_PUBLIC_APP_URL:-http://localhost}
+  NEXTAUTH_URL: ${NEXTAUTH_URL:-http://localhost}
+  NEXTAUTH_SECRET: ${NEXTAUTH_SECRET:-CHANGE_ME_BASE64}
+  ENCRYPTION_KEY: ${ENCRYPTION_KEY:-CHANGE_ME_32_BYTE_HEX}
+  MFA_ENCRYPTION_KEY: ${MFA_ENCRYPTION_KEY:-CHANGE_ME_32_BYTE_HEX}
+  WHATSAPP_PROVIDER: evolution
+  EVOLUTION_API_URL: ${EVOLUTION_API_URL:-}
+  EVOLUTION_INSTANCE: ${EVOLUTION_INSTANCE:-}
+  EVOLUTION_API_KEY: ${EVOLUTION_API_KEY:-}
+  EVOLUTION_INSTANCE_TOKEN: ${EVOLUTION_INSTANCE_TOKEN:-}
+  EVOLUTION_TEST_RECIPIENT: ${EVOLUTION_TEST_RECIPIENT:-}
+  VNC_PROXY_HOST: ${VNC_PROXY_HOST:-0.0.0.0}
+  VNC_PROXY_PORT: ${VNC_PROXY_PORT:-3001}
+  WORKER_HEALTH_PORT: ${WORKER_HEALTH_PORT:-3100}
+  SCHEDULER_HEALTH_PORT: ${SCHEDULER_HEALTH_PORT:-3101}
+  ZWS_BACKUP_DIR: /app/backups
+  ZWS_LOG_DIR: /app/logs
+  ZWS_UPLOAD_DIR: /app/uploads
+  DEPLOYMENT_REPORT_DIR: /app/deployment-reports
+  BROWSER_AUTOMATION_ENABLED: ${BROWSER_AUTOMATION_ENABLED:-1}
+  CLOUDFLARE_ONLY_MODE: ${CLOUDFLARE_ONLY_MODE:-false}
+  DIRECT_CLOUDFLARE_MODE: ${DIRECT_CLOUDFLARE_MODE:-false}
+  CF_TUNNEL_SERVICE: ${CF_TUNNEL_SERVICE:-http://app:3000}
+  PROXMOX_LIVE_SSE_POLL_MS: ${PROXMOX_LIVE_SSE_POLL_MS:-250}
+  PROXMOX_EVENT_WATCH_MS: ${PROXMOX_EVENT_WATCH_MS:-250}
+  PUPPETEER_EXECUTABLE_PATH: /usr/bin/chromium
+
+x-zws-logging: &zws-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "2"
+    compress: "true"
+
+x-zws-service: &zws-service
+  build:
+    context: .
+    target: runner
+    args:
+      APP_VERSION: ${APP_VERSION:-1.1.0}
+      APP_COMMIT: ${APP_COMMIT:-}
+      APP_SOURCE_DATE: ${APP_SOURCE_DATE:-}
+  image: zws-cloud:latest
+  restart: unless-stopped
+  mem_limit: 1g
+  logging: *zws-logging
+  env_file:
+    - path: .env
+      required: false
+  environment:
+    <<: *zws-env
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+  volumes:
+    - zws_logs:/app/logs
+    - zws_backups:/app/backups
+    - zws_reports:/app/deployment-reports
+    - zws_uploads:/app/uploads
+  depends_on:
+    redis:
+      condition: service_healthy
+    host-redis-proxy:
+      condition: service_started
+    migrate:
+      condition: service_completed_successfully
+  networks:
+    - zws
+
+services:
+  db-tunnel:
+    image: cloudflare/cloudflared:latest
+    profiles: ["db-tunnel"]
+    restart: unless-stopped
+    command:
+      - access
+      - tcp
+      - --hostname
+      - ${DATABASE_TUNNEL_HOSTNAME:-db.myrdphub.com}
+      - --url
+      - 0.0.0.0:${DATABASE_TUNNEL_PORT:-15432}
+    environment:
+      TUNNEL_SERVICE_TOKEN_ID: ${TUNNEL_SERVICE_TOKEN_ID:-}
+      TUNNEL_SERVICE_TOKEN_SECRET: ${TUNNEL_SERVICE_TOKEN_SECRET:-}
+    volumes:
+      - ${CLOUDFLARED_CONFIG_DIR:-/root/.cloudflared}:/home/nonroot/.cloudflared:ro
+    expose:
+      - "${DATABASE_TUNNEL_PORT:-15432}"
+    networks:
+      - zws
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    mem_limit: 256m
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "192mb", "--maxmemory-policy", "noeviction"]
+    logging: *zws-logging
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    networks:
+      - zws
+
+  host-db-proxy:
+    image: alpine/socat:1.8.0.3
+    restart: unless-stopped
+    mem_limit: 128m
+    logging: *zws-logging
+    network_mode: host
+    command:
+      - TCP-LISTEN:15432,bind=172.17.0.1,reuseaddr,fork
+      - TCP:127.0.0.1:5432
+
+  host-redis-proxy:
+    image: alpine/socat:1.8.0.3
+    restart: unless-stopped
+    mem_limit: 128m
+    logging: *zws-logging
+    network_mode: host
+    command:
+      - TCP-LISTEN:${HOST_REDIS_PROXY_PORT:-16379},bind=172.17.0.1,reuseaddr,fork
+      - TCP:127.0.0.1:6379
+
+  postgres:
+    image: postgres:17-alpine
+    profiles: ["local-db"]
+    restart: unless-stopped
+    mem_limit: 1g
+    logging: *zws-logging
+    command:
+      - postgres
+      - -c
+      - shared_buffers=128MB
+      - -c
+      - effective_cache_size=512MB
+      - -c
+      - maintenance_work_mem=32MB
+      - -c
+      - work_mem=2MB
+      - -c
+      - max_connections=90
+      - -c
+      - random_page_cost=1.1
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-zwscloud}
+      POSTGRES_USER: ${POSTGRES_USER:-zwscloud_app}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-CHANGE_ME}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-zwscloud_app} -d ${POSTGRES_DB:-zwscloud}"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+    networks:
+      - zws
+
+  migrate:
+    <<: *zws-service
+    restart: "no"
+    command: ["migrate"]
+    depends_on:
+      redis:
+        condition: service_healthy
+      host-db-proxy:
+        condition: service_started
+
+  app:
+    <<: *zws-service
+    command: ["app"]
+    mem_limit: 3g
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    environment:
+      <<: *zws-env
+      HOSTNAME: 0.0.0.0
+      NODE_OPTIONS: --max-old-space-size=2048 --max-semi-space-size=16
+    ports:
+      - "${APP_BIND_ADDRESS:-127.0.0.1}:${APP_HTTP_PORT:-13000}:3000"
+    expose:
+      - "3000"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3000/api/health | grep -qE '^(200|503)$'"]
+      interval: 20s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+
+  worker:
+    <<: *zws-service
+    command: ["worker"]
+    mem_limit: 3g
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    environment:
+      <<: *zws-env
+      NODE_OPTIONS: --max-old-space-size=384 --max-semi-space-size=8
+    ports:
+      - "${WORKER_BIND_ADDRESS:-127.0.0.1}:${VNC_PROXY_PUBLIC_PORT:-13001}:3001"
+      - "${WORKER_BIND_ADDRESS:-127.0.0.1}:${WORKER_HEALTH_PUBLIC_PORT:-13100}:3100"
+    expose:
+      - "3001"
+      - "3100"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:${WORKER_HEALTH_PORT:-3100}/api/health >/dev/null"]
+      interval: 20s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+
+  scheduler:
+    <<: *zws-service
+    command: ["scheduler"]
+    mem_limit: 1536m
+    environment:
+      <<: *zws-env
+      NODE_OPTIONS: --max-old-space-size=384 --max-semi-space-size=8
+    ports:
+      - "${SCHEDULER_BIND_ADDRESS:-127.0.0.1}:${SCHEDULER_HEALTH_PUBLIC_PORT:-13101}:3101"
+    expose:
+      - "3101"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:${SCHEDULER_HEALTH_PORT:-3101}/api/health >/dev/null"]
+      interval: 20s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+
+  backup:
+    <<: *zws-service
+    profiles: ["backup"]
+    restart: "no"
+    command: ["backup", "backup"]
+
+  self-test:
+    <<: *zws-service
+    profiles: ["self-test"]
+    restart: "no"
+    command: ["self-test"]
+    environment:
+      <<: *zws-env
+      SELF_TEST_BASE_URL: http://app:3000
+    depends_on:
+      app:
+        condition: service_healthy
+      worker:
+        condition: service_healthy
+      scheduler:
+        condition: service_healthy
+
+  nginx:
+    image: nginx:1.27-alpine
+    profiles: ["nginx"]
+    restart: unless-stopped
+    depends_on:
+      app:
+        condition: service_healthy
+      worker:
+        condition: service_healthy
+    ports:
+      - "${HTTP_PORT:-80}:80"
+      - "${HTTPS_PORT:-443}:443"
+    environment:
+      SITE_DOMAIN: ${SITE_DOMAIN:-localhost}
+    volumes:
+      - ./config/nginx/docker.conf:/etc/nginx/templates/default.conf.template:ro
+      - ${SSL_CERT_DIR:-./certs}:/etc/nginx/certs:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/api/health >/dev/null"]
+      interval: 20s
+      timeout: 10s
+      retries: 10
+    networks:
+      - zws
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    profiles: ["direct-cloudflare"]
+    restart: unless-stopped
+    command:
+      - tunnel
+      - --no-autoupdate
+      - run
+      - --token
+      - ${CF_TUNNEL_TOKEN:-}
+    depends_on:
+      app:
+        condition: service_healthy
+    networks:
+      - zws
+
+volumes:
+  postgres_data:
+  redis_data:
+  zws_logs:
+  zws_backups:
+  zws_reports:
+  zws_uploads:
+
+networks:
+  zws:
+    name: zws_network

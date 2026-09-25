@@ -1,0 +1,575 @@
+@import 'tailwindcss';
+@import 'tw-animate-css';
+@import '@xterm/xterm/css/xterm.css';
+@import 'react-phone-number-input/style.css';
+@import './theme.css';
+
+@custom-variant dark (&:is(.dark *));
+
+/*
+  UltraEdge Datacenter Theme
+  Visual System: Black/Navy + Cyan + White
+    1. Background: Deep Black (#05070B)
+    2. Card Surface: Dark Navy (#0C111A / #0F1622)
+    3. Border: Subtle Navy (#1B2635)
+    4. Text: White (#F8FAFC) / Muted (#CBD5E1) / Secondary (#94A3B8)
+    5. Accent: Cyan (#00D4FF) — Primary brand color
+  Green (#22C55E) reserved ONLY for status indicators.
+*/
+
+:root {
+  /* Base surfaces */
+  --background: var(--bg-primary);
+  --foreground: var(--text-primary);
+
+  --card: var(--surface-primary);
+  --card-foreground: var(--text-primary);
+
+  --popover: var(--surface-solid);
+  --popover-foreground: var(--text-primary);
+
+  /* Primary = deep black (for primary buttons on dark bg) */
+  --primary: #05070B;
+  --primary-foreground: #F8FAFC;
+
+  /* Secondary = dark navy */
+  --secondary: var(--bg-tertiary);
+  --secondary-foreground: var(--text-primary);
+
+  --muted: var(--bg-tertiary);
+  --muted-foreground: var(--text-muted);
+
+  /* Accent = cyan (brand) */
+  --accent: var(--accent-primary);
+  --accent-foreground: var(--text-selected);
+
+  --destructive: var(--danger);
+  --destructive-foreground: #FEE2E2;
+
+  --border: var(--border-primary);
+  --input: var(--border-primary);
+  --ring: var(--accent-primary);
+
+  --chart-1: oklch(0.72 0.14 180);
+  --chart-2: oklch(0.68 0.1 210);
+  --chart-3: oklch(0.6 0.08 240);
+  --chart-4: oklch(0.78 0.1 160);
+  --chart-5: oklch(0.55 0.05 260);
+
+  --radius: 0.625rem;
+
+  --sidebar: var(--bg-secondary);
+  --sidebar-foreground: var(--text-primary);
+  --sidebar-primary: var(--accent-primary);
+  --sidebar-primary-foreground: var(--text-selected);
+  --sidebar-accent: var(--accent-soft);
+  --sidebar-accent-foreground: var(--text-selected);
+  --sidebar-border: var(--border-primary);
+  --sidebar-ring: var(--border-focus);
+}
+
+@media print {
+  @page {
+    size: A4;
+    margin: 0;
+  }
+
+  html,
+  body {
+    background: #ffffff !important;
+  }
+
+  body * {
+    visibility: hidden !important;
+  }
+
+  .invoice-print-root,
+  .invoice-print-root *,
+  .recovery-codes-print-root,
+  .recovery-codes-print-root * {
+    visibility: visible !important;
+  }
+
+  .invoice-actions {
+    display: none !important;
+  }
+
+  .invoice-print-root,
+  .recovery-codes-print-root {
+    position: absolute !important;
+    inset: 0 auto auto 0 !important;
+    width: 100% !important;
+    min-height: 100vh !important;
+    color: #111111 !important;
+    background: #ffffff !important;
+  }
+
+  .recovery-codes-print-root {
+    display: block !important;
+    padding: 32px !important;
+    font-family: Arial, sans-serif !important;
+  }
+
+  .recovery-codes-print-root h1 {
+    margin: 0 0 8px !important;
+    font-size: 22px !important;
+    color: #111111 !important;
+  }
+
+  .recovery-codes-print-root p {
+    margin: 0 0 24px !important;
+    color: #333333 !important;
+  }
+
+  .recovery-codes-print-root div {
+    display: grid !important;
+    grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
+    gap: 10px !important;
+  }
+
+  .recovery-codes-print-root code {
+    display: block !important;
+    border: 1px solid #cccccc !important;
+    padding: 8px !important;
+    color: #111111 !important;
+    background: #ffffff !important;
+    font: 14px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace !important;
+  }
+}
+
+.dark {
+  --background: var(--bg-primary);
+  --foreground: var(--text-primary);
+  --card: var(--surface-primary);
+  --card-foreground: var(--text-primary);
+  --popover: var(--surface-solid);
+  --popover-foreground: var(--text-primary);
+  --primary: #05070B;
+  --primary-foreground: #F8FAFC;
+  --secondary: var(--bg-tertiary);
+  --secondary-foreground: var(--text-primary);
+  --muted: var(--bg-tertiary);
+  --muted-foreground: var(--text-muted);
+  --accent: var(--accent-primary);
+  --accent-foreground: var(--text-selected);
+  --destructive: var(--danger);
+  --destructive-foreground: #FEE2E2;
+  --border: var(--border-primary);
+  --input: var(--border-primary);
+  --ring: var(--accent-primary);
+}
+
+@theme inline {
+  --font-sans: var(--font-geist-sans), system-ui, sans-serif;
+  --font-mono: var(--font-geist-mono), ui-monospace, monospace;
+
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  html,
+  body {
+    width: 100%;
+    max-width: 100vw;
+    overflow-x: hidden;
+  }
+  body {
+    @apply bg-background text-foreground;
+    font-feature-settings: 'ss01', 'cv11';
+    font-weight: 450;
+    letter-spacing: 0.01em;
+  }
+  select {
+    color-scheme: dark;
+    max-width: 100%;
+  }
+  select option,
+  select optgroup {
+    background: var(--surface-solid);
+    color: var(--text-primary);
+  }
+  .skeleton-shimmer {
+    position: relative;
+    overflow: hidden;
+  }
+  .skeleton-shimmer::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    transform: translateX(-100%);
+    background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.08), transparent);
+    animation: zws-skeleton-shimmer 1.6s ease-in-out infinite;
+  }
+  @keyframes zws-skeleton-shimmer {
+    100% {
+      transform: translateX(100%);
+    }
+  }
+  html,
+  body,
+  #__next,
+  * {
+    scrollbar-width: none !important;
+    -ms-overflow-style: none !important;
+  }
+  body,
+  #__next {
+    width: 100%;
+    max-width: 100vw;
+    overflow-x: hidden;
+  }
+  *::-webkit-scrollbar {
+    width: 0 !important;
+    height: 0 !important;
+    display: none !important;
+    background: transparent !important;
+  }
+  html {
+    scroll-behavior: smooth;
+  }
+}
+
+/* Subtle grid background utility */
+@layer utilities {
+  .bg-grid {
+    background-image:
+      linear-gradient(to right, color-mix(in oklch, var(--border) 60%, transparent) 1px, transparent 1px),
+      linear-gradient(to bottom, color-mix(in oklch, var(--border) 60%, transparent) 1px, transparent 1px);
+    background-size: 48px 48px;
+  }
+  .bg-dot {
+    background-image: radial-gradient(
+      color-mix(in oklch, var(--border) 80%, transparent) 1px,
+      transparent 1px
+    );
+    background-size: 20px 20px;
+  }
+  .mask-fade-b {
+    -webkit-mask-image: linear-gradient(to bottom, black 40%, transparent 100%);
+            mask-image: linear-gradient(to bottom, black 40%, transparent 100%);
+  }
+
+  .hide-scrollbar {
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+  }
+
+  .hide-scrollbar::-webkit-scrollbar {
+    display: none;
+    width: 0;
+    height: 0;
+  }
+
+  .interactive-layer {
+    position: relative;
+    z-index: 10;
+    pointer-events: auto;
+  }
+
+  .decorative-layer,
+  .decorative-layer *,
+  [data-decorative-layer],
+  [data-decorative-layer] *,
+  [data-panel-background-root],
+  [data-panel-background-root] * {
+    pointer-events: none !important;
+  }
+
+  .admin-shell {
+    position: relative;
+    display: flex;
+    width: 100%;
+    max-width: 100vw;
+    height: 100dvh;
+    min-width: 0;
+    min-height: 0;
+    overflow: hidden;
+    background: var(--background);
+    pointer-events: auto;
+  }
+
+  .admin-main {
+    position: relative;
+    display: flex;
+    flex: 1 1 0%;
+    width: 100%;
+    max-width: 100%;
+    height: 100dvh;
+    min-width: 0;
+    min-height: 0;
+    flex-direction: column;
+    overflow: hidden;
+    pointer-events: auto;
+  }
+
+  .admin-page-scroll {
+    position: relative;
+    flex: 1 1 0%;
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
+    min-height: 0;
+    overflow-y: auto;
+    overflow-x: hidden;
+    overscroll-behavior-x: none;
+    overscroll-behavior-y: auto;
+    -webkit-overflow-scrolling: touch;
+    pointer-events: auto;
+  }
+
+  .page-container {
+    width: 100%;
+    max-width: 100vw;
+    min-width: 0;
+    overflow-x: hidden;
+  }
+
+  .zws-phone-input {
+    display: flex;
+    min-width: 0;
+    width: 100%;
+    flex: 1 1 0%;
+    overflow: visible;
+  }
+
+  .zws-phone-input .PhoneInputCountry {
+    display: none;
+  }
+
+  .zws-phone-input .PhoneInputInput {
+    min-width: 0;
+    width: 100%;
+    height: 44px;
+    border-radius: 0.375rem;
+    border: 1px solid var(--border-primary);
+    background: var(--surface-primary);
+    padding: 0.5rem 0.75rem;
+    color: var(--text-primary);
+    outline: none;
+    overflow: visible;
+    text-overflow: clip;
+    box-shadow: 0 1px 2px 0 rgb(0 0 0 / 0.05);
+    transition: border-color 150ms ease, box-shadow 150ms ease, background 150ms ease;
+  }
+
+  .dark .zws-phone-input .PhoneInputInput {
+    background: var(--surface-primary);
+  }
+
+  .zws-phone-input .PhoneInputInput::placeholder {
+    color: var(--text-placeholder);
+  }
+
+  .zws-phone-input .PhoneInputInput:focus {
+    border-color: var(--accent-primary);
+    box-shadow: 0 0 0 3px rgba(0, 212, 255, 0.12);
+  }
+
+  .zws-phone-input .PhoneInputInput:disabled {
+    cursor: not-allowed;
+    opacity: 0.75;
+  }
+
+  .zws-phone-input .PhoneInputCountryIcon {
+    width: 1.125rem;
+    height: 1.125rem;
+    border-radius: 999px;
+    overflow: hidden;
+    box-shadow: none;
+    filter: none !important;
+  }
+
+  .zws-phone-country-trigger {
+    height: 44px;
+    width: 100%;
+    border-color: var(--border-primary) !important;
+    background: var(--surface-primary) !important;
+    color: var(--text-primary) !important;
+  }
+
+  @media (min-width: 640px) {
+    .zws-phone-country-trigger {
+      width: 108px !important;
+      min-width: 108px !important;
+      max-width: 108px !important;
+    }
+  }
+
+  .zws-phone-country-trigger svg,
+  .zws-phone-country-trigger img {
+    filter: none !important;
+  }
+
+  /*
+    Glassmorphism surfaces — the core visual primitive for cards across
+    The cloud UI sits over the global interactive dot field and keeps a
+    consistent premium feel (soft border, blurred backdrop, subtle top
+    highlight and accent glow on hover).
+  */
+  .glass {
+    background: var(--surface-primary);
+    border: 1px solid var(--border-primary);
+    backdrop-filter: blur(12px) saturate(112%);
+    -webkit-backdrop-filter: blur(12px) saturate(112%);
+    box-shadow:
+      0 1px 0 0 rgba(255, 255, 255, 0.03) inset,
+      0 0 0 1px rgba(255, 255, 255, 0.01) inset,
+      0 30px 60px -30px rgba(0, 0, 0, 0.5);
+    transition:
+      border-color 220ms ease,
+      box-shadow 260ms ease,
+      transform 260ms ease;
+  }
+  .glass-hover:hover {
+    border-color: var(--border-hover);
+    box-shadow:
+      0 1px 0 0 rgba(255, 255, 255, 0.04) inset,
+      0 0 0 1px rgba(255, 255, 255, 0.015) inset,
+      0 30px 60px -30px rgba(0, 0, 0, 0.55);
+  }
+  .glass-strong {
+    background: var(--surface-solid);
+    border: 1px solid var(--border-primary);
+    backdrop-filter: blur(16px) saturate(112%);
+    -webkit-backdrop-filter: blur(16px) saturate(112%);
+    box-shadow:
+      0 1px 0 0 rgba(255, 255, 255, 0.04) inset,
+      0 40px 80px -32px rgba(0, 0, 0, 0.6);
+  }
+
+  .cms-editor-content h1 {
+    font-size: 2rem;
+    font-weight: 700;
+    line-height: 1.2;
+  }
+
+  .cms-editor-content h2 {
+    font-size: 1.5rem;
+    font-weight: 650;
+    line-height: 1.25;
+  }
+
+  .cms-editor-content p,
+  .cms-editor-content li {
+    color: var(--text-secondary);
+    line-height: 1.75;
+  }
+
+  .cms-editor-content blockquote {
+    border-left: 3px solid var(--accent-primary);
+    padding-left: 1rem;
+    color: var(--text-muted);
+  }
+
+  .cms-editor-content pre {
+    overflow: auto;
+    border-radius: 0.5rem;
+    background: var(--bg-primary);
+    padding: 1rem;
+  }
+
+  .cms-editor-content table {
+    width: 100%;
+    border-collapse: collapse;
+  }
+
+  .cms-editor-content th,
+  .cms-editor-content td {
+    border: 1px solid var(--border-primary);
+    padding: 0.5rem;
+  }
+
+  /* Faint accent glow halo (used sparingly behind primary surfaces). */
+  .accent-glow::before {
+    content: "";
+    position: absolute;
+    inset: -1px;
+    border-radius: inherit;
+    padding: 1px;
+    background: linear-gradient(
+      135deg,
+      rgba(0, 212, 255, 0.18),
+      transparent 40%,
+      rgba(0, 212, 255, 0.08) 80%
+    );
+    -webkit-mask:
+      linear-gradient(#000 0 0) content-box,
+      linear-gradient(#000 0 0);
+    -webkit-mask-composite: xor;
+            mask-composite: exclude;
+    pointer-events: none;
+    opacity: 0.35;
+  }
+
+  /* Cursor blink for terminal lines. */
+  @keyframes blink {
+    0%, 49% { opacity: 1; }
+    50%, 100% { opacity: 0; }
+  }
+  .caret-blink {
+    animation: blink 1.05s steps(1) infinite;
+  }
+
+  /* Live status dot pulse. */
+  @keyframes soft-pulse {
+    0%, 100% { opacity: 0.55; transform: scale(1); }
+    50% { opacity: 1; transform: scale(1.25); }
+  }
+  .status-pulse {
+    animation: soft-pulse 1.8s ease-in-out infinite;
+  }
+
+  /* Row-fade-in used by terminal log lines. */
+  @keyframes row-in {
+    from { opacity: 0; transform: translateY(2px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+  .row-in {
+    animation: row-in 240ms ease-out both;
+  }
+
+  /* Indeterminate progress bar (no real progress known -> keep animating). */
+  @keyframes operation-indeterminate {
+    0% { transform: translateX(-120%); }
+    60% { transform: translateX(220%); }
+    100% { transform: translateX(220%); }
+  }
+}

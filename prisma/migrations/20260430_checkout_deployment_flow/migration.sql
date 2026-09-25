@@ -1,0 +1,11 @@
+ALTER TABLE "products"
+  ADD COLUMN IF NOT EXISTS "price36m" DECIMAL(10,2);
+
+ALTER TABLE "products"
+  ALTER COLUMN "billingTerms" SET DEFAULT '[1, 3, 6, 12, 24, 36]';
+
+ALTER TABLE "os_templates"
+  ADD COLUMN IF NOT EXISTS "osVersion" TEXT,
+  ADD COLUMN IF NOT EXISTS "defaultUsername" TEXT DEFAULT 'root',
+  ADD COLUMN IF NOT EXISTS "isRecommended" BOOLEAN NOT NULL DEFAULT false,
+  ADD COLUMN IF NOT EXISTS "eolWarningText" TEXT;

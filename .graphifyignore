@@ -1,0 +1,11 @@
+.git/
+.next/
+node_modules/
+dist/
+coverage/
+graphify-out/
+
+# Secrets and local env files
+.env
+.env.*
+!.env.example

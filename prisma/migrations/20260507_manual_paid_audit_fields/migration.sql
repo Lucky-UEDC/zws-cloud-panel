@@ -1,0 +1,4 @@
+ALTER TABLE "invoices"
+  ADD COLUMN IF NOT EXISTS "manualProcessedBy" TEXT,
+  ADD COLUMN IF NOT EXISTS "manualProcessedAt" TIMESTAMP(3),
+  ADD COLUMN IF NOT EXISTS "manualReason" TEXT;

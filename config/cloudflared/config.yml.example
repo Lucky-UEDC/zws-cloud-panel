@@ -1,0 +1,9 @@
+tunnel: <UUID>
+credentials-file: /root/.cloudflared/<UUID>.json
+
+ingress:
+  - hostname: ${SITE_DOMAIN}
+    service: http://127.0.0.1:${PORT}
+  - hostname: www.${SITE_DOMAIN}
+    service: http://127.0.0.1:${PORT}
+  - service: http_status:404

@@ -1,0 +1,1 @@
+import "./docker-self-test"

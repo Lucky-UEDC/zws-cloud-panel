@@ -1,0 +1,4 @@
+backups/**/*.zip filter=lfs diff=lfs merge=lfs -text
+backups/**/*.sql filter=lfs diff=lfs merge=lfs -text
+backups/**/*.sql.gz filter=lfs diff=lfs merge=lfs -text
+node_modules/**/*.node filter=lfs diff=lfs merge=lfs -text

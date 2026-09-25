@@ -1,0 +1,7 @@
+ALTER TABLE "os_templates"
+  ADD COLUMN IF NOT EXISTS "consoleType" TEXT NOT NULL DEFAULT 'auto';
+
+ALTER TABLE "vps_instances"
+  ADD COLUMN IF NOT EXISTS "consoleType" TEXT NOT NULL DEFAULT 'auto',
+  ADD COLUMN IF NOT EXISTS "consoleEndpoint" TEXT,
+  ADD COLUMN IF NOT EXISTS "vmOsFamily" TEXT;

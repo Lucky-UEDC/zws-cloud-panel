@@ -1,0 +1,9 @@
+/var/www/zws/logs/*.log {
+  daily
+  rotate 14
+  compress
+  delaycompress
+  missingok
+  notifempty
+  copytruncate
+}

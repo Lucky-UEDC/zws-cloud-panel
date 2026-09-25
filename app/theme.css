@@ -1,0 +1,235 @@
+/*
+  UltraEdge Datacenter enterprise dark theme.
+  Black/Navy + Cyan + White visual system.
+  Green reserved ONLY for status indicators (Available, Online, Active, Success, In Stock, Operational).
+*/
+
+:root {
+  --bg-primary: #05070B;
+  --bg-secondary: #080C12;
+  --bg-tertiary: #0C111A;
+
+  --surface-primary: #0F1622;
+  --surface-solid: #0C111A;
+  --surface-hover: rgba(0, 212, 255, 0.12);
+  --surface-subtle: rgba(255, 255, 255, 0.03);
+  --surface-selected: linear-gradient(90deg, rgba(0, 212, 255, 0.18), rgba(0, 212, 255, 0.08));
+
+  --border-primary: #1B2635;
+  --border-hover: #2A3A4A;
+  --border-focus: rgba(0, 212, 255, 0.45);
+  --border-selected: rgba(0, 212, 255, 0.28);
+
+  --text-primary: #F8FAFC;
+  --text-secondary: #CBD5E1;
+  --text-muted: #94A3B8;
+  --text-placeholder: #64748B;
+  --text-selected: #E0F7FF;
+  --text-selected-secondary: #A5F3FC;
+
+  --accent-primary: #00D4FF;
+  --accent-hover: #00B8E0;
+  --accent-soft: rgba(0, 212, 255, 0.18);
+  --accent-hover-soft: rgba(0, 212, 255, 0.22);
+  --accent-subtle: rgba(0, 212, 255, 0.10);
+
+  --success: #22C55E;
+  --success-soft: rgba(34, 197, 94, 0.12);
+
+  --danger: #EF4444;
+  --danger-soft: rgba(239, 68, 68, 0.12);
+
+  --warning: #F59E0B;
+  --warning-soft: rgba(245, 158, 11, 0.12);
+
+  --shadow-dropdown:
+    0 10px 30px rgba(0, 0, 0, 0.5),
+    0 0 0 1px rgba(0, 212, 255, 0.02);
+  --shadow-surface: 0 24px 60px -36px rgba(0, 0, 0, 0.7);
+
+  --background: var(--bg-primary);
+  --foreground: var(--text-primary);
+  --card: var(--surface-primary);
+  --card-foreground: var(--text-primary);
+  --popover: var(--surface-solid);
+  --popover-foreground: var(--text-primary);
+  --primary: #05070B;
+  --primary-foreground: #F8FAFC;
+  --secondary: var(--bg-tertiary);
+  --secondary-foreground: var(--text-primary);
+  --muted: var(--bg-tertiary);
+  --muted-foreground: var(--text-muted);
+  --accent: var(--accent-primary);
+  --accent-foreground: var(--text-selected);
+  --destructive: var(--danger);
+  --destructive-foreground: #FEE2E2;
+  --border: var(--border-primary);
+  --input: var(--border-primary);
+  --ring: var(--accent-primary);
+
+  --sidebar: var(--bg-secondary);
+  --sidebar-foreground: var(--text-primary);
+  --sidebar-primary: var(--accent-primary);
+  --sidebar-primary-foreground: var(--text-selected);
+  --sidebar-accent: var(--accent-soft);
+  --sidebar-accent-foreground: var(--text-selected);
+  --sidebar-border: var(--border-primary);
+  --sidebar-ring: var(--border-focus);
+}
+
+.dark {
+  --background: var(--bg-primary);
+  --foreground: var(--text-primary);
+  --card: var(--surface-primary);
+  --card-foreground: var(--text-primary);
+  --popover: var(--surface-solid);
+  --popover-foreground: var(--text-primary);
+  --primary: #05070B;
+  --primary-foreground: #F8FAFC;
+  --secondary: var(--bg-tertiary);
+  --secondary-foreground: var(--text-primary);
+  --muted: var(--bg-tertiary);
+  --muted-foreground: var(--text-muted);
+  --accent: var(--accent-primary);
+  --accent-foreground: var(--text-selected);
+  --destructive: var(--danger);
+  --destructive-foreground: #FEE2E2;
+  --border: var(--border-primary);
+  --input: var(--border-primary);
+  --ring: var(--accent-primary);
+}
+
+@theme inline {
+  --color-surface: var(--surface-primary);
+  --color-surface-hover: var(--surface-hover);
+  --color-surface-solid: var(--surface-solid);
+  --color-border-default: var(--border-primary);
+  --color-border-focus: var(--border-focus);
+  --color-accent-primary: var(--accent-primary);
+  --color-accent-soft: var(--accent-soft);
+  --color-success: var(--success);
+  --color-success-soft: var(--success-soft);
+}
+
+@layer utilities {
+  .surface-card {
+    background:
+      linear-gradient(
+        180deg,
+        rgba(15, 22, 34, 0.95),
+        rgba(10, 14, 20, 0.98)
+      );
+    border-color: var(--border-primary);
+  }
+
+  .selected-item {
+    background: rgba(0, 212, 255, 0.18);
+    border-color: rgba(0, 212, 255, 0.35);
+    color: var(--text-selected);
+    backdrop-filter: blur(18px) saturate(1.25);
+    -webkit-backdrop-filter: blur(18px) saturate(1.25);
+  }
+
+  .dropdown-surface {
+    width: max-content;
+    min-width: min(var(--radix-select-trigger-width, var(--radix-dropdown-menu-trigger-width, 8rem)), calc(100vw - 1rem));
+    max-width: min(calc(100vw - env(safe-area-inset-left) - env(safe-area-inset-right) - 1rem), var(--radix-popper-available-width, 36rem));
+    max-height: min(calc(100dvh - env(safe-area-inset-top) - env(safe-area-inset-bottom) - 1rem), var(--radix-select-content-available-height, var(--radix-dropdown-menu-content-available-height, var(--radix-popover-content-available-height, 28rem))));
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    -webkit-overflow-scrolling: touch;
+    background:
+      linear-gradient(180deg, rgba(15, 22, 34, 0.92), rgba(8, 12, 18, 0.88)),
+      rgba(8, 12, 18, 0.92);
+    color: var(--text-primary);
+    border-color: var(--border-primary);
+    box-shadow:
+      0 18px 56px rgba(0, 0, 0, 0.6),
+      0 0 0 1px rgba(0, 212, 255, 0.06),
+      inset 0 1px 0 rgba(255, 255, 255, 0.05);
+    backdrop-filter: blur(28px) saturate(1.45);
+    -webkit-backdrop-filter: blur(28px) saturate(1.45);
+    transform-origin: var(--radix-select-content-transform-origin, var(--radix-dropdown-menu-content-transform-origin, center));
+    animation-duration: 220ms;
+    animation-timing-function: cubic-bezier(0.2, 0.8, 0.2, 1);
+    transition: background-color 180ms ease, border-color 180ms ease, box-shadow 180ms ease, opacity 180ms ease, transform 180ms ease;
+    will-change: transform, opacity, filter;
+  }
+
+  .dropdown-surface * {
+    border-color: var(--border-primary);
+  }
+
+  .dropdown-surface [role="option"]:hover,
+  .dropdown-surface [role="menuitem"]:hover,
+  .dropdown-surface [role="menuitemcheckbox"]:hover,
+  .dropdown-surface [role="menuitemradio"]:hover {
+    background: rgba(0, 212, 255, 0.12);
+    color: var(--text-primary);
+    transition: background-color 160ms ease, color 160ms ease;
+  }
+
+  .liquid-native-select {
+    min-width: 0;
+    appearance: none;
+    border-radius: 0.5rem;
+    border: 1px solid var(--border-primary);
+    background:
+      linear-gradient(45deg, transparent 50%, rgba(248, 250, 252, 0.82) 50%) calc(100% - 18px) 50% / 6px 6px no-repeat,
+      linear-gradient(135deg, rgba(248, 250, 252, 0.82) 50%, transparent 50%) calc(100% - 13px) 50% / 6px 6px no-repeat,
+      var(--surface-solid);
+    color: var(--text-primary);
+    padding: 0 2.25rem 0 0.75rem;
+    box-shadow:
+      0 8px 32px rgba(0, 0, 0, 0.3),
+      inset 0 1px 0 rgba(255, 255, 255, 0.04);
+    backdrop-filter: blur(28px) saturate(1.35);
+    -webkit-backdrop-filter: blur(28px) saturate(1.35);
+    transition: border-color 180ms ease, background-color 180ms ease, box-shadow 180ms ease;
+  }
+
+  .liquid-native-select:focus {
+    outline: none;
+    border-color: var(--border-focus);
+    box-shadow:
+      0 0 0 3px rgba(0, 212, 255, 0.12),
+      0 8px 32px rgba(0, 0, 0, 0.4),
+      inset 0 1px 0 rgba(255, 255, 255, 0.04);
+  }
+
+  .liquid-native-select option {
+    background: var(--surface-solid);
+    color: var(--text-primary);
+  }
+
+  select:not([data-slot]) {
+    max-width: 100%;
+    color: var(--text-primary);
+    background-color: var(--surface-primary);
+  }
+
+  select:not([data-slot]) option {
+    background: var(--surface-solid);
+    color: var(--text-primary);
+  }
+
+  .soft-focus-ring {
+    outline: 2px solid var(--border-focus);
+    outline-offset: 2px;
+  }
+
+  .success-badge {
+    background: var(--success-soft);
+    border-color: rgba(34, 197, 94, 0.3);
+    color: #86EFAC;
+  }
+
+  .status-available,
+  .status-online,
+  .status-active,
+  .status-success,
+  .status-in-stock,
+  .status-operational {
+    color: var(--success);
+  }
+}

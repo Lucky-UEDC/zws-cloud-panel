@@ -1,0 +1,8 @@
+{
+  "version": "0.0.1",
+  "image": "zws-cloud:0.0.1",
+  "digest": "sha256:30e563b2b5d6a7a6e90704939f2b6a22e70534e41013d550c049c0b9880ed5d4",
+  "commit": "6d542e95a056",
+  "migrations": ["20260925000000_add_deployments"],
+  "notes": "Initial published release (internal app version 1.1.0)."
+}

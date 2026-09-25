@@ -1,0 +1,85 @@
+name: ci
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Typecheck, lint, test, build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CI: "true"
+      DATABASE_URL: postgresql://zwscloud_app:zwscloud_app@127.0.0.1:5432/zwscloud?schema=public
+      NEXT_TELEMETRY_DISABLED: "1"
+      ZWS_SKIP_SETTINGS_DB_DURING_BUILD: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile --ignore-scripts
+
+      - name: Prisma generate
+        run: ./node_modules/.bin/prisma generate
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Lint
+        run: pnpm lint
+
+      - name: Unit tests
+        run: pnpm test
+
+      - name: Build
+        run: pnpm build
+
+  docker:
+    name: Build image (immutable metadata)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    needs: validate
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Compute source fingerprint
+        id: fingerprint
+        run: |
+          FP="$(find . -path ./node_modules -prune -o -type f -print | sort | xargs sha256sum | sha256sum | cut -c1-12)"
+          echo "fp=${FP}" >> "$GITHUB_OUTPUT"
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: runner
+          push: false
+          tags: zws-cloud:${{ steps.fingerprint.outputs.fp }}
+          build-args: |
+            APP_VERSION=${{ github.ref_type == 'tag' && github.ref_name || 'ci' }}
+            APP_COMMIT=${{ github.sha }}
+            APP_SOURCE_DATE=${{ github.event.head_commit.timestamp }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Report image size
+        run: |
+          SIZE="$(docker image inspect zws-cloud:${{ steps.fingerprint.outputs.fp }} --format='{{.Size}}')"
+          echo "image_size_bytes=${SIZE}"
+          echo "image_size_human=$(numfmt --to=iec $SIZE)"

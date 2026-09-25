@@ -1,0 +1,8 @@
+ALTER TABLE "system_settings"
+  ADD COLUMN IF NOT EXISTS "metaPixelId" TEXT,
+  ADD COLUMN IF NOT EXISTS "tawkPropertyId" TEXT,
+  ADD COLUMN IF NOT EXISTS "crispWebsiteId" TEXT,
+  ADD COLUMN IF NOT EXISTS "customHeadScript" TEXT,
+  ADD COLUMN IF NOT EXISTS "customBodyScript" TEXT,
+  ADD COLUMN IF NOT EXISTS "analyticsUpdatedAt" TIMESTAMP(3),
+  ADD COLUMN IF NOT EXISTS "analyticsVersion" INTEGER NOT NULL DEFAULT 1;

@@ -1,0 +1,1 @@
+ALTER TABLE "ssh_keys" ADD COLUMN IF NOT EXISTS "lastUsedAt" TIMESTAMP(3);
