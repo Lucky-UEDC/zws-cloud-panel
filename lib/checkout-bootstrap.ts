@@ -4,6 +4,8 @@ import { normalizeBillingTerm } from "@/lib/billing-pricing"
 import { calculateCheckoutQuote } from "@/lib/checkout-shared"
 import type { CheckoutBootstrap, CheckoutDraft, CheckoutGatewayCode, CheckoutGatewayOption, OperatingSystem, Product } from "@/app/checkout/CheckoutContent"
 import { getUsableGateways, type UsableRuntimeGateway } from "@/lib/runtime-payment-resolver"
+import { getClientFromCookies } from "@/lib/server-auth"
+import { prisma } from "@/lib/db"
 
 export type CheckoutSearchParams = {
   product?: string
@@ -34,6 +36,7 @@ const INITIAL_SERVER_CHECKOUT_DRAFT: CheckoutDraft = {
   osVersion: "",
   accessMethod: "PASSWORD",
   hostname: "",
+  serverTag: "",
   quantity: 1,
   adminUser: "root",
   password: "",
@@ -101,6 +104,27 @@ function safeGatewayLogo(gateway: UsableRuntimeGateway): string | null {
   return /^(https:\/\/|data:image\/(png|jpeg|webp|svg\+xml);)/i.test(raw) && raw.length <= 4096 ? raw : null
 }
 
+/**
+ * Server-side Account Credit balance for the logged-in client (if any).
+ * Returns null when there is no authenticated client or the balance cannot
+ * be resolved — the client UI then fetches it from /api/client/wallet.
+ */
+async function clientWalletBalance(): Promise<number | null> {
+  try {
+    const client = await getClientFromCookies()
+    if (!client?.sub) return null
+    const customer = await prisma.customer.findUnique({
+      where: { id: String(client.sub) },
+      select: { walletBalance: true },
+    })
+    const balance = Number(customer?.walletBalance || 0)
+    return Number.isFinite(balance) && balance >= 0 ? balance : 0
+  } catch (error) {
+    console.error("[checkout_wallet_balance_failed]", error instanceof Error ? error.message : String(error))
+    return null
+  }
+}
+
 export function safeOperatingSystems(input: unknown): OperatingSystem[] {
   if (!Array.isArray(input)) return []
   return input
@@ -155,6 +179,7 @@ function emptyCheckoutBootstrap(params: CheckoutSearchParams, error?: CheckoutBo
     initialBillingDiscounts: { 1: 0, 3: 5, 6: 10, 12: 15, 24: 20, 36: 25 },
     availableGateways: [],
     defaultGateway: null,
+    walletBalance: null,
     bootstrapError: error,
   }
 }
@@ -289,6 +314,7 @@ export async function buildCheckoutBootstrap(params: CheckoutSearchParams, reque
       initialBillingDiscounts,
       availableGateways,
       defaultGateway,
+      walletBalance: await clientWalletBalance(),
       bootstrapError,
     }
   } catch (error) {

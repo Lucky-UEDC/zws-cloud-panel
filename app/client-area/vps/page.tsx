@@ -19,6 +19,8 @@ type Row = {
   orderId: string
   orderNumber: string
   hostname: string | null
+  displayTag: string | null
+  name: string | null
   ipAddress: string | null
   os: string | null
   plan: string
@@ -193,7 +195,7 @@ export default function ClientVpsListPage() {
                 return (
                 <tr key={row.id} className="cursor-pointer border-b align-top hover:bg-foreground/[0.03]" onClick={() => router.push(`/client-area/vps/${row.id}`)}>
                   <td className="py-3">
-                    <div className="font-medium">{row.hostname || row.orderNumber}</div>
+                    <div className="font-medium">{row.name || row.hostname || row.orderNumber}</div>
                     <div className="text-xs text-muted-foreground">{row.os || "Operating system provisioning"}</div>
                   </td>
                   <td className="py-3"><CopyableIp ipAddress={row.ipAddress} /></td>
@@ -245,7 +247,7 @@ export default function ClientVpsListPage() {
               <div key={row.id} className="cursor-pointer rounded-lg border border-border/40 p-3 hover:bg-foreground/[0.03]" onClick={() => router.push(`/client-area/vps/${row.id}`)}>
                 <div className="flex items-start justify-between gap-2">
                   <div className="min-w-0">
-                    <div className="truncate text-sm font-medium">{row.hostname || row.orderNumber}</div>
+                    <div className="truncate text-sm font-medium">{row.name || row.hostname || row.orderNumber}</div>
                     <div className="truncate text-xs text-muted-foreground">{row.os || "Operating system provisioning"}</div>
                   </div>
                   {rowBadge(state)}

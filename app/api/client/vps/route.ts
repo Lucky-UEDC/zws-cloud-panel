@@ -6,7 +6,7 @@ import { customerFacingVpsStatus } from "@/lib/vps-lifecycle"
 import { lifecycleDates } from "@/lib/renewals"
 import { normalizeVmAutomationState, normalizeVmLifecycleState } from "@/lib/vm-state-machine"
 import { formatBandwidthQuota } from "@/lib/bandwidth-format"
-import { hostnameFromIp } from "@/lib/vm-hostname"
+import { hostnameFromIp, friendlyVmDisplayName } from "@/lib/vm-hostname"
 
 export const dynamic = "force-dynamic"
 export const revalidate = 0
@@ -112,6 +112,8 @@ export async function GET() {
     orderId: vps.orderId,
     orderNumber: vps.order.orderNumber,
     hostname: hostnameFromIp(vps.ipAddress) || (typeof vps.hostname === "string" && vps.hostname.startsWith("ip-") ? vps.hostname : null),
+    displayTag: typeof vps.displayTag === "string" ? vps.displayTag : null,
+    name: friendlyVmDisplayName({ displayTag: vps.displayTag, ipAddress: vps.ipAddress, hostname: vps.hostname }) || null,
     ipAddress: vps.ipAddress,
     os: vps.operatingSystem?.name || vps.order.osName,
     plan: vps.product?.name || "Instance",

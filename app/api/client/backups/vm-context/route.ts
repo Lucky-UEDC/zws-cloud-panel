@@ -67,7 +67,7 @@ export async function GET(request: NextRequest) {
       success: true,
       instance: {
         vpsInstanceId: instance.id,
-        name: instance.instanceName || instance.name || instance.hostname || `VM-${instance.vmid}`,
+        name: instance.displayTag || instance.instanceName || instance.name || instance.hostname || `VM-${instance.vmid}`,
       },
       vm,
       // NOTE: internal storage details (storage IDs, node names, disk capacity)

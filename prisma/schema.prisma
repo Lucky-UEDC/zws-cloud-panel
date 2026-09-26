@@ -764,6 +764,7 @@ model VpsInstance {
   name                            String
   instanceName                    String?                 @map("instance_name")
   hostname                        String?
+  displayTag                      String?                 @map("display_tag")
   vmMacAddress                    String?                 @map("vm_mac_address")
   status                          String                  @default("active")
   ipAddress                       String?

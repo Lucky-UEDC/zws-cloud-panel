@@ -107,7 +107,9 @@ test("legacy offer/topup path processes only the explicitly selected gateway", (
 
 test("frontend hard-checks returned gateway matches selected gateway before starting payment", () => {
   const checkout = read("app/checkout/CheckoutContent.tsx")
-  assert.match(checkout, /const gatewayAtSubmit = selectedGateway/)
+  // Gateway mode derives the gateway to verify from the customer's explicit
+  // selection; the wallet (Account Credit) path has no gateway to open.
+  assert.match(checkout, /const gatewayAtSubmit = method === "gateway" \? selectedGateway : null/)
   assert.match(checkout, /const returnedGateway = String\(data\?\.gateway/)
   // Part 2.6: returned-gateway validation is centralized and blocks mismatches.
   assert.match(checkout, /validateReturnedGateway\(returnedGateway, gatewayAtSubmit\)/)

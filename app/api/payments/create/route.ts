@@ -64,6 +64,7 @@ import {
 } from "@/lib/dedicated"
 import { createWalletTopupPayment, normalizeWalletTopupAmount } from "@/lib/wallet-topup"
 import { getTaxPolicy } from "@/lib/tax-engine"
+import { normalizeServerTag, isRejectedServerTag } from "@/lib/vm-hostname"
 
 const ALLOWED_TERMS = new Set([1, 3, 6, 12, 24, 36])
 const paymentCreateSchema = z.object({
@@ -84,6 +85,7 @@ const paymentCreateSchema = z.object({
   operatingSystemVersion: z.string().trim().max(80).optional().nullable(),
   region: z.string().trim().max(120).optional().nullable(),
   hostname: z.string().trim().max(253).optional().nullable(),
+  displayTag: z.string().trim().max(120).optional().nullable(),
   quantity: z.union([z.number(), z.string()]).optional().nullable(),
   adminUsername: z.string().trim().max(64).optional().nullable(),
   password: z.string().max(256).optional().nullable(),
@@ -1087,6 +1089,7 @@ export async function POST(request: NextRequest) {
       operatingSystemVersion: requestedOperatingSystemVersion,
       region: requestedRegion,
       hostname: requestedHostname,
+      displayTag: requestedDisplayTag,
       quantity: requestedQuantity,
       adminUsername: requestedAdminUsername,
       password: requestedPassword,
@@ -1112,6 +1115,9 @@ export async function POST(request: NextRequest) {
     const quantity = normalizeOrderQuantity(requestedQuantity)
     const isOfferCheckout = Boolean(requestedOfferSlug || requestedOfferId)
     const paymentMethod = String(requestedPaymentMethod || "").toLowerCase()
+    // Server Tag: customer-managed friendly identity, sanitized server-side.
+    // System hostname stays managed by the platform (ip-A-B-C-D from the IP).
+    const serverTag = normalizeServerTag(requestedDisplayTag)
     const isDedicatedCheckout = String(requestedOrderType || "").toLowerCase() === "dedicated"
     const checkoutConfig = config as any
     const premiumIpRequest = normalizePremiumIpRequest(requestedPremiumIps || checkoutConfig?.premiumIps || {})
@@ -1254,11 +1260,14 @@ export async function POST(request: NextRequest) {
       const hostname = String(requestedHostname || "").trim()
       const accessMethod = String(requestedAccessMethod || "PASSWORD").toUpperCase()
       const password = String(requestedPassword || "")
-      if (!hostname) {
-        return apiError("hostname_required", "Enter an instance name before payment.", 400)
-      }
-      if (!isValidLinuxHostname(hostname)) {
+      // Hostname is system-managed: the customer no longer enters one at
+      // checkout. When supplied, it must still be a valid Linux hostname; when
+      // absent, provisioning derives the default from the assigned public IP.
+      if (hostname && !isValidLinuxHostname(hostname)) {
         return apiError("invalid_hostname", "Instance name must use valid hostname characters.", 400)
+      }
+      if (isRejectedServerTag(requestedDisplayTag)) {
+        return apiError("invalid_server_tag", "Server tag may only contain letters, numbers, spaces, hyphens and underscores (up to 64 characters).", 400)
       }
       if (accessMethod !== "PASSWORD") {
         return apiError("invalid_access_method", "Checkout currently supports password login only.", 400)
@@ -1967,6 +1976,7 @@ export async function POST(request: NextRequest) {
         currency: chargedCurrency,
         status: "pending_payment",
         hostname: primaryHostname,
+        displayTag: serverTag || null,
         adminUsername: !isDedicatedCheckout ? String(requestedAdminUsername || resolvedOsTemplateDefaultUsername(selectedOperatingSystem) || "root") : null,
         passwordEncrypted: orderPasswordEncrypted,
         accessMethod: isDedicatedCheckout ? "MANUAL_DELIVERY" : orderAccessMethod,

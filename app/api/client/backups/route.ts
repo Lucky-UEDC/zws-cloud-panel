@@ -14,19 +14,29 @@ const NO_CACHE_HEADERS = {
 
 const DONE_STATUSES = ["completed", "failed", "cancelled"]
 
+/** Customer-facing friendly label for a server (never an internal infra id). */
+function friendlyServerName(instance: any, fallback: string) {
+  const candidate = instance?.displayTag || instance?.instanceName || instance?.name || instance?.hostname || ""
+  const label = String(candidate || "").trim() || fallback
+  // Prefer the customer's Server Tag when present; otherwise the canonical IP hostname.
+  if (instance?.displayTag) return String(instance.displayTag).trim()
+  if (/^ip-\d{1,3}-\d{1,3}-\d{1,3}-\d{1,3}$/.test(label)) return label
+  return label
+}
+
 function normalizeBackupRow(row: any, instancesById: Map<string, any>) {
   const instance = instancesById.get(String(row.vpsInstanceId))
   const metadata = (row.metadata as Record<string, unknown>) || {}
-  const rawArchive = String(metadata.volid || row.backupPath || "")
-  const archive = rawArchive ? rawArchive.split(":").pop()!.split("/").pop() || rawArchive : null
   return {
     id: row.id,
     vmId: row.vmid,
-    name: instance?.instanceName || instance?.name || instance?.hostname || `VM-${row.vmid}`,
+    name: friendlyServerName(instance, `VM-${row.vmid}`),
+    ipAddress: instance?.ipAddress || null,
     vpsInstanceId: row.vpsInstanceId,
     status: row.status,
     sizeBytes: row.sizeBytes != null ? String(row.sizeBytes) : null,
-    fileName: archive,
+    // The internal storage artifact name (volid/path) is NOT exposed to clients.
+    fileName: null,
     startedAt: row.startedAt ? row.startedAt.toISOString() : null,
     completedAt: row.completedAt ? row.completedAt.toISOString() : null,
     createdAt: row.createdAt ? row.createdAt.toISOString() : null,
@@ -50,7 +60,7 @@ export async function GET(request: NextRequest) {
 
   const instances = await prisma.vpsInstance.findMany({
     where: { customerId, deletedAt: null, vmid: { gt: 0 } },
-    select: { id: true, vmid: true, name: true, instanceName: true, hostname: true, status: true },
+    select: { id: true, vmid: true, name: true, instanceName: true, hostname: true, displayTag: true, ipAddress: true, status: true },
     orderBy: { vmid: "asc" },
   })
   const instanceIds = instances.map((i) => i.id)
@@ -90,12 +100,16 @@ export async function GET(request: NextRequest) {
     rows = rows.filter((row) => String(row.name || "").toLowerCase().includes(searchParam) || String(row.id || "").toLowerCase().includes(searchParam))
   }
 
-  const vms = instances.map((i) => ({
-    vmId: Number(i.vmid),
-    vpsInstanceId: i.id,
-    name: i.instanceName || i.name || i.hostname || `VM-${i.vmid}`,
-    status: i.status,
-  }))
+  const vms = instances.map((i) => {
+    const label = friendlyServerName(i, `VM-${i.vmid}`)
+    return {
+      vmId: Number(i.vmid),
+      vpsInstanceId: i.id,
+      name: label,
+      label: i.ipAddress ? `${label} — ${i.ipAddress}` : label,
+      status: i.status,
+    }
+  })
 
   return NextResponse.json(
     {
@@ -115,5 +129,10 @@ export async function GET(request: NextRequest) {
 
 function normalizeUsageJson(usage: Record<string, any>) {
   const { backups: _backups, ...rest } = usage
-  return { ...rest, usedBytes: String(usage.usedBytes ?? 0), storageQuotaBytes: String(usage.storageQuotaBytes ?? 0) }
+  // Quota/usage fields are Prisma BigInt-backed (usedBytes, storageQuotaBytes,
+  // remainingBytes, …). Everything must be JSON-safe before NextResponse.json —
+  // otherwise the route dies with "Do not know how to serialize a BigInt".
+  // The `backups` array of raw rows is deliberately dropped; the response ships
+  // the client-safe `rows` instead.
+  return JSON.parse(JSON.stringify(rest, (_key, value) => (typeof value === "bigint" ? String(value) : value)))
 }

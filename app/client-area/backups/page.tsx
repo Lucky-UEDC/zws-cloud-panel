@@ -17,15 +17,15 @@ import { Check, CircleAlert, ShieldCheck } from "lucide-react"
 import { formatBytesDecimal } from "@/lib/format-units"
 import { OperationProgressDialog } from "@/components/client/operation-progress-dialog"
 
-type BackupVm = { vmId: number; vpsInstanceId: string; name: string; status: string }
+type BackupVm = { vmId: number; vpsInstanceId: string; name: string; label?: string; status: string }
 type BackupRow = {
   id: string
   vmId: number
   name: string
+  ipAddress?: string | null
   vpsInstanceId: string
   status: string
   sizeBytes: string | null
-  fileName: string | null
   startedAt: string | null
   completedAt: string | null
   createdAt: string | null
@@ -110,6 +110,11 @@ export default function ClientBackupsPage() {
   const [shuttingDown, setShuttingDown] = useState(false)
   const [restoreVmStatus, setRestoreVmStatus] = useState<string>("unknown")
   const [restoreOperationId, setRestoreOperationId] = useState<string | null>(null)
+
+  const [deleteTarget, setDeleteTarget] = useState<BackupRow | null>(null)
+  const [deleteConfirm, setDeleteConfirm] = useState("")
+  const [deleting, setDeleting] = useState(false)
+  const [deleteError, setDeleteError] = useState<string | null>(null)
 
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const pollDeadlineRef = useRef<number>(0)
@@ -330,6 +335,30 @@ useEffect(() => {
     }
   }
 
+  const doDeleteBackup = async () => {
+    if (!deleteTarget) return
+    setDeleting(true)
+    setDeleteError(null)
+    try {
+      const res = await fetch(`/api/client/backups/${deleteTarget.id}/delete?vpsInstanceId=${encodeURIComponent(deleteTarget.vpsInstanceId)}&confirmation=${encodeURIComponent(deleteConfirm)}`, {
+        method: "DELETE",
+        headers: { "content-type": "application/json" },
+        cache: "no-store",
+      })
+      const body = await res.json()
+      if (!res.ok || !body?.success) throw new Error(body?.error || "Deletion failed.")
+      setDeleteTarget(null)
+      setDeleteConfirm("")
+      // Usage + count changed: refresh history, billing header and VM list.
+      void loadHistory()
+      void loadVms()
+    } catch (e: any) {
+      setDeleteError(e?.message || "Deletion failed.")
+    } finally {
+      setDeleting(false)
+    }
+  }
+
   const percent = backupProgress?.percent != null ? Math.max(0, Math.min(100, backupProgress.percent)) : 0
 
   return (
@@ -422,7 +451,7 @@ useEffect(() => {
                     <SelectItem value="all">All servers</SelectItem>
                     {vms.map((vm) => (
                       <SelectItem key={vm.vmId} value={vm.vpsInstanceId}>
-                        {vm.name} ({vm.vmId})
+                        {vm.label || vm.name}
                       </SelectItem>
                     ))}
                   </SelectContent>
@@ -557,7 +586,16 @@ useEffect(() => {
           {loading ? (
             <div className="py-10 text-center text-sm text-muted-foreground">Loading backups…</div>
           ) : backups.length === 0 ? (
-            <div className="py-10 text-center text-sm text-muted-foreground">No backups match the current filters.</div>
+            error ? (
+              <div className="flex flex-col items-center gap-3 py-10">
+                <p className="text-sm text-red-200">Unable to load backups.</p>
+                <Button variant="outline" size="sm" onClick={() => void loadHistory()}>
+                  Retry
+                </Button>
+              </div>
+            ) : (
+              <div className="py-10 text-center text-sm text-muted-foreground">No backups match the current filters.</div>
+            )
           ) : (
             <div className="min-w-0 overflow-x-auto">
               <Table>
@@ -585,6 +623,20 @@ useEffect(() => {
                           {backup.status === "completed" ? (
                             <Button variant="default" size="sm" onClick={() => void openRestore(backup)} className="bg-amber-500/90 text-black hover:bg-amber-400">
                               Restore
+                            </Button>
+                          ) : null}
+                          {["completed", "failed", "cancelled"].includes(String(backup.status).toLowerCase()) ? (
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              className="border-red-400/40 text-red-300 hover:bg-red-400/10 hover:text-red-200"
+                              onClick={() => {
+                                setDeleteTarget(backup)
+                                setDeleteConfirm("")
+                                setDeleteError(null)
+                              }}
+                            >
+                              Delete
                             </Button>
                           ) : null}
                         </div>
@@ -781,12 +833,6 @@ useEffect(() => {
                 <dt className="text-muted-foreground">Completed</dt>
                 <dd>{formatDate(details.completedAt, true)}</dd>
               </div>
-              {details.fileName ? (
-                <div className="col-span-2">
-                  <dt className="text-muted-foreground">Archive</dt>
-                  <dd className="break-all font-mono text-xs">{details.fileName}</dd>
-                </div>
-              ) : null}
               {details.error ? (
                 <div className="col-span-2">
                   <dt className="text-muted-foreground">Error</dt>
@@ -865,6 +911,40 @@ useEffect(() => {
                 {restoring ? "Restoring…" : "Restore backup"}
               </AlertDialogAction>
             )}
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      <AlertDialog open={Boolean(deleteTarget)} onOpenChange={(open) => (open ? null : setDeleteTarget(null))}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Delete backup?</AlertDialogTitle>
+            <AlertDialogDescription asChild>
+              <div className="space-y-2 text-sm">
+                <p>
+                  This permanently deletes the backup of <span className="font-medium">{deleteTarget?.name}</span> from storage and releases its quota. This
+                  cannot be undone.
+                </p>
+                {deleteError ? <div className="rounded-md border border-red-400/30 bg-red-400/10 p-3 text-xs text-red-200">{deleteError}</div> : null}
+                <Label htmlFor="delete-confirm">Type DELETE to confirm</Label>
+                <Input id="delete-confirm" value={deleteConfirm} onChange={(e) => setDeleteConfirm(e.target.value)} placeholder="DELETE" autoComplete="off" />
+              </div>
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={deleting} onClick={() => setDeleteTarget(null)}>
+              Cancel
+            </AlertDialogCancel>
+            <AlertDialogAction
+              disabled={deleteConfirm.toUpperCase() !== "DELETE" || deleting}
+              onClick={(e) => {
+                e.preventDefault()
+                void doDeleteBackup()
+              }}
+              className="bg-red-500/90 text-white hover:bg-red-500"
+            >
+              {deleting ? "Deleting…" : "Delete backup"}
+            </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>

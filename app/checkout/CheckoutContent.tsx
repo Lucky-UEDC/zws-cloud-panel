@@ -20,6 +20,7 @@ import {
   EyeOff,
   KeyRound,
   Copy,
+  CreditCard,
   Minus,
   Plus,
 } from "lucide-react"
@@ -43,7 +44,7 @@ import { resolvePaymentCheckoutTarget, startPaymentRedirect } from "@/lib/client
 import type { CheckoutApiSuccess, CheckoutQuote, CheckoutQuoteResult } from "@/lib/checkout-shared"
 import { hasCompleteBillingAddress } from "@/lib/checkout-identity"
 import { getResolvedOsIcon, handleOsIconError } from "@/lib/os-icons"
-import { BULK_DISCOUNT_PERCENT, customerHostnameSlug, generateVmHostnames, hasBulkDiscount, planHostnameSlug } from "@/lib/order-bulk"
+import { BULK_DISCOUNT_PERCENT, hasBulkDiscount } from "@/lib/order-bulk"
 import { clearCheckoutResumeIntent, readCheckoutResumeIntent, writeCheckoutResumeIntent } from "@/lib/client/checkout-resume"
 
 export type Product = {
@@ -113,7 +114,7 @@ export type OperatingSystem = {
 }
 
 type AccessMethod = "PASSWORD" | "PASSWORD_AND_SSH_KEY" | "SAVED_SSH_KEY" | "GENERATED_SSH_KEY" | "PASTED_SSH_KEY"
-type PaymentMethod = "gateway"
+type PaymentMethod = "wallet" | "gateway"
 export type CheckoutGatewayCode = "razorpay" | "phonepe" | "cashfree"
 type PaymentState = "idle" | "initializing" | "redirecting" | "waiting" | "verifying" | "verified" | "error"
 
@@ -143,6 +144,7 @@ export type CheckoutDraft = {
   osVersion: string
   accessMethod: AccessMethod
   hostname: string
+  serverTag: string
   quantity: number
   adminUser: string
   password: string
@@ -202,6 +204,7 @@ export const INITIAL_CHECKOUT_DRAFT: CheckoutDraft = {
   osVersion: "",
   accessMethod: "PASSWORD",
   hostname: "",
+  serverTag: "",
   quantity: 1,
   adminUser: "root",
   password: "",
@@ -246,6 +249,7 @@ export type CheckoutBootstrap = {
   initialBillingDiscounts: Record<number, number>
   availableGateways: CheckoutGatewayOption[]
   defaultGateway: CheckoutGatewayCode | null
+  walletBalance: number | null
   bootstrapError?: {
     code: string
     message: string
@@ -270,6 +274,17 @@ function firstPaymentString(...values: Array<unknown>) {
     if (typeof value === "string" && value.trim()) return value.trim()
   }
   return null
+}
+
+/** Client-side Server Tag sanitization (mirrors lib/vm-hostname normalizeServerTag). */
+function clientNormalizeServerTag(value: string) {
+  const cleaned = String(value || "").replace(/[\u0000-\u001f\u007f]/g, " ").replace(/[^a-zA-Z0-9 _-]/g, " ").replace(/\s+/g, " ").trim()
+  return cleaned.slice(0, 64)
+}
+
+function clientRejectedServerTag(value: string) {
+  const raw = String(value || "").trim()
+  return Boolean(raw) && !clientNormalizeServerTag(raw)
 }
 
 function validatePaymentStartResponse(data: any) {
@@ -313,16 +328,6 @@ function storeCheckoutIdempotencyKey(value: string | null) {
   }
 }
 
-function validCheckoutHostname(value: string) {
-  const normalized = String(value || "").trim()
-  if (!normalized || normalized.length > 253) return false
-  return normalized.split(".").every((label) => (
-    label.length > 0 &&
-    label.length <= 63 &&
-    /^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$/.test(label)
-  ))
-}
-
 export function CheckoutContent({ bootstrap, brandName = "Cloud", siteUrl = "", currency = "INR" }: { bootstrap: CheckoutBootstrap; brandName?: string; siteUrl?: string; currency?: string }) {
   const router = useRouter()
   const product = bootstrap.product
@@ -344,6 +349,10 @@ export function CheckoutContent({ bootstrap, brandName = "Cloud", siteUrl = "", 
   const [checkoutDraft, setCheckoutDraft] = useState<CheckoutDraft>(() => bootstrap.initialDraft)
   const availableGateways = useMemo(() => Array.isArray(bootstrap.availableGateways) ? bootstrap.availableGateways : [], [bootstrap.availableGateways])
   const [selectedGateway, setSelectedGateway] = useState<CheckoutGatewayCode | null>(() => bootstrap.defaultGateway)
+  const [paymentMethod, setPaymentMethod] = useState<PaymentMethod>(() => (bootstrap.initialDraft.paymentMethod === "wallet" ? "wallet" : "gateway"))
+  const [creditBalance, setCreditBalance] = useState<number>(() => (typeof bootstrap.walletBalance === "number" && bootstrap.walletBalance >= 0 ? bootstrap.walletBalance : 0))
+  const [creditLoaded, setCreditLoaded] = useState<boolean>(typeof bootstrap.walletBalance === "number")
+  const methodUserChoiceRef = useRef<PaymentMethod | null>(null)
   const [clientDisplayName, setClientDisplayName] = useState("")
   const [copiedSecret, setCopiedSecret] = useState<string | null>(null)
   const [showPassword, setShowPassword] = useState(false)
@@ -366,6 +375,8 @@ export function CheckoutContent({ bootstrap, brandName = "Cloud", siteUrl = "", 
 
   const handleGatewayChange = useCallback((code: CheckoutGatewayCode) => {
     setSelectedGateway(code)
+    setPaymentMethod("gateway")
+    methodUserChoiceRef.current = "gateway"
     // A checkout session/order belongs to exactly ONE gateway: when the customer
     // switches gateways, rotate the idempotency key so a session created for the
     // previous gateway can never be reused, and clear gateway-specific state.
@@ -735,9 +746,7 @@ export function CheckoutContent({ bootstrap, brandName = "Cloud", siteUrl = "", 
   const renewalAmount = Math.max(0, Number((payAmount + taxAmount - scaledCouponDiscount - bulkDiscountAmount).toFixed(2)))
   const selectedAdminUser = selectedOs?.defaultUsername || checkoutDraft.adminUser || "root"
   const osSummary = selectedOs ? `${selectedOs.familyLabel || selectedOs.name} ${selectedOs.version || ""}`.trim() : "Select OS"
-  const hostnamePlan = planHostnameSlug(instanceName || checkoutDraft.productSlug || "plan")
-  const hostnameClient = customerHostnameSlug(clientDisplayName || "user")
-  const generatedHostnames = generateVmHostnames({ planName: hostnamePlan, customerName: hostnameClient, quantity })
+  // Hostname is system-managed (assigned from the public IP after deployment).
   const accessPreviewPassword = checkoutDraft.password ? "********" : "Not set"
   const passwordRequirements = useMemo(() => passwordRequirementRows(checkoutDraft.password), [checkoutDraft.password])
   const passwordStrongEnough = passwordStrengthScore(checkoutDraft.password) >= 3
@@ -746,6 +755,33 @@ export function CheckoutContent({ bootstrap, brandName = "Cloud", siteUrl = "", 
   const hasBillingDiscount = discountPercent > 0 && monthlyBase > monthlyTotal
   const taxLabel = String(quote?.tax?.label || "GST")
   const displayMoney = useCallback((value: number) => formatPrice(value), [])
+
+  const creditEligible = useMemo(() => creditLoaded && creditBalance >= payableToday, [creditLoaded, creditBalance, payableToday])
+
+  // Auto-select Account Credit when the balance covers the final payable amount
+  // AND the customer has not explicitly picked a gateway this session.
+  useEffect(() => {
+    if (!creditEligible) return
+    if (methodUserChoiceRef.current === null) setPaymentMethod("wallet")
+  }, [creditEligible])
+
+  // Authoritative balance when the server bootstrap could not include one.
+  useEffect(() => {
+    if (creditLoaded) return
+    let cancelled = false
+    fetch("/api/client/wallet", { cache: "no-store" })
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => {
+        if (cancelled) return
+        const next = Number(data?.balance ?? data?.walletBalance)
+        if (Number.isFinite(next)) {
+          setCreditBalance(next)
+          setCreditLoaded(true)
+        }
+      })
+      .catch(() => null)
+    return () => { cancelled = true }
+  }, [creditLoaded])
 
   const breakdown = useMemo(() => {
     if (quote?.monthly) {
@@ -833,23 +869,31 @@ export function CheckoutContent({ bootstrap, brandName = "Cloud", siteUrl = "", 
     }
     if (!product) return
     const current = checkoutDraftRef.current
-    const effectiveHostname = String(current.hostname || generatedHostnames[0] || "").trim()
+    // Hostname is system-managed: assigned automatically from the public IP
+    // after deployment (ip-A-B-C-D). The customer never provides one.
+    const effectiveHostname = ""
+    const effectiveServerTag = clientNormalizeServerTag(current.serverTag)
+    if (clientRejectedServerTag(current.serverTag)) return failCheckout("Server Tag may only contain letters, numbers, spaces, hyphens and underscores (up to 64 characters).")
     if (!current.productId && !product.id) return failCheckout("Select a cloud instance before payment.")
     if (!current.osTemplateId) return failCheckout("Select an operating system before payment.")
     if (selectedTemplateIncompatible) return failCheckout("Selected operating system is not available in this region.")
     if (!allowedTerms.includes(current.termMonths)) return failCheckout("Choose a valid billing term before payment.")
     if (passwordStrengthScore(current.password) < 2) return failCheckout("Use at least 8 characters with a mix of letters and numbers.")
-    if (!validCheckoutHostname(effectiveHostname)) return failCheckout("Enter a valid Linux hostname before payment.")
     if (displayCurrency !== "INR") return failCheckout("Checkout supports INR payments only.")
     if (!Number.isFinite(payableToday) || payableToday <= 0) return failCheckout("Total payable must be greater than zero.")
     if (profileLoading || hasBillingAddress === false) {
       const label = missingBillingFields.length ? `Missing: ${missingBillingFields.join(", ")}` : "Billing address required before payment."
       return failCheckout(label)
     }
-    if (!selectedGateway || !availableGateways.some((gateway) => gateway.code === selectedGateway)) return failCheckout("No payment gateway available.")
+    const method: PaymentMethod = paymentMethod === "wallet" ? "wallet" : "gateway"
+    if (method === "wallet") {
+      if (!creditEligible) return failCheckout("Your Account Credit balance is not enough for this purchase. Add credit or choose a payment gateway.")
+    } else if (!selectedGateway || !availableGateways.some((gateway) => gateway.code === selectedGateway)) {
+      return failCheckout("No payment gateway available.")
+    }
 
-    const gatewayAtSubmit = selectedGateway
-    console.info("[Checkout][Payment] gateway captured at submit", { selectedGateway: gatewayAtSubmit })
+    const gatewayAtSubmit = method === "gateway" ? selectedGateway : null
+    console.info("[Checkout][Payment] payment captured at submit", { paymentMethod: method, selectedGateway: gatewayAtSubmit })
 
     setCheckoutError(null)
     setPaymentState("initializing")
@@ -887,6 +931,7 @@ export function CheckoutContent({ bootstrap, brandName = "Cloud", siteUrl = "", 
         operatingSystemFamily: selectedOs?.family || current.osFamily,
         operatingSystemVersion: selectedOs?.version || current.osVersion,
         hostname: effectiveHostname,
+        displayTag: effectiveServerTag || undefined,
         config: isCustomCheckout
           ? {
               cpu: current.customCpu,
@@ -920,8 +965,8 @@ export function CheckoutContent({ bootstrap, brandName = "Cloud", siteUrl = "", 
         adminUsername: selectedAdminUser,
         password: current.password,
         accessMethod: "PASSWORD",
-        paymentMethod: "gateway",
-        preferredGateway: gatewayAtSubmit,
+        paymentMethod: method,
+        preferredGateway: method === "gateway" ? gatewayAtSubmit : undefined,
         priceToken: paymentToken,
         idempotencyKey,
         redirectTo: `${globalThis.location.pathname}${globalThis.location.search}`,
@@ -943,7 +988,7 @@ export function CheckoutContent({ bootstrap, brandName = "Cloud", siteUrl = "", 
           signal: controller.signal,
           body: JSON.stringify({
             checkoutSessionId,
-            preferredGateway: gatewayAtSubmit,
+            preferredGateway: method === "gateway" ? gatewayAtSubmit : undefined,
             idempotencyKey,
             currency: "INR",
           }),
@@ -1029,6 +1074,17 @@ export function CheckoutContent({ bootstrap, brandName = "Cloud", siteUrl = "", 
         })
         setCheckoutError(mismatchMessage)
         toast.error(mismatchMessage)
+        return
+      }
+      // Account Credit (wallet) payments never open a payment gateway — the
+      // backend settled the order atomically against the balance. Go straight
+      // to the receipt without initializing any gateway session.
+      if (returnedGateway === "wallet") {
+        setPaymentState("verified")
+        storeCheckoutIdempotencyKey(null)
+        checkoutIdempotencyRef.current = null
+        const receiptUrl = firstPaymentString(data?.redirectUrl, data?.redirect_url) || "/client-area/billing?tab=invoices"
+        window.setTimeout(() => router.push(receiptUrl), 1200)
         return
       }
       setPaymentState("redirecting")
@@ -1300,30 +1356,11 @@ export function CheckoutContent({ bootstrap, brandName = "Cloud", siteUrl = "", 
                       onFocus={() => focusDraftField("quantity")}
                       onBlur={() => blurDraftField("quantity")}
                     />
-                    <FieldInput label="Hostname" field="hostname" value={checkoutDraft.hostname} placeholder={generatedHostnames[0] || "instance-hostname"} onFocus={focusDraftField} onBlur={blurDraftField} onChange={markDraftInputChange} />
+                    <FieldInput label="Server Tag (optional)" field="serverTag" value={checkoutDraft.serverTag} placeholder="e.g. Production Database" onFocus={focusDraftField} onBlur={blurDraftField} onChange={markDraftInputChange} />
                     <FieldInput label="Admin user" field="adminUser" value={selectedAdminUser} readOnly onFocus={focusDraftField} onBlur={blurDraftField} onChange={markDraftInputChange} />
                     <div className="sm:col-span-2 rounded-xl border border-[var(--border-primary)] bg-[rgba(255,255,255,0.035)] p-4 text-sm shadow-sm shadow-black/20 backdrop-blur">
-                      <div className="flex items-center justify-between gap-3">
-                        <div className="flex items-center gap-2 text-muted-foreground"><KeyRound className="h-4 w-4" />Generated hostnames</div>
-                        <Badge variant="outline">{generatedHostnames.length} VM{generatedHostnames.length === 1 ? "" : "s"}</Badge>
-                      </div>
-                      <div className="mt-3 max-h-52 space-y-2 overflow-y-auto pr-1">
-                        {generatedHostnames.map((hostname, index) => (
-                          <div key={hostname} className="flex min-w-0 items-center justify-between gap-3 rounded-lg border border-border/40 bg-background/40 px-3 py-2">
-                            <span className="min-w-0 truncate font-mono text-xs text-foreground sm:text-sm">{hostname}</span>
-                            <Button
-                              type="button"
-                              variant={copiedSecret === `host-${index}` ? "default" : "outline"}
-                              size="sm"
-                              className="h-8 shrink-0 gap-1.5"
-                              onClick={() => void copyCheckoutSecret(hostname, `host-${index}`, "Hostname copied")}
-                            >
-                              <Copy className="h-3.5 w-3.5" />
-                              {copiedSecret === `host-${index}` ? "Copied" : "Copy"}
-                            </Button>
-                          </div>
-                        ))}
-                      </div>
+                      <div className="flex items-center gap-2 text-muted-foreground"><KeyRound className="h-4 w-4" />Hostname</div>
+                      <p className="mt-2 text-xs text-muted-foreground">Assigned automatically after deployment from your server&apos;s public IP (e.g. <span className="font-mono text-foreground">ip-103-216-170-230</span>). Your Server Tag above is a label you control and can change anytime from the server page.</p>
                     </div>
                     <div className="sm:col-span-2 space-y-2">
                       <label className="block text-xs font-medium uppercase tracking-wide text-muted-foreground">Password</label>
@@ -1551,12 +1588,30 @@ export function CheckoutContent({ bootstrap, brandName = "Cloud", siteUrl = "", 
                   {couponError ? <p className="mt-2 text-xs text-destructive">{couponError}</p> : null}
                   <div className="mt-5 space-y-2">
                     <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Payment method</p>
+                    {creditLoaded || creditBalance > 0 ? (
+                      <button
+                        type="button"
+                        onClick={() => { setPaymentMethod("wallet"); methodUserChoiceRef.current = "wallet" }}
+                        className={`flex w-full items-center gap-3 rounded-xl border px-3 py-3 text-left text-sm transition-[background,border-color,transform,color] duration-150 hover:-translate-y-px ${paymentMethod === "wallet" ? "selected-item" : "border-[var(--border-primary)] bg-[var(--surface-subtle)] hover:border-[var(--border-hover)] hover:bg-[rgba(255,255,255,0.04)]"}`}
+                        aria-pressed={paymentMethod === "wallet"}
+                      >
+                        <CreditCard className="h-9 w-9 shrink-0 text-muted-foreground" />
+                        <span className="min-w-0 flex-1">
+                          <span className="block font-medium">Pay with Account Credit</span>
+                          <span className="block text-xs text-muted-foreground">Available: {displayMoney(creditBalance)}</span>
+                          <span className="block text-xs text-muted-foreground">
+                            {creditEligible ? <>You will use {displayMoney(payableToday)} — no gateway involved</> : <span className="text-amber-300">Not enough credit for this purchase</span>}
+                          </span>
+                        </span>
+                      </button>
+                    ) : null}
                     {availableGateways.map((gateway) => (
                       <button
                         key={gateway.code}
                         type="button"
                         onClick={() => handleGatewayChange(gateway.code)}
-                        className={`flex w-full items-center gap-3 rounded-xl border px-3 py-3 text-left text-sm transition-[background,border-color,transform,color] duration-150 hover:-translate-y-px ${selectedGateway === gateway.code ? "selected-item" : "border-[var(--border-primary)] bg-[var(--surface-subtle)] hover:border-[var(--border-hover)] hover:bg-[rgba(255,255,255,0.04)]"}`}
+                        className={`flex w-full items-center gap-3 rounded-xl border px-3 py-3 text-left text-sm transition-[background,border-color,transform,color] duration-150 hover:-translate-y-px ${paymentMethod === "gateway" && selectedGateway === gateway.code ? "selected-item" : "border-[var(--border-primary)] bg-[var(--surface-subtle)] hover:border-[var(--border-hover)] hover:bg-[rgba(255,255,255,0.04)]"}`}
+                        aria-pressed={paymentMethod === "gateway" && selectedGateway === gateway.code}
                       >
                         <GatewayBrandMark gateway={gateway} />
                         <span>
@@ -1576,14 +1631,15 @@ export function CheckoutContent({ bootstrap, brandName = "Cloud", siteUrl = "", 
                   ) : null}
                   <div className="mt-6 flex flex-col gap-2">
                     <TurnstileWidget value={turnstileToken} onChange={setTurnstileToken} action="checkout" surface="checkout" siteKey={turnstile.siteKey} />
-                    <Button type="submit" disabled={submitting || profileLoading || hasBillingAddress === false || !operatingSystemId || operatingSystems.length === 0 || !selectedGateway || (Boolean(clientDisplayName) && captchaRequired && !turnstileToken)} className="w-full gap-1.5">
-                      {paymentState === "initializing" ? <><Spinner className="h-4 w-4" />Initializing {gatewayDisplayName(selectedGateway || "")}...</> : null}
+                    <Button type="submit" disabled={submitting || profileLoading || hasBillingAddress === false || !operatingSystemId || operatingSystems.length === 0 || (paymentMethod === "wallet" ? !creditEligible : !selectedGateway) || (Boolean(clientDisplayName) && captchaRequired && !turnstileToken)} className="w-full gap-1.5">
+                      {paymentState === "initializing" ? <><Spinner className="h-4 w-4" />Initializing {paymentMethod === "wallet" ? "Account Credit" : gatewayDisplayName(selectedGateway || "")}...</> : null}
                       {paymentState === "redirecting" ? <><Spinner className="h-4 w-4" />Opening payment gateway...</> : null}
                       {paymentState === "waiting" ? <><Spinner className="h-4 w-4" />Waiting for payment...</> : null}
                       {paymentState === "verifying" ? <><Spinner className="h-4 w-4" />Verifying payment...</> : null}
                       {paymentState === "verified" ? <><CheckCircle2 className="h-4 w-4" />Payment verified</> : null}
                       {paymentState === "error" ? <>Payment initialization failed<ArrowRight className="h-4 w-4" /></> : null}
-                      {paymentState === "idle" ? <>Continue with {selectedGateway === "razorpay" ? "Razorpay" : selectedGateway === "phonepe" ? "PhonePe" : "Cashfree"}<ArrowRight className="h-4 w-4" /></> : null}
+                      {paymentState === "idle" && paymentMethod === "wallet" ? <>Buy with Account Credit<ArrowRight className="h-4 w-4" /></> : null}
+                      {paymentState === "idle" && paymentMethod !== "wallet" ? <>Continue with {selectedGateway === "razorpay" ? "Razorpay" : selectedGateway === "phonepe" ? "PhonePe" : "Cashfree"}<ArrowRight className="h-4 w-4" /></> : null}
                     </Button>
                     <Button type="button" variant="outline" asChild className="w-full">
                       <Link href="/pricing"><ArrowLeft className="mr-2 h-4 w-4" />View plans</Link>
@@ -1591,7 +1647,7 @@ export function CheckoutContent({ bootstrap, brandName = "Cloud", siteUrl = "", 
                   </div>
                   <div className="mt-4 flex items-center gap-2 text-xs text-muted-foreground">
                     <CheckCircle2 className="h-4 w-4 text-accent" />
-                    {selectedGateway === "razorpay" ? "Secure Razorpay Checkout" : selectedGateway === "phonepe" ? "Secure PhonePe Checkout" : selectedGateway === "cashfree" ? "Secure Cashfree Checkout" : "No payment gateway available"}
+                    {paymentMethod === "wallet" ? "Paid instantly from your Account Credit — no payment gateway involved" : selectedGateway === "razorpay" ? "Secure Razorpay Checkout" : selectedGateway === "phonepe" ? "Secure PhonePe Checkout" : selectedGateway === "cashfree" ? "Secure Cashfree Checkout" : "No payment gateway available"}
                   </div>
                 </div>
               </aside>

@@ -27,6 +27,7 @@ import {
   RefreshCw,
   RotateCcw,
   Server,
+  Tag,
   UserRound,
   Wrench,
 } from "lucide-react"
@@ -61,6 +62,8 @@ type VpsStatus = {
   provisioningStatus?: string
   currentStep?: string
   hostname?: string
+  displayTag?: string | null
+  name?: string | null
   ipAddress?: string | null
   plan?: string
   os?: string | null
@@ -266,6 +269,10 @@ export default function VPSControlPanel() {
   const [credentials, setCredentials] = useState<{ ip?: string | null; username?: string | null; password?: string | null; passwordAvailable?: boolean; hostname?: string | null } | null>(null)
   const [showCredentialPassword, setShowCredentialPassword] = useState(false)
   const [rotationStatus, setRotationStatus] = useState<{ state: string; lastChangedAt: string | null; method?: string; username?: string | null } | null>(null)
+  const [tagDialogOpen, setTagDialogOpen] = useState(false)
+  const [tagDraft, setTagDraft] = useState("")
+  const [tagSaving, setTagSaving] = useState(false)
+  const [tagError, setTagError] = useState<string | null>(null)
   const supplementalFetchRef = useRef({ logsAt: 0, bandwidthAt: 0, metricsAt: 0 })
 
   const currentState = stateOf(status)
@@ -655,6 +662,35 @@ export default function VPSControlPanel() {
     )
   }
 
+  async function saveServerTag() {
+    setTagSaving(true)
+    setTagError(null)
+    try {
+      const body = await readJsonResponse(
+        await fetch(`/api/client/vps/${id}/tag`, {
+          method: "PATCH",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ serverTag: tagDraft }),
+        }),
+      )
+      if (!body?.success) throw new Error(body?.error || "Failed to update Server Tag.")
+      const savedTag = String(body.serverTag || "")
+      setStatus((prev) => (prev ? { ...prev, displayTag: savedTag, name: savedTag || prev.name } : prev))
+      setTagDialogOpen(false)
+      toast.success("Server Tag updated")
+    } catch (e: any) {
+      setTagError(e?.message || "Failed to update Server Tag.")
+    } finally {
+      setTagSaving(false)
+    }
+  }
+
+  async function openTagDialog() {
+    setTagDraft(status?.displayTag || "")
+    setTagError(null)
+    setTagDialogOpen(true)
+  }
+
   return (
     <Container className="overflow-x-hidden py-3">
       <div className="space-y-4">
@@ -662,7 +698,7 @@ export default function VPSControlPanel() {
           <CardContent className="flex flex-col gap-4 p-4 lg:flex-row lg:items-center lg:justify-between">
             <div className="min-w-0 space-y-3">
               <div className="flex flex-wrap items-center gap-2">
-                <h1 className="truncate text-2xl font-semibold tracking-tight">{status?.hostname || "Cloud server"}</h1>
+                <h1 className="truncate text-2xl font-semibold tracking-tight">{status?.name || status?.hostname || "Cloud server"}</h1>
                 <span className={`inline-flex items-center gap-1 rounded-full border px-2.5 py-1 text-xs font-semibold ${statusClass(currentState)} ${currentState === "provisioning" ? "animate-pulse" : ""}`}>
                   {stateLabel(currentState)}
                 </span>
@@ -749,6 +785,13 @@ export default function VPSControlPanel() {
               </CardHeader>
               <CardContent className="grid min-w-0 gap-3 sm:grid-cols-2 lg:grid-cols-3">
                 <CredentialCard icon={Server} label="Hostname" value={credentials?.hostname || status?.hostname || null} onCopy={copySecret} />
+                <CredentialCard
+                  icon={Tag}
+                  label="Server Tag"
+                  value={status?.displayTag || null}
+                  onCopy={copySecret}
+                  action={<Button size="icon-sm" variant="ghost" type="button" onClick={() => void openTagDialog()} title="Edit Server Tag" className={iconActionButtonClass}><Wrench className="h-4 w-4" /></Button>}
+                />
                 <CredentialCard icon={Globe2} label="IP address" value={credentials?.ip || status?.ipAddress || null} onCopy={copySecret} />
                 <CredentialCard icon={UserRound} label="Username" value={credentials?.username || status?.username || null} onCopy={copySecret} />
                 <CredentialCard
@@ -933,6 +976,25 @@ export default function VPSControlPanel() {
             <Button onClick={() => void changePassword()} disabled={loadingAction === "password" || !passwordForm.password || passwordForm.password.length < 12}>
               {loadingAction === "password" ? "Rotating…" : "Rotate password"}
             </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={tagDialogOpen} onOpenChange={setTagDialogOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Server Tag</DialogTitle>
+            <DialogDescription>Your own label for this server (letters, numbers, spaces, hyphens, underscores — up to 64 characters). The system hostname and IP are managed automatically and are not affected.</DialogDescription>
+          </DialogHeader>
+          {tagError ? <div className="rounded-md border border-red-400/30 bg-red-400/10 p-3 text-xs text-red-200">{tagError}</div> : null}
+          <div className="grid gap-2 py-2">
+            <Label htmlFor="server-tag">Server Tag (optional)</Label>
+            <Input id="server-tag" value={tagDraft} maxLength={64} placeholder="e.g. Production Database" onChange={(event) => setTagDraft(event.target.value)} />
+            <p className="text-xs text-muted-foreground">Shown in your server list and backup history. Leave blank to use the automatic IP hostname.</p>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setTagDialogOpen(false)} disabled={tagSaving}>Cancel</Button>
+            <Button onClick={() => void saveServerTag()} disabled={tagSaving}>{tagSaving ? "Saving…" : "Save tag"}</Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>

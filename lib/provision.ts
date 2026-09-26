@@ -36,7 +36,7 @@ import { discoverVmIpAddress } from "@/lib/vm-ip-discovery"
 import { assertPaymentVerifiedForProvisioning } from "@/lib/payment-state"
 import { persistVpsConsoleMetadata } from "@/lib/console-metadata"
 import { ensureCloudInitBeforeStart } from "@/lib/vps-control"
-import { hostnameFromIp } from "@/lib/vm-hostname"
+import { hostnameFromIp, normalizeServerTag } from "@/lib/vm-hostname"
 import { expandGuestPrimaryDisk, waitForGuestExec } from "@/lib/vm-guest-disk"
 import { publishLiveVmSnapshot } from "@/lib/proxmox-live"
 import { validateReinstallNetwork } from "@/lib/vm-network-orchestrator"
@@ -1737,6 +1737,7 @@ async function enqueueJob(orderId: string, actor: string, type: EnqueueType, opt
       let vmid = service?.vmid || null
       const node = order.operatingSystem?.proxmoxNode?.id === order.proxmoxNodeId ? order.operatingSystem.proxmoxNode : null
       const hostname = order.hostname || hostnameForOrder(order)
+      const instanceDisplayTag = normalizeServerTag((order as any).displayTag) || null
       const requestedOsFamily = order.requestedOsFamily || order.operatingSystem?.osFamily || null
       const requestedOsVersion = order.requestedOsVersion || order.operatingSystem?.osVersion || null
 
@@ -1757,6 +1758,7 @@ async function enqueueJob(orderId: string, actor: string, type: EnqueueType, opt
           accessMethod: order.accessMethod || "PASSWORD",
           sshKeyId: order.sshKeyId || null,
           adminUsername: order.adminUsername || null,
+          displayTag: instanceDisplayTag,
           cpuCores: Number(order.product?.cpuCores || order.customConfig?.cpuCores || 1),
           ramGb: Number(order.product?.ramGb || order.customConfig?.ramGb || 1),
           diskGb: Number(order.product?.storageGb || (Array.isArray(order.customConfig?.disks) ? (order.customConfig!.disks as any[]).reduce((sum, disk) => sum + Number(disk?.sizeGb || 0), 0) : 0)),
@@ -1824,7 +1826,7 @@ async function enqueueJob(orderId: string, actor: string, type: EnqueueType, opt
             userName: order.customer!.name || "there",
             email: order.customer!.email,
             orderId: order.orderNumber,
-            serviceName: hostname,
+            serviceName: instanceDisplayTag || hostname,
           },
           orderId: order.id,
           vpsInstanceId: service?.id || null,
@@ -2171,6 +2173,7 @@ async function upsertServiceState(input: {
   coresPerSocket?: number | null
   ramGb?: number | null
   diskGb?: number | null
+  displayTag?: string | null
   storagePoolId?: string | null
   storagePoolSnapshot?: any
   status:
@@ -2213,6 +2216,7 @@ async function upsertServiceState(input: {
       coresPerSocket: input.coresPerSocket === undefined ? undefined : input.coresPerSocket,
       ramGb: input.ramGb || null,
       diskGb: input.diskGb || null,
+      displayTag: input.displayTag === undefined ? undefined : (input.displayTag || null),
       storagePoolId: input.storagePoolId === undefined ? undefined : input.storagePoolId,
       storagePoolSnapshot: input.storagePoolSnapshot === undefined ? undefined : input.storagePoolSnapshot,
     },
@@ -2238,6 +2242,7 @@ async function upsertServiceState(input: {
       coresPerSocket: input.coresPerSocket || null,
       ramGb: input.ramGb || null,
       diskGb: input.diskGb || null,
+      displayTag: input.displayTag || null,
       storagePoolId: input.storagePoolId || null,
       storagePoolSnapshot: input.storagePoolSnapshot || undefined,
     },

@@ -9,7 +9,7 @@ import { getBrandName } from "@/lib/settings/site-settings"
 import { consoleModeLabel } from "@/lib/console-mode"
 import { getConsoleAccess, getConsoleSettings } from "@/lib/console-access"
 import { consoleModeForResolvedType, normalizeConsoleType, resolveConsoleType } from "@/lib/console-resolution"
-import { instanceDisplayName, internalVmHostname } from "@/lib/vm-hostname"
+import { friendlyVmDisplayName, instanceDisplayName, internalVmHostname } from "@/lib/vm-hostname"
 
 const ACTIVE_IP_STATUSES = ["active", "assigned", "used", "reserved", "moved", "pending"]
 
@@ -290,14 +290,13 @@ function clientSnapshotRow(row: any) {
 }
 
 function clientBackupRow(row: any) {
-  const raw = String(row.backupPath || row.fileName || "")
-  const archive = raw ? raw.split(":").pop()!.split("/").pop() || raw : null
   return {
     id: row.id,
     status: row.status,
     sizeBytes: row.sizeBytes ?? null,
     schedule: row.schedule || null,
-    fileName: archive,
+    // The internal storage artifact name (volid/fileName) is NEVER exposed to
+    // clients — Proxmox internals must not leak to customer surfaces.
     startedAt: iso(row.startedAt),
     completedAt: iso(row.completedAt),
     finishedAt: iso(row.finishedAt),
@@ -597,6 +596,8 @@ export async function serializeClientVmStatus(vps: any) {
     steps: customerSteps(job?.steps || [], job?.type),
     hostname: instanceDisplayName(vps),
     instanceName: instanceDisplayName(vps),
+    displayTag: typeof vps.displayTag === "string" ? vps.displayTag : null,
+    name: friendlyVmDisplayName(vps) || instanceDisplayName(vps),
     internalHostname: internalVmHostname(vps, canonical.primaryIp || vps.ipAddress || null),
     vmid: null,
     nodeName: null,
@@ -916,6 +917,8 @@ export async function serializeClientVmListRow(vps: any, customer: any, canonica
     orderNumber: vps.order.orderNumber,
     hostname: instanceDisplayName(vps),
     instanceName: instanceDisplayName(vps),
+    displayTag: typeof vps.displayTag === "string" ? vps.displayTag : null,
+    name: friendlyVmDisplayName(vps) || instanceDisplayName(vps),
     internalHostname: internalVmHostname(vps, canonical?.primaryIp || vps.ipAddress || null),
     ipAddress: canonical?.primaryIp || vps.ipAddress || null,
     primaryIp: canonical?.primaryIp || vps.ipAddress || null,
