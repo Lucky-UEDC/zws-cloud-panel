@@ -35,6 +35,9 @@ This branch tracks the product roadmap and planning documents for the UltraEdge 
 - ✅ Immutable image tagging (source-fingerprint + semver + digest)
 - ✅ Runtime build-info endpoint (version / commit / built-at)
 - ✅ Client-side infra leak removal (no node names, UPIDs, or paths to customers)
+- ✅ Client backup page hardening: self-service delete (artifact-first, usage recalc, audit trail), friendly label/IP selector (no internal vmId), error≠empty UI, no artifact path/fileName exposure
+- ✅ Server Tag identity (`displayTag`): customer-managed display name end-to-end (checkout → list → detail → backups), hostname auto-derived from public IP and never customer-editable
+- ✅ Account Credit wallet payments in checkout: credit default when it covers payable, atomic exact/insufficient debit, credit path never opens a payment gateway
 - ✅ Vulnerability-ish gaps closed: gateway mismatch detection, run guards, entitlement checks on every backup start
 
 ## Phase 4 — Update Center (shipped ✅)
