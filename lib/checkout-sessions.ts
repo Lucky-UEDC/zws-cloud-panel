@@ -8,6 +8,79 @@ function record(value: unknown): Record<string, any> {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, any> : {}
 }
 
+/** Valid Order model fields (from Prisma schema) */
+const ORDER_MODEL_FIELDS = new Set([
+  "orderNumber",
+  "customerId",
+  "productId",
+  "offerId",
+  "customConfigId",
+  "nodeClassId",
+  "storagePoolId",
+  "orderType",
+  "termMonths",
+  "unitPrice",
+  "quantity",
+  "subtotal",
+  "taxAmount",
+  "discountAmount",
+  "totalAmount",
+  "originalAmount",
+  "finalAmount",
+  "payableAmount",
+  "couponCode",
+  "couponId",
+  "offerSnapshot",
+  "nodeClassSnapshot",
+  "storagePoolSnapshot",
+  "cpuSockets",
+  "coresPerSocket",
+  "gatewayMode",
+  "cashfreeOrderId",
+  "cashfreePaymentSessionId",
+  "operatingSystemId",
+  "requestedOsFamily",
+  "requestedOsVersion",
+  "osName",
+  "templateVmid",
+  "proxmoxNodeId",
+  "provisioningStatus",
+  "provisioningError",
+  "provisionedAt",
+  "serviceId",
+  "hostname",
+  "adminUsername",
+  "passwordEncrypted",
+  "sshPublicKey",
+  "accessMethod",
+  "sshKeyId",
+  "currency",
+  "status",
+  "isActive",
+  "notes",
+  "metadata",
+  "vmId",
+  "proxmoxNode",
+  "couponId",
+  "offerId",
+  "nodeClassId",
+  "storagePoolId",
+  "nodeClassSnapshot",
+  "storagePoolSnapshot",
+  "offerSnapshot",
+])
+
+/** Filter order input to only include valid Order model fields */
+function filterOrderInput(input: Record<string, any>): Record<string, any> {
+  const filtered: Record<string, any> = {}
+  for (const [key, value] of Object.entries(input)) {
+    if (ORDER_MODEL_FIELDS.has(key)) {
+      filtered[key] = value
+    }
+  }
+  return filtered
+}
+
 function orderList(snapshot: Record<string, any>) {
   const orderData = record(snapshot.orderData)
   const bulkOrders = Array.isArray(snapshot.bulkOrders)
@@ -88,7 +161,7 @@ export async function fulfillCheckoutSession(input: {
 
     const orders = []
     for (const source of ordersInput) {
-      const inputOrder = { ...source }
+      const inputOrder = filterOrderInput({ ...source })
       if (customConfigId && !inputOrder.customConfigId) inputOrder.customConfigId = customConfigId
       orders.push(await tx.order.create({ data: inputOrder as any }))
     }
