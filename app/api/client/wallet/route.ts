@@ -1,9 +1,10 @@
 import { NextResponse } from "next/server"
 import { prisma } from "@/lib/db"
 import { getClientFromCookies } from "@/lib/server-auth"
-import { getBillingPricingSettings, getPaymentSettings } from "@/lib/settings"
+import { getBillingPricingSettings, getPaymentSettings, getCreditSettings } from "@/lib/settings"
 import { WALLET_TOPUP_PURPOSE, LEGACY_WALLET_TOPUP_PURPOSE, resolveMinimumWalletTopupAmount } from "@/lib/wallet-topup"
 import { getRegionalPrice, getUserCountry } from "@/lib/regional-pricing"
+import { resolveGatewayFeeConfig } from "@/lib/billing/gateway-fee"
 
 export async function GET(request: Request) {
   const client = await getClientFromCookies()
@@ -11,7 +12,7 @@ export async function GET(request: Request) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
   }
 
-  const [customer, pendingTopup, billingPricing, paymentSettings] = await Promise.all([
+  const [customer, pendingTopup, billingPricing, paymentSettings, creditSettings] = await Promise.all([
     prisma.customer.findUnique({
       where: { id: String(client.sub) },
       select: {
@@ -41,6 +42,7 @@ export async function GET(request: Request) {
     }),
     getBillingPricingSettings().catch(() => null),
     getPaymentSettings().catch(() => null),
+    getCreditSettings().catch(() => null),
   ])
 
   if (!customer) return NextResponse.json({ error: "Customer not found" }, { status: 404 })
@@ -59,6 +61,9 @@ export async function GET(request: Request) {
     context: { source: "client_wallet_minimum_topup" },
   }).catch(() => null)
 
+  // Resolve gateway fee config for live top-up fee preview (uses default gateway if none selected)
+  const feeConfig = await resolveGatewayFeeConfig("razorpay").catch(() => null)
+
   return NextResponse.json({
     balance: Number(customer.walletBalance),
     currency: "INR",
@@ -66,6 +71,13 @@ export async function GET(request: Request) {
     localizedBalance,
     minimumTopupAmount,
     localizedMinimumTopup,
+    topupFeeConfig: feeConfig ? {
+      feePercent: feeConfig.feePercent,
+      fixedFee: feeConfig.fixedFee,
+      minAmount: feeConfig.minAmount,
+      maxAmount: feeConfig.maxAmount,
+      configured: feeConfig.configured,
+    } : null,
     transactions: customer.walletTransactions.map((transaction) => {
       const amount = Number(transaction.amount || 0)
       return {

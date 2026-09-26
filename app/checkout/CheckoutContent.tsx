@@ -1647,7 +1647,7 @@ export function CheckoutContent({ bootstrap, brandName = "Cloud", siteUrl = "", 
                   </div>
                   <div className="mt-4 flex items-center gap-2 text-xs text-muted-foreground">
                     <CheckCircle2 className="h-4 w-4 text-accent" />
-                    {paymentMethod === "wallet" ? "Paid instantly from your Account Credit — no payment gateway involved" : selectedGateway === "razorpay" ? "Secure Razorpay Checkout" : selectedGateway === "phonepe" ? "Secure PhonePe Checkout" : selectedGateway === "cashfree" ? "Secure Cashfree Checkout" : "No payment gateway available"}
+                    {paymentMethod === "wallet" ? "Paid from Account Credit" : selectedGateway === "razorpay" ? "Secure Razorpay Checkout" : selectedGateway === "phonepe" ? "Secure PhonePe Checkout" : selectedGateway === "cashfree" ? "Secure Cashfree Checkout" : "No payment gateway available"}
                   </div>
                 </div>
               </aside>

@@ -32,6 +32,14 @@ type PendingTopup = PaymentRedirectResponse & {
   createdAt: string
 }
 
+type TopupFeeConfig = {
+  feePercent: number
+  fixedFee: number
+  minAmount: number | null
+  maxAmount: number | null
+  configured: boolean
+}
+
 export default function ClientWalletPage() {
   const searchParams = useSearchParams()
   const [balance, setBalance] = useState(0)
@@ -42,6 +50,7 @@ export default function ClientWalletPage() {
   const [topupAmount, setTopupAmount] = useState("1000")
   const [topupLoading, setTopupLoading] = useState(false)
   const [topupFee, setTopupFee] = useState<{ grossAmount: number; feePercent: number; fixedFee: number; feeAmount: number; netAmount: number } | null>(null)
+  const [feeConfig, setFeeConfig] = useState<TopupFeeConfig | null>(null)
 
   async function load() {
     try {
@@ -53,6 +62,7 @@ export default function ClientWalletPage() {
         setMinimumTopupAmount(Number(data.minimumTopupAmount || 100))
         setTransactions(data.transactions || [])
         setPendingTopup(data.pendingTopup || null)
+        if (data.topupFeeConfig) setFeeConfig(data.topupFeeConfig)
       } else {
         toast.error(data?.message || data?.error || "Wallet could not be loaded.")
       }
@@ -72,11 +82,25 @@ export default function ClientWalletPage() {
     }
   }, [searchParams])
 
+  // Live fee calculation while typing
   const amountText = topupAmount.trim()
   const topupAmountNumber = /^\d+(\.\d{1,2})?$/.test(amountText) ? Number(amountText) : NaN
   const belowMinimum = Number.isFinite(topupAmountNumber) && topupAmountNumber > 0 && topupAmountNumber < minimumTopupAmount
   const isTopupAmountValid = Number.isFinite(topupAmountNumber) && topupAmountNumber > 0 && !belowMinimum
   const topupDisabled = topupLoading || !isTopupAmountValid
+
+  // Client-side instant fee preview
+  useEffect(() => {
+    if (!feeConfig || !Number.isFinite(topupAmountNumber) || topupAmountNumber <= 0) {
+      setTopupFee(null)
+      return
+    }
+    const gross = Math.round(topupAmountNumber * 100) / 100
+    const { feePercent, fixedFee } = feeConfig
+    const feeAmount = Math.round((gross * (feePercent / 100) + fixedFee) * 100) / 100
+    const netAmount = Math.round((gross - feeAmount) * 100) / 100
+    setTopupFee({ grossAmount: gross, feePercent, fixedFee, feeAmount, netAmount })
+  }, [feeConfig, topupAmountNumber])
 
   async function topup() {
     if (topupLoading) return

@@ -172,6 +172,13 @@ function freshnessLabel(item?: { state?: string; lastUpdatedAt?: string | null }
   return { state, updated }
 }
 
+function diskFreshnessLabel(item?: { state?: string; checkedAt?: string | null; source?: string | null }) {
+  const state = String(item?.state || "OFFLINE").toUpperCase()
+  const checked = item?.checkedAt ? formatDate(item.checkedAt, true) : "Never"
+  const src = item?.source || "unknown"
+  return { state, checked, source: src }
+}
+
 function metricUnavailable(item?: { state?: string; source?: string | null }) {
   const state = String(item?.state || "").toUpperCase()
   const source = String(item?.source || "").toLowerCase()
@@ -290,6 +297,7 @@ export default function VPSControlPanel() {
   const bandwidthPercent = bandwidthIncluded > 0 ? Math.min(100, Math.max(0, (bandwidthTotal / bandwidthIncluded) * 100)) : 0
   const networkQuality = bandwidth?.throttled ? "Limited" : liveState === "offline" ? "Offline" : liveState === "connected" ? "Good" : "Checking"
   const bandwidthFreshness = freshnessLabel(bandwidth?.freshness)
+  const diskFreshness = diskFreshnessLabel(status?.diskUsage)
   const diskReadRate = latestMetric?.diskReadBytesRate || 0
   const diskWriteRate = latestMetric?.diskWriteBytesRate || 0
 
@@ -337,6 +345,15 @@ export default function VPSControlPanel() {
     if (res.ok && data?.summary) setBandwidth(data.summary)
   }, [id])
 
+  const fetchDiskUsage = useCallback(async () => {
+    if (!id) return
+    const res = await fetch(`/api/client/vps/${id}/disk-usage`, { cache: "no-store" })
+    const data = await readJsonResponse<any>(res)
+    if (res.ok && data?.diskUsage) {
+      setStatus((current) => current ? { ...current, diskUsage: data.diskUsage } : current)
+    }
+  }, [id])
+
   const fetchLogs = useCallback(async () => {
     try {
       const res = await fetch(`/api/client/vps/${id}/logs`, { cache: "no-store" })
@@ -359,6 +376,12 @@ export default function VPSControlPanel() {
       supplementalFetchRef.current.bandwidthAt = now
       supplemental.push(fetchBandwidth())
     }
+    // Poll disk usage every 30s ONLY while VM is running (lightweight endpoint)
+    if (isRunning && now - supplementalFetchRef.current.metricsAt > 30_000) {
+      supplementalFetchRef.current.metricsAt = now
+      supplemental.push(fetchDiskUsage())
+    }
+    // Full metrics (CPU/RAM/Network) only when live stream is not connected
     if (isRunning && liveState !== "connected" && now - supplementalFetchRef.current.metricsAt > 15_000) {
       supplementalFetchRef.current.metricsAt = now
       supplemental.push(fetchMetrics())
@@ -735,7 +758,7 @@ export default function VPSControlPanel() {
             <div className="grid min-w-0 gap-4 sm:grid-cols-2 xl:grid-cols-4">
               <ResourceCard title="CPU" icon={Gauge} value={isRunning ? metricUnavailable(status?.metricsFreshness?.cpu) ? "Monitoring unavailable" : formatPercent(status?.cpuPercent) : currentState === "provisioning" ? "Preparing server" : "Server offline"} subvalue={`${status?.resources?.cpuCores || status?.cpuCores || "-"} cores`} freshness={status?.metricsFreshness?.cpu} metricKey="cpuPercent" data={metricSeries} paused={!isRunning} accent="#22c55e" />
               <ResourceCard title="RAM" icon={MemoryStick} value={isRunning ? metricUnavailable(status?.metricsFreshness?.memory) ? "Monitoring unavailable" : `${formatBytesDecimal(status?.ramUsedBytes, { fallback: "0 MB" })} / ${formatBytesDecimal(status?.ramTotalBytes, { fallback: "0 MB" })}` : currentState === "provisioning" ? "Preparing server" : "Server offline"} subvalue={isRunning && !metricUnavailable(status?.metricsFreshness?.memory) ? formatPercent(status?.ramPercent) : ""} freshness={status?.metricsFreshness?.memory} metricKey="ramPercent" data={metricSeries} paused={!isRunning} accent="#38bdf8" progress={status?.ramPercent} />
-              <ResourceCard title="Disk" icon={HardDrive} value={isRunning && status?.diskUsage?.reported ? status.diskUsage.usedGb === null || status.diskUsage.usedGb === undefined ? "Usage unavailable" : `${formatGbDecimal(status.diskUsage.usedGb)} used` : currentState === "provisioning" ? "Preparing server" : "Server offline"} subvalue={status?.diskUsage?.reported ? `${status.diskUsage.freeGb === null || status.diskUsage.freeGb === undefined ? "Usage unavailable" : `${formatGbDecimal(status.diskUsage.freeGb, "0 GB")} free`} / ${formatGbDecimal(status.diskUsage.totalGb, "-")} · ${formatByteRateDecimal(diskReadRate)} read · ${formatByteRateDecimal(diskWriteRate)} write` : ""} freshness={status?.metricsFreshness?.disk} metricKey="diskPercent" data={metricSeries} paused={!isRunning} accent="#a78bfa" progress={status?.diskUsage?.percent} />
+              <ResourceCard title="Disk" icon={HardDrive} value={isRunning && status?.diskUsage?.reported ? status.diskUsage.usedGb === null || status.diskUsage.usedGb === undefined ? "Usage unavailable" : `${formatGbDecimal(status.diskUsage.usedGb)} used` : currentState === "provisioning" ? "Preparing server" : "Server offline"} subvalue={status?.diskUsage?.reported ? `${status.diskUsage.freeGb === null || status.diskUsage.freeGb === undefined ? "Usage unavailable" : `${formatGbDecimal(status.diskUsage.freeGb, "0 GB")} free`} / ${formatGbDecimal(status.diskUsage.totalGb, "-")} · ${formatByteRateDecimal(diskReadRate)} read · ${formatByteRateDecimal(diskWriteRate)} write` : ""} freshness={status?.diskUsage} metricKey="diskPercent" data={metricSeries} paused={!isRunning} accent="#a78bfa" progress={status?.diskUsage?.percent} />
               <ResourceCard title="Network" icon={BarChart3} value={isRunning ? metricUnavailable(status?.metricsFreshness?.network) || (!networkDownRate && !networkUpRate) ? "No traffic sample" : `${formatRateDecimal(networkDownRate)} down` : currentState === "provisioning" ? "Preparing server" : "Server offline"} subvalue={isRunning && !metricUnavailable(status?.metricsFreshness?.network) && (networkDownRate || networkUpRate) ? `${formatRateDecimal(networkUpRate)} up` : ""} freshness={status?.metricsFreshness?.network} metricKey="networkInBytesRate" data={metricSeries} paused={!isRunning} accent="#14b8a6" />
             </div>
 
@@ -1011,8 +1034,9 @@ function ActionButton({ icon: Icon, label, onClick, busy, disabled }: { icon: an
   )
 }
 
-function ResourceCard({ title, icon: Icon, value, subvalue, freshness, data, metricKey, paused, accent = "#60a5fa", progress }: { title: string; icon: any; value: string; subvalue?: string; freshness?: { state?: string; lastUpdatedAt?: string | null }; data: MetricPoint[]; metricKey: string; paused?: boolean; accent?: string; progress?: number | null }) {
-  const fresh = freshnessLabel(freshness)
+function ResourceCard({ title, icon: Icon, value, subvalue, freshness, data, metricKey, paused, accent = "#60a5fa", progress }: { title: string; icon: any; value: string; subvalue?: string; freshness?: { state?: string; lastUpdatedAt?: string | null; checkedAt?: string | null; source?: string | null }; data: MetricPoint[]; metricKey: string; paused?: boolean; accent?: string; progress?: number | null }) {
+  const isDisk = title === "Disk"
+  const fresh = isDisk ? diskFreshnessLabel(freshness) : freshnessLabel(freshness)
   const live = fresh.state === "LIVE"
   const stale = fresh.state === "STALE"
   return (
@@ -1025,7 +1049,9 @@ function ResourceCard({ title, icon: Icon, value, subvalue, freshness, data, met
         <div>
           <div className="text-lg font-semibold">{value}</div>
           {subvalue ? <div className="text-xs text-muted-foreground">{subvalue}</div> : null}
-          <div className="text-xs text-muted-foreground">Last update {fresh.updated}</div>
+          <div className="text-xs text-muted-foreground">
+            {isDisk && "checked" in fresh && fresh.checked ? `Last checked ${fresh.checked} (${fresh.source})` : "updated" in fresh && fresh.updated ? `Last update ${fresh.updated}` : ""}
+          </div>
         </div>
         {progress !== undefined && progress !== null ? <Progress value={Math.max(0, Math.min(100, Number(progress || 0)))} /> : null}
         <div className="h-20">

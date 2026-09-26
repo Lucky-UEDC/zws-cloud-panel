@@ -4,11 +4,19 @@ import { createProxmoxClient } from "@/lib/proxmox"
 import { markRuntimeCompleteIfReady, probeVmRuntimeHealth } from "@/lib/vm-runtime-health"
 
 const DEPLOYMENT_STAGES = [
-  { key: "SELECTING_ZONE", title: "Selecting deployment location", matches: ["pending", "paid", "QUEUED", "pending", "validating", "SELECTING_NODE", "WAITING_FOR_ADMIN", "WAITING_FOR_CAPACITY"] },
-  { key: "DEPLOYING_SERVER", title: "Deploying cloud server", matches: ["node_selected", "cloning", "CLONING_TEMPLATE", "CLONE_COMPLETE", "RESIZING_DISK"] },
-  { key: "ASSIGNING_NETWORK", title: "Assigning network", matches: ["ip_reserved", "ASSIGNING_IP"] },
-  { key: "STARTING_SERVER", title: "Starting server", matches: ["starting", "configuring", "APPLYING_CLOUD_INIT", "CONFIGURING_VM", "STARTING_VM", "VERIFYING_VM", "STOPPED"] },
-  { key: "SERVICE_ACTIVE", title: "Service active", matches: ["delivered", "ACTIVE"] },
+  { key: "PAYMENT_PENDING", title: "Payment pending", matches: ["payment_pending", "pending_payment", "payment_processing"] },
+  { key: "PAYMENT_CONFIRMED", title: "Payment confirmed", matches: ["paid", "payment_success", "payment_confirmed"] },
+  { key: "ORDER_ACCEPTED", title: "Order accepted", matches: ["order_accepted", "queued", "QUEUED"] },
+  { key: "SELECTING_LOCATION", title: "Selecting deployment location", matches: ["SELECTING_NODE", "WAITING_FOR_CAPACITY", "WAITING_FOR_ADMIN"] },
+  { key: "CLONING_TEMPLATE", title: "Installing operating system", matches: ["CLONING_TEMPLATE", "CLONE_COMPLETE"] },
+  { key: "CONFIGURING_VM", title: "Configuring server", matches: ["CONFIGURING_VM", "RESIZING_DISK"] },
+  { key: "INSTALLING_OS", title: "Applying cloud-init", matches: ["APPLYING_CLOUD_INIT"] },
+  { key: "CONFIGURING_NETWORK", title: "Configuring network", matches: ["ASSIGNING_IP", "ip_reserved"] },
+  { key: "STARTING_VM", title: "Starting server", matches: ["STARTING_VM"] },
+  { key: "DETECTING_IP", title: "Detecting IP address", matches: ["VERIFYING_VM", "starting", "configuring"] },
+  { key: "CONFIGURING_GUEST", title: "Configuring guest", matches: ["STOPPED"] },
+  { key: "VERIFYING_SERVICE", title: "Final verification", matches: ["delivered"] },
+  { key: "SERVICE_ACTIVE", title: "Service active", matches: ["ACTIVE"] },
 ]
 
 function serializeLog(log: any, jobType?: string | null) {

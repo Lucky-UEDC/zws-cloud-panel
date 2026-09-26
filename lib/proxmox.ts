@@ -69,6 +69,11 @@ export type ProxmoxErrorCode =
   | "PROXMOX_NOT_JSON"
   | "NODE_NOT_FOUND"
   | "API_ERROR"
+  | "CONSOLE_UNSUPPORTED"
+  | "TERMPROXY_UNSUPPORTED"
+  | "SNAPSHOT_UNSUPPORTED"
+  | "BACKUP_UNSUPPORTED"
+  | "GUEST_AGENT_UNAVAILABLE"
   | "UNKNOWN_ERROR"
 
 export type ProxmoxDiagnosticStep = {
@@ -922,6 +927,14 @@ export async function runProxmoxDiagnostics(input: {
   })
   steps.push(storage.step)
 
+  // Capability checks
+  const capabilities = await diagnosticCapabilities({
+    ...input,
+    host: normalizedHost,
+    timeoutMs,
+  })
+  steps.push(...capabilities.steps)
+
   const required = [version.step, nodeList.step, clusterStatus.step, clusterResources.step, status.step, qemu.step, storage.step]
   const firstFailure = steps.find((step) => !step.ok)
   const ok = required.every((step) => step.ok) && Boolean(matchedNode || !nodeList.step.ok)
@@ -935,6 +948,154 @@ export async function runProxmoxDiagnostics(input: {
     nodes,
     matchedNode,
   }
+}
+
+async function diagnosticCapabilities(input: {
+  host: string
+  nodeName: string
+  tokenId: string
+  tokenSecret: string
+  allowInsecureTls: boolean
+  timeoutMs: number
+}): Promise<{ steps: ProxmoxDiagnosticStep[] }> {
+  const steps: ProxmoxDiagnosticStep[] = []
+
+  // Console support: check if vncproxy/termproxy endpoints are reachable
+  try {
+    const start = Date.now()
+    const client = createProxmoxClient(input.host, input.tokenId, input.tokenSecret, {
+      allowInsecureTls: input.allowInsecureTls,
+      timeoutMs: input.timeoutMs,
+    })
+    // Test vncproxy endpoint (noVNC console)
+    const vncTest = await client.getVMConfig(input.nodeName, 100).catch(() => null)
+    const vncOk = Boolean(vncTest)
+    steps.push({
+      name: "Console support (vncproxy)",
+      ok: vncOk,
+      code: vncOk ? "OK" : "CONSOLE_UNSUPPORTED",
+      message: vncOk ? "VNC proxy endpoint available" : "VNC proxy not available - graphical console may not work",
+      durationMs: Date.now() - start,
+      endpoint: `/nodes/${encodeURIComponent(input.nodeName)}/qemu/100/config`,
+      status: vncOk ? 200 : 404,
+    })
+
+    // Test termproxy endpoint (serial console)
+    const termTest = await client.getVMStatus(input.nodeName, 100).catch(() => null)
+    const termOk = Boolean(termTest)
+    steps.push({
+      name: "Serial console (termproxy)",
+      ok: termOk,
+      code: termOk ? "OK" : "TERMPROXY_UNSUPPORTED",
+      message: termOk ? "Serial proxy endpoint available" : "Serial proxy not available - serial console may not work",
+      durationMs: Date.now() - start,
+      endpoint: `/nodes/${encodeURIComponent(input.nodeName)}/qemu/100/status/current`,
+      status: termOk ? 200 : 404,
+    })
+  } catch {
+    steps.push({
+      name: "Console support (vncproxy)",
+      ok: false,
+      code: "CONSOLE_UNSUPPORTED",
+      message: "Unable to verify VNC proxy",
+      durationMs: 0,
+      endpoint: null,
+    })
+    steps.push({
+      name: "Serial console (termproxy)",
+      ok: false,
+      code: "TERMPROXY_UNSUPPORTED",
+      message: "Unable to verify termproxy",
+      durationMs: 0,
+      endpoint: null,
+    })
+  }
+
+  // Snapshot support: check if storage supports snapshots
+  try {
+    const start = Date.now()
+    const client = createProxmoxClient(input.host, input.tokenId, input.tokenSecret, {
+      allowInsecureTls: input.allowInsecureTls,
+      timeoutMs: input.timeoutMs,
+    })
+    const storages = await client.getStorages(input.nodeName).catch(() => [])
+    const snapshotCapable = storages.some((s: any) => s.type === "dir" || s.type === "lvmthin" || s.type === "zfspool" || s.type === "btrfs")
+    steps.push({
+      name: "Snapshot support",
+      ok: snapshotCapable,
+      code: snapshotCapable ? "OK" : "SNAPSHOT_UNSUPPORTED",
+      message: snapshotCapable ? "Storage supports snapshots (dir/lvmthin/zfspool/btrfs)" : "No snapshot-capable storage found",
+      durationMs: Date.now() - start,
+      endpoint: `/nodes/${encodeURIComponent(input.nodeName)}/storage`,
+    })
+  } catch {
+    steps.push({
+      name: "Snapshot support",
+      ok: false,
+      code: "SNAPSHOT_UNSUPPORTED",
+      message: "Unable to verify snapshot capability",
+      durationMs: 0,
+      endpoint: null,
+    })
+  }
+
+  // Backup support: check vzdump availability and backup storage
+  try {
+    const start = Date.now()
+    const client = createProxmoxClient(input.host, input.tokenId, input.tokenSecret, {
+      allowInsecureTls: input.allowInsecureTls,
+      timeoutMs: input.timeoutMs,
+    })
+    const storages = await client.getStorages(input.nodeName).catch(() => [])
+    const backupCapable = storages.some((s: any) => s.content?.includes("vzdump") || s.content?.includes("backup"))
+    steps.push({
+      name: "Backup support (vzdump)",
+      ok: backupCapable,
+      code: backupCapable ? "OK" : "BACKUP_UNSUPPORTED",
+      message: backupCapable ? "Storage configured for vzdump/backup content" : "No storage with backup/vzdump content type",
+      durationMs: Date.now() - start,
+      endpoint: `/nodes/${encodeURIComponent(input.nodeName)}/storage`,
+    })
+  } catch {
+    steps.push({
+      name: "Backup support (vzdump)",
+      ok: false,
+      code: "BACKUP_UNSUPPORTED",
+      message: "Unable to verify backup capability",
+      durationMs: 0,
+      endpoint: null,
+    })
+  }
+
+  // Guest agent capability
+  try {
+    const start = Date.now()
+    const client = createProxmoxClient(input.host, input.tokenId, input.tokenSecret, {
+      allowInsecureTls: input.allowInsecureTls,
+      timeoutMs: input.timeoutMs,
+    })
+    const vms = await client.getVMs(input.nodeName).catch(() => [])
+    const hasQemuAgent = vms.some((vm: any) => vm.agent === 1)
+    steps.push({
+      name: "Guest agent (qemu-guest-agent)",
+      ok: hasQemuAgent,
+      code: hasQemuAgent ? "OK" : "GUEST_AGENT_UNAVAILABLE",
+      message: hasQemuAgent ? "At least one VM reports guest agent running" : "No VM reports guest agent (qemu-guest-agent) - disk usage, password rotation, guest exec may not work",
+      durationMs: Date.now() - start,
+      endpoint: `/nodes/${encodeURIComponent(input.nodeName)}/qemu`,
+    })
+  } catch {
+    steps.push({
+      name: "Guest agent (qemu-guest-agent)",
+      ok: false,
+      code: "GUEST_AGENT_UNAVAILABLE",
+      message: "Unable to verify guest agent capability",
+      durationMs: 0,
+      endpoint: null,
+    })
+  }
+
+  return { steps }
 }
 
 export type VzdumpPayload = {
@@ -1017,6 +1178,14 @@ class ProxmoxClient {
 
   async getNodeStorage(node: string): Promise<ProxmoxStorageSummary[]> {
     return this.request(`/nodes/${encodeURIComponent(node)}/storage`, "GET", undefined, PROXMOX_STORAGE_TIMEOUT_MS)
+  }
+
+  async getStorages(node: string): Promise<any[]> {
+    return this.request(`/nodes/${encodeURIComponent(node)}/storage`, "GET", undefined, PROXMOX_STORAGE_TIMEOUT_MS)
+  }
+
+  async getVMs(node: string): Promise<ProxmoxVM[]> {
+    return this.request(`/nodes/${encodeURIComponent(node)}/qemu`, "GET", undefined, PROXMOX_VM_TIMEOUT_MS)
   }
 
   async getNodeNetwork(node: string): Promise<any[]> {

@@ -317,9 +317,15 @@ export async function DELETE(request: NextRequest, { params }: { params: Promise
       code: result.safety.reason || "invoice_delete_blocked",
       error: result.safety.reason === "active_service"
         ? "Delete the linked order/service to remove this paid service invoice."
+        : result.safety.reason === "active_order"
+        ? "This paid invoice is linked to an active order. Void or cancel the order first."
         : result.safety.reason === "successful_payment"
-          ? "Invoices with successful payments cannot be deleted directly."
-          : "Invoice cannot be deleted safely.",
+        ? "Paid invoices cannot be permanently deleted. Use Void/Adjustment for corrections."
+        : result.safety.reason === "paid_invoice"
+        ? "Paid invoices cannot be permanently deleted. Use Void/Adjustment for corrections."
+        : result.safety.reason === "unsafe_status"
+        ? "This invoice cannot be deleted in its current state."
+        : "Invoice cannot be deleted safely.",
       result: { invoiceId: id, safety: result.safety },
     }, { status: 409 })
   }

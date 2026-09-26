@@ -77,6 +77,17 @@ export default function ClientDeploymentTrackerPage() {
     return mins > 0 ? `Retry in ${mins} min` : `Retry in ${seconds}s`
   }, [deployment?.retryState?.retryCountdownSeconds])
 
+  const [redirected, setRedirected] = useState(false)
+
+  useEffect(() => {
+    if (ready && deployment?.vm?.id && !redirected) {
+      setRedirected(true)
+      window.setTimeout(() => {
+        window.location.href = `/client-area/vps/${deployment.vm.id}`
+      }, 1500)
+    }
+  }, [ready, deployment?.vm?.id, redirected])
+
   if (loading && !deployment) {
     return <div className="flex min-h-[40vh] items-center justify-center"><Loader2 className="h-6 w-6 animate-spin" /></div>
   }

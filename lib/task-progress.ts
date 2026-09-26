@@ -52,7 +52,7 @@ function dedupeKey(nodeName: string, upid: string) {
 const BYTES_RE = /([\d.,]+)\s*([KMGT]iB)/g
 const PERCENT_RE = /(\d{1,3})%/
 const SPEED_RE = /([\d.,]+)\s*([KMGT]?i?B\/s)/
-const PHASE_RE = /INFO:\s+(Starting Backup|Finished Backup|creating Proxmox|starting new backup|restoring|Backup started|Backup finished|starting restored)/i
+const PHASE_RE = /INFO:\s+(Starting Backup|Finished Backup|creating Proxmox|starting new backup|restoring|Backup started|Backup finished|starting restored|Verifying Backup|Verification)/i
 
 function parseBytesHuman(s: string): number {
   const m = BYTES_RE.exec(s)
@@ -61,6 +61,25 @@ function parseBytesHuman(s: string): number {
   const unit = m[2]
   const units: Record<string, number> = { B: 1, KiB: 1024, MiB: 1024 ** 2, GiB: 1024 ** 3, TiB: 1024 ** 4, KB: 1000, MB: 1000 ** 2, GB: 1000 ** 3, TB: 1000 ** 4 }
   return num * (units[unit] || 0)
+}
+
+// Monotonic progress clamp: remember the highest seen percentage to prevent
+// regression when log lines are reordered or noisy.
+let lastPercent = 0
+let lastPercentResetAt = 0
+
+function resetPercentClamp() {
+  lastPercent = 0
+  lastPercentResetAt = Date.now()
+}
+
+function clampPercent(value: number | null): number | null {
+  if (value === null) return null
+  // Reset clamp after 2 minutes of inactivity (task likely restarted)
+  if (Date.now() - lastPercentResetAt > 2 * 60 * 1000) resetPercentClamp()
+  if (value < lastPercent) return lastPercent
+  lastPercent = value
+  return value
 }
 
 function extractLines(rawLog: any[]): string[] {
@@ -91,12 +110,14 @@ function parseVzdumpProgress(lines: string[]): {
     const phaseMatch = line.match(PHASE_RE)
     if (phaseMatch) {
       phase = phaseMatch[1] || line.replace(/^INFO:\s+/, "").slice(0, 80)
+      // Normalize verification phase for UI
+      if (/verif/i.test(phase)) phase = "Verifying backup"
     }
 
     const pctMatch = line.match(PERCENT_RE)
     if (pctMatch) {
       const p = parseInt(pctMatch[1], 10)
-      if (p >= 0 && p <= 100) percent = p
+      if (p >= 0 && p <= 100) percent = clampPercent(p)
     }
 
     // vzdump format: "INFO: 45% (3.60 GiB of 8.00 GiB)"

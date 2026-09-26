@@ -189,7 +189,7 @@ test("wallet payment is gated on eligibility and never opens a gateway", () => {
   const redirectIndex = checkout.indexOf("startPaymentRedirect(data")
   assert.ok(walletIndex >= 0, "wallet branch present")
   assert.ok(redirectIndex > walletIndex, "wallet branch short-circuits before startPaymentRedirect")
-  assert.match(checkout, /no payment gateway involved/)
+  assert.match(checkout, /Paid from Account Credit/)
 })
 
 test("wallet settle shows a receipt instead of a gateway redirect", () => {
