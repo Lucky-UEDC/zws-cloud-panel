@@ -1,5 +1,5 @@
 import Link from "next/link"
-import { AlertTriangle, ArrowLeft, RefreshCw, Stethoscope } from "lucide-react"
+import { AlertTriangle, ArrowLeft, RefreshCw, Stethoscope, Server, Cpu, HardDrive, Wifi, Terminal, Shield } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { canAccessAdminApi } from "@/lib/admin-rbac"
 import { getAdminVmDetails } from "@/lib/admin-vm-management"
@@ -62,6 +62,24 @@ export default async function AdminVmDetailPage({ params }: { params: Promise<{ 
     select: { id: true, name: true, nodeName: true },
     orderBy: [{ name: "asc" }],
   }).catch(() => []) : []
+
+  // Fetch metrics diagnostics from internal admin API (same auth context)
+  let metricsDiagnostics: any = null
+  if (vps?.id) {
+    try {
+      const baseUrl = process.env.NEXT_PUBLIC_APP_URL || `http://localhost:3000`
+      const res = await fetch(`${baseUrl}/api/admin/vms/${encodeURIComponent(vps.id)}/metrics-diagnostics`, {
+        cache: "no-store",
+        headers: { Cookie: "" }, // Cookies are forwarded automatically in Server Components
+      })
+      if (res.ok) {
+        const json = await res.json()
+        metricsDiagnostics = json.diagnostics
+      }
+    } catch {
+      // Diagnostics are supplemental; page remains usable
+    }
+  }
 
   return (
     <div className="space-y-6">
@@ -136,6 +154,136 @@ export default async function AdminVmDetailPage({ params }: { params: Promise<{ 
           <Fact label="Provisioning" value={overview.provisioningStatus || data?.stateMachine?.provisioningStatus || vps.status} />
         </div>
       </section>
+
+      {metricsDiagnostics ? (
+        <section className="rounded-lg border border-border/40 bg-card">
+          <div className="border-b p-4 flex items-center justify-between">
+            <h2 className="text-lg font-semibold">Metrics Diagnostics</h2>
+            <Button variant="outline" size="sm" asChild>
+              <Link href={`/api/admin/vms/${encodeURIComponent(vps.id)}/metrics-diagnostics`} target="_blank" rel="noopener noreferrer">
+                <Terminal className="mr-2 h-4 w-4" />Open JSON
+              </Link>
+            </Button>
+          </div>
+          <div className="p-4 space-y-4">
+            <div className="grid gap-4 md:grid-cols-3">
+              <div className="rounded-md border border-border/40 p-3">
+                <div className="flex items-center gap-2 text-sm font-medium text-muted-foreground"><Server className="h-4 w-4" />VM</div>
+                <div className="mt-1 text-lg font-mono">{metricsDiagnostics.vps?.vmid || "?"}</div>
+                <div className="text-xs text-muted-foreground">{metricsDiagnostics.vps?.node?.nodeName || "No node"}</div>
+              </div>
+              <div className="rounded-md border border-border/40 p-3">
+                <div className="flex items-center gap-2 text-sm font-medium text-muted-foreground"><Cpu className="h-4 w-4" />OS</div>
+                <div className="mt-1 text-lg">{metricsDiagnostics.vps?.osDetected || "unknown"}</div>
+                <div className="text-xs text-muted-foreground">{metricsDiagnostics.vps?.os || "No OS metadata"}</div>
+              </div>
+              <div className="rounded-md border border-border/40 p-3">
+                <div className="flex items-center gap-2 text-sm font-medium text-muted-foreground"><Shield className="h-4 w-4" />Guest Agent</div>
+                <div className="mt-1 text-lg">{metricsDiagnostics.guestAgent?.reachable ? "Reachable" : "Unreachable"}</div>
+                <div className="text-xs text-muted-foreground">Enabled: {metricsDiagnostics.guestAgent?.enabled ? "Yes" : "No"}</div>
+              </div>
+            </div>
+
+            <div className="rounded-md border border-border/40 p-3">
+              <div className="flex items-center gap-2 text-sm font-medium text-muted-foreground"><HardDrive className="h-4 w-4" />Last Disk Collection</div>
+              <div className="mt-2 grid gap-2 sm:grid-cols-3">
+                <Fact label="Command" value={metricsDiagnostics.diskCollection?.commandType || "N/A"} mono />
+                <Fact label="Duration" value={metricsDiagnostics.diskCollection?.collectionDurationMs ? `${metricsDiagnostics.diskCollection.collectionDurationMs} ms` : "N/A"} />
+                <Fact label="Source" value={metricsDiagnostics.diskCollection?.source || "N/A"} />
+                <Fact label="Checked At" value={metricsDiagnostics.diskCollection?.checkedAt ? new Date(metricsDiagnostics.diskCollection.checkedAt).toLocaleString("en-IN") : "Never"} />
+                <Fact label="Error" value={metricsDiagnostics.diskCollection?.errorCode ? `${metricsDiagnostics.diskCollection.errorCode}: ${metricsDiagnostics.diskCollection.error}` : "None"} />
+                <Fact label="Selected Volume" value={metricsDiagnostics.diskCollection?.selectedVolume ? `${metricsDiagnostics.diskCollection.selectedVolume.name} (${metricsDiagnostics.diskCollection.selectedVolume.filesystem || "N/A"})` : "N/A"} mono />
+              </div>
+            </div>
+
+            {metricsDiagnostics.diskCollection?.volumes?.length ? (
+              <div className="rounded-md border border-border/40 p-3">
+                <div className="flex items-center gap-2 text-sm font-medium text-muted-foreground"><HardDrive className="h-4 w-4" />All Volumes</div>
+                <div className="mt-2 overflow-x-auto">
+                  <table className="w-full text-sm">
+                    <thead className="border-b text-left text-muted-foreground">
+                      <tr><th className="py-1 pr-4">Name</th><th className="py-1 pr-4">Mount/Drive</th><th className="py-1 pr-4">FS</th><th className="py-1 pr-4">Total</th><th className="py-1 pr-4">Used</th><th className="py-1 pr-4">Free</th><th className="py-1">System</th></tr>
+                    </thead>
+                    <tbody>
+                      {metricsDiagnostics.diskCollection.volumes.map((v: any, idx: number) => (
+                        <tr key={idx} className="border-b">
+                          <td className="py-1 pr-4 font-mono">{v.name}</td>
+                          <td className="py-1 pr-4">{v.mountpoint || "-"}</td>
+                          <td className="py-1 pr-4">{v.filesystem || "-"}</td>
+                          <td className="py-1 pr-4 text-right">{(v.totalBytes / 1_000_000_000).toFixed(2)} GB</td>
+                          <td className="py-1 pr-4 text-right">{(v.usedBytes / 1_000_000_000).toFixed(2)} GB</td>
+                          <td className="py-1 pr-4 text-right">{(v.freeBytes / 1_000_000_000).toFixed(2)} GB</td>
+                          <td className="py-1">{v.system ? "Yes" : "No"}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            ) : null}
+
+            <div className="rounded-md border border-border/40 p-3">
+              <div className="flex items-center gap-2 text-sm font-medium text-muted-foreground"><Wifi className="h-4 w-4" />Latest Metric</div>
+              <div className="mt-2 grid gap-2 sm:grid-cols-4">
+                {metricsDiagnostics.latestMetric ? (
+                  <>
+                    <Fact label="Recorded" value={metricsDiagnostics.latestMetric.recordedAt ? new Date(metricsDiagnostics.latestMetric.recordedAt).toLocaleString("en-IN") : "N/A"} />
+                    <Fact label="CPU" value={metricsDiagnostics.latestMetric.cpuPercent ? `${metricsDiagnostics.latestMetric.cpuPercent}%` : "N/A"} />
+                    <Fact label="RAM" value={metricsDiagnostics.latestMetric.ramUsedGb !== undefined ? `${metricsDiagnostics.latestMetric.ramUsedGb} / ${metricsDiagnostics.latestMetric.ramTotalGb} GB` : "N/A"} />
+                    <Fact label="Disk" value={metricsDiagnostics.latestMetric.diskUsedGb !== undefined ? `${metricsDiagnostics.latestMetric.diskUsedGb} / ${metricsDiagnostics.latestMetric.diskTotalGb} GB (${metricsDiagnostics.latestMetric.diskFreeGb} free)` : "N/A"} />
+                    <Fact label="Runtime" value={metricsDiagnostics.latestMetric.runtimeStatus || "N/A"} />
+                    <Fact label="Source" value={metricsDiagnostics.latestMetric.source || "N/A"} />
+                  </>
+                ) : (
+                  <Fact label="Status" value="No metrics recorded" />
+                )}
+              </div>
+            </div>
+
+            <div className="rounded-md border border-border/40 p-3">
+              <div className="flex items-center gap-2 text-sm font-medium text-muted-foreground"><Terminal className="h-4 w-4" />Recent Metric History (last 5)</div>
+              <div className="mt-2 overflow-x-auto">
+                <table className="w-full text-sm">
+                  <thead className="border-b text-left text-muted-foreground">
+                    <tr><th className="py-1 pr-4">Time</th><th className="py-1 pr-4">Status</th><th className="py-1 pr-4">CPU</th><th className="py-1 pr-4">RAM</th><th className="py-1 pr-4">Disk</th><th className="py-1 pr-4">Source</th><th className="py-1">Disk Error</th></tr>
+                  </thead>
+                  <tbody>
+                    {metricsDiagnostics.recentMetrics?.map((m: any, idx: number) => (
+                      <tr key={idx} className="border-b">
+                        <td className="py-1 pr-4">{new Date(m.recordedAt).toLocaleString("en-IN")}</td>
+                        <td className="py-1 pr-4">{m.runtimeStatus || "N/A"}</td>
+                        <td className="py-1 pr-4">{m.cpuPercent}%</td>
+                        <td className="py-1 pr-4">{m.ramUsedGb} / {m.ramTotalGb} GB</td>
+                        <td className="py-1 pr-4">{m.diskUsedGb} / {m.diskTotalGb} GB</td>
+                        <td className="py-1 pr-4">{m.source || "N/A"}</td>
+                        <td className="py-1">{m.diskErrorCode || "None"}</td>
+                      </tr>
+                    ))}
+                    {!metricsDiagnostics.recentMetrics?.length ? <tr><td colSpan={7} className="py-4 text-center text-muted-foreground">No recent metrics</td></tr> : null}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            <div className="rounded-md border border-border/40 p-3">
+              <div className="flex items-center gap-2 text-sm font-medium text-muted-foreground"><HardDrive className="h-4 w-4" />VpsInstance Disk Cache</div>
+              <div className="mt-2 grid gap-2 sm:grid-cols-4">
+                {metricsDiagnostics.vpsInstanceDiskCache ? (
+                  <>
+                    <Fact label="Used" value={metricsDiagnostics.vpsInstanceDiskCache.diskUsedGb !== null ? `${metricsDiagnostics.vpsInstanceDiskCache.diskUsedGb} GB` : "N/A"} />
+                    <Fact label="Total" value={metricsDiagnostics.vpsInstanceDiskCache.diskTotalGb !== null ? `${metricsDiagnostics.vpsInstanceDiskCache.diskTotalGb} GB` : "N/A"} />
+                    <Fact label="Percent" value={metricsDiagnostics.vpsInstanceDiskCache.diskUsagePercent !== null ? `${metricsDiagnostics.vpsInstanceDiskCache.diskUsagePercent}%` : "N/A"} />
+                    <Fact label="Source" value={metricsDiagnostics.vpsInstanceDiskCache.diskUsageSource || "N/A"} />
+                    <Fact label="Checked" value={metricsDiagnostics.vpsInstanceDiskCache.diskUsageCheckedAt ? new Date(metricsDiagnostics.vpsInstanceDiskCache.diskUsageCheckedAt).toLocaleString("en-IN") : "Never"} />
+                  </>
+                ) : (
+                  <Fact label="Status" value="No disk cache recorded" />
+                )}
+              </div>
+            </div>
+          </div>
+        </section>
+      ) : null}
 
       <RelationDiagnostics relations={relations} />
 
