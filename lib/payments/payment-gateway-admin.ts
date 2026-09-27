@@ -99,6 +99,28 @@ export function activePaymentGatewayCredentials(row: any) {
   return credentials
 }
 
+/**
+ * Resolve the enabled payment_gateways row for a gateway code as an in-memory
+ * gateway config. Used by webhook verification and server-side reconciliation
+ * when a payment attempt has no linked gatewayConfig row yet. Never returns
+ * credentials for a different gateway.
+ */
+export async function fallbackGatewayConfig(gateway: "cashfree" | "phonepe" | "razorpay", host?: string | null) {
+  const row = await prisma.paymentGateway.findFirst({
+    where: { OR: [{ code: gateway }, { provider: gateway }], enabled: true },
+    orderBy: [{ priority: "asc" }, { updatedAt: "desc" }],
+  }).catch(() => null)
+  if (!row) return null
+  return {
+    id: null,
+    gateway,
+    enabled: true,
+    environment: normalizeMode(row?.mode || row?.environment),
+    approvedPaymentDomain: host || null,
+    credentialsPlain: activePaymentGatewayCredentials(row),
+  }
+}
+
 export function mergeGatewayCredentials(existing: any, incoming: unknown) {
   const previous = decryptPaymentGatewayCredentials(existing || {})
   const provider = String(existing?.code || existing?.provider || "").toLowerCase()

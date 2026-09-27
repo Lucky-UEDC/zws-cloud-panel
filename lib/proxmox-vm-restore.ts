@@ -329,7 +329,10 @@ export async function restoreVmFromBackup(input: {
     throw new ProxmoxError(409, `VM must be stopped before restore (current status=${status || "unknown"})`)
   }
 
+  onProgress?.({ phase: "Preparing restore", percent: 5 })
+
   try {
+    onProgress?.({ phase: "Restoring cloud server from archive", percent: 10 })
     const payload = await client.restoreVMFromDump(node.nodeName, {
       vmid: Number(instance.vmid),
       name: instance.instanceName || instance.name || `VM-${instance.vmid}`,
@@ -338,7 +341,7 @@ export async function restoreVmFromBackup(input: {
     const upid = normalizeUpid(payload)
 
     if (upid) {
-      onProgress?.({ phase: "Restoring cloud server from archive", percent: null })
+      onProgress?.({ phase: "Restoring cloud server from archive", percent: 20 })
       const task = await client.waitForTask(node.nodeName, upid, VM_RESTORE_TIMEOUT_MS).catch(async (error: any) => {
         const unsupported = error instanceof ProxmoxError && isUnsupportedRestore(error)
         if (unsupported) return null
@@ -346,6 +349,8 @@ export async function restoreVmFromBackup(input: {
       })
       if (!task) return { taskId: upid, status: "unsupported", reason: "Restore task rejected by node; API-based restore is unavailable on this Proxmox node." }
     }
+
+    onProgress?.({ phase: "Finalizing restore", percent: 90 })
 
     const verified = await client.getVMStatus(node.nodeName, Number(instance.vmid)).catch(() => null)
     const verifyStatus = String(verified?.status || "").toLowerCase()
@@ -357,6 +362,8 @@ export async function restoreVmFromBackup(input: {
         reason: "Restore finished but the VM is no longer stopped; the customer must start it explicitly.",
       }
     }
+
+    onProgress?.({ phase: "Verifying restore", percent: 95 })
 
     await prisma.vmBackup
       .update({
@@ -374,9 +381,12 @@ export async function restoreVmFromBackup(input: {
       metadata: { vpsInstanceId, actor },
     }).catch(() => null)
 
+    onProgress?.({ phase: "Restore complete", percent: 100 })
+
     return { taskId: upid, status: "completed", verifyStatus: "stopped" }
   } catch (error: any) {
     if (error instanceof ProxmoxError && isUnsupportedRestore(error)) {
+      onProgress?.({ phase: "Restoring cloud server from archive (SSH fallback)", percent: 10 })
       const ssh = await restoreVmViaSsh({
         node: {
           host: node.host,
@@ -389,13 +399,14 @@ export async function restoreVmFromBackup(input: {
         storage: null,
         onOutput: (text) => {
           onProgress?.({
-            phase: "Restoring cloud server from archive",
+            phase: "Restoring cloud server from archive (SSH fallback)",
             logTail: text.split("\n").map((line) => line.trim()).filter(Boolean),
             percent: null,
           })
         },
       })
       if (ssh.status === "completed") {
+        onProgress?.({ phase: "Verifying restore", percent: 95 })
         const verified = await client.getVMStatus(node.nodeName, Number(instance.vmid)).catch(() => null)
         const verifyStatus = String(verified?.status || "").toLowerCase()
         await prisma.vmBackup
@@ -412,6 +423,7 @@ export async function restoreVmFromBackup(input: {
           newValue: { vmid: Number(instance.vmid), volid, restoreTask: "ssh-qmrestore", verifyStatus },
           metadata: { vpsInstanceId, actor, mechanism: "ssh-qmrestore" },
         }).catch(() => null)
+        onProgress?.({ phase: "Restore complete", percent: 100 })
         return {
           taskId: null,
           status: "completed",

@@ -497,19 +497,43 @@ export async function getOrderPayments(orderId: string, override?: CashfreeConfi
   return Array.isArray(data) ? data : data?.data || []
 }
 
+/**
+ * Cashfree signs payment webhooks with the merchant's API client secret
+ * (HMAC-SHA256 over `${x-webhook-timestamp}${rawBody}`, base64) per Cashfree's
+ * documented webhook signature verification. A dashboard-configured webhook
+ * secret is also accepted when one is stored. Verification fails closed: every
+ * candidate must be a real Cashfree credential, and the signature must match
+ * at least one of them with a constant-time comparison.
+ */
 export function verifyWebhookSignature(
   payload: string,
   timestamp: string,
   signature: string,
-  webhookSecretOverride?: string,
+  webhookSecretOverride?: string | string[],
 ): boolean {
-  const webhookSecret = webhookSecretOverride || ''
-  if (!webhookSecret) {
-    throw new Error('Cashfree webhook secret is not configured in admin payment settings.')
+  const candidates = (Array.isArray(webhookSecretOverride) ? webhookSecretOverride : [webhookSecretOverride])
+    .map((value) => String(value || '').trim())
+    .filter(Boolean)
+  if (!candidates.length) {
+    throw new Error('Cashfree webhook secret/client secret is not configured in payment gateway settings.')
   }
   const message = `${timestamp}${payload}`
-  const expectedSignature = crypto.createHmac('sha256', webhookSecret).update(message).digest('base64')
-  return signature === expectedSignature
+  const incoming = Buffer.from(String(signature || ''), 'utf8')
+  return candidates.some((candidate) => {
+    const expected = crypto.createHmac('sha256', candidate).update(message).digest('base64')
+    const expectedBuffer = Buffer.from(expected, 'utf8')
+    return incoming.length === expectedBuffer.length && crypto.timingSafeEqual(incoming, expectedBuffer)
+  })
+}
+
+/**
+ * Cashfree sends `x-webhook-timestamp` as epoch milliseconds; tolerate epoch
+ * seconds as well so the freshness check never false-rejects a fresh webhook.
+ */
+export function parseWebhookTimestampMs(timestamp: string): number | null {
+  const value = Number(timestamp)
+  if (!Number.isFinite(value) || value <= 0) return null
+  return value < 1_000_000_000_000 ? value * 1000 : value
 }
 
 export function getCashfreeSdkUrl(modeInput?: string): string {

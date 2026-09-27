@@ -119,7 +119,7 @@ export default function ClientDeploymentTrackerPage() {
               <Metric label="Instance Status" value={deployment?.vm.status || deployment?.status || "-"} />
               <Metric label="Network" value={deployment?.network.ipAssigned ? "IP assigned" : "Waiting for IP"} />
               <Metric label="Infrastructure Zone" value={deployment?.network.infrastructureZone || "Default zone"} />
-              <Metric label="Instance ID" value={deployment?.vm.instanceId || deployment?.vm.id || deployment?.orderId || "-"} />
+              <Metric label="Instance ID" value={deployment?.vm.instanceId || deployment?.vm.id || deployment?.orderNumber || "-"} />
             </div>
           </div>
           <div className="rounded-md border border-border/40 p-4">

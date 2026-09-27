@@ -75,7 +75,7 @@ const CLIENT_EVENT_MESSAGES: Record<string, string> = {
   vm_provisioned: "Server activated",
 }
 
-const CLIENT_INTERNAL_PATTERN = /\b(?:automation|backend|cluster|cloud[- ]?init|job|lxc|node|provisioning engine|proxmox|qemu|queue|realm|storage pool|template clone|upid|vmid|vncproxy|vncwebsocket)\b|api2\/json|pveapitoken|root@pam/i
+const CLIENT_INTERNAL_PATTERN = /\b(?:automation|backend|cluster|cloud[- ]?init|cloning|job|lxc|node|provisioning engine|proxmox|qemu|queue|realm|scheduler|storage pool|template clone|upid|vmid|vncproxy|vncwebsocket|worker)\b|api2\/json|pveapitoken|root@pam|\btask (?:running|queued|started|stopped)\b|\b(?:cloning_template|clone_complete|applying_cloud_init|configuring_vm|resizing_disk|assigning_ip|starting_vm|verifying_vm|selecting_node|waiting_for_capacity|waiting_for_admin)\b/i
 
 function genericClientActivityMessage(input: string) {
   if (/network/i.test(input)) return "Network setup is being verified"

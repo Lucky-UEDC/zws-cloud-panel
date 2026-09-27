@@ -347,7 +347,9 @@ export async function finalizeSuccessfulPayment(paymentAttemptId: string, option
     const incomingAmount = options.amount === undefined || options.amount === null ? expectedAmount : money(options.amount)
     const expectedCurrency = normalizeCurrency(attempt.currency || payment.currency)
     const incomingCurrency = normalizeCurrency(options.currency || expectedCurrency)
-    if (Math.abs(incomingAmount - expectedAmount) > 0.009 || incomingCurrency !== expectedCurrency) {
+    // Compare in INR minor units (₹1.18 === 118 paise) to avoid float drift.
+    const inrMinor = (value: number) => Math.round((Number.isFinite(value) ? value : 0) * 100)
+    if (inrMinor(incomingAmount) !== inrMinor(expectedAmount) || incomingCurrency !== expectedCurrency) {
       const result = {
         finalized: false,
         reason: "amount_or_currency_mismatch",

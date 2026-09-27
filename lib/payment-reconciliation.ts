@@ -5,6 +5,7 @@ import { createInvoiceForOrder } from "@/lib/invoices"
 import { getSetting, type PaymentSettings } from "@/lib/settings"
 import { recordGatewayAttempt, safeGatewayError } from "@/lib/payment-attempts"
 import { gatewayCredentials, gatewayMode } from "@/lib/payment-gateways"
+import { fallbackGatewayConfig } from "@/lib/payments/payment-gateway-admin"
 import { markDedicatedPaymentConfirmed } from "@/lib/dedicated"
 import { finalizePaidOrder, finalizeSuccessfulPayment, handlePaidInvoice } from "@/lib/payment-finalization"
 import { fulfillCheckoutIntent } from "@/lib/checkout-intents"
@@ -42,6 +43,19 @@ function paymentMethodFromPayment(payment: any) {
 
 function delay(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+/**
+ * Resolve the gateway config used for server-side reconciliation. Prefers the
+ * config linked to the payment attempt; falls back to the enabled
+ * payment_gateways row for the same gateway code so provider verification
+ * works even before a domain config is linked.
+ */
+async function resolveReconcileGatewayConfig(gateway: string, prefer?: any): Promise<any> {
+  if (prefer) return prefer
+  if (String(gateway).toLowerCase() === "phonepe") return fallbackGatewayConfig("phonepe", null)
+  if (String(gateway).toLowerCase() === "razorpay") return fallbackGatewayConfig("razorpay", null)
+  return fallbackGatewayConfig("cashfree", null)
 }
 
 function cashfreeErrorStatus(error: any): number | null {
@@ -141,7 +155,7 @@ async function reconcileCheckoutIntentPayment(
 ): Promise<ReconcileResult> {
   const gateway = String(payment.gateway || "cashfree").toLowerCase()
   const gatewayOrderId = payment.gatewayOrderId || payment.checkoutIntent?.referenceId || orderNumberOrGatewayId
-  const gatewayConfig = payment.paymentAttempts?.[0]?.gatewayConfig
+  const gatewayConfig = await resolveReconcileGatewayConfig(gateway, payment.paymentAttempts?.[0]?.gatewayConfig)
   const credentials = gatewayCredentials(gatewayConfig || {})
   try {
     let outcome = "pending"
@@ -294,6 +308,154 @@ async function reconcileCheckoutIntentPayment(
   }
 }
 
+async function reconcileCheckoutSessionPayment(
+  payment: any,
+  paymentSettings: PaymentSettings,
+  orderNumberOrGatewayId: string,
+  actor: string,
+): Promise<ReconcileResult> {
+  const gateway = String(payment.gateway || "cashfree").toLowerCase()
+  const gatewayOrderId = payment.gatewayOrderId || payment.checkoutSession?.referenceId || orderNumberOrGatewayId
+  const gatewayConfig = await resolveReconcileGatewayConfig(gateway, payment.paymentAttempts?.[0]?.gatewayConfig)
+  const credentials = gatewayCredentials(gatewayConfig || {})
+  try {
+    let outcome = "pending"
+    let transactionId: string | null = null
+    let gatewayResponse: any = null
+    let method: string | null = null
+
+    if (gateway === "phonepe") {
+      const statusResponse = await getPhonePePaymentStatus(gatewayOrderId, {
+        merchantId: String(credentials.merchantId || ""),
+        clientId: String(credentials.clientId || ""),
+        clientSecret: String(credentials.clientSecret || ""),
+        clientVersion: String(credentials.clientVersion || ""),
+        webhookUsername: String(credentials.webhookUsername || ""),
+        webhookPassword: String(credentials.webhookPassword || ""),
+        webhookSecret: String(credentials.webhookPassword || credentials.webhookSecret || ""),
+        environment: gatewayMode(gatewayConfig) as any,
+      })
+      const data = statusResponse?.data || statusResponse
+      outcome = normalizeGatewayStatus(data?.state || statusResponse?.code, data?.paymentState || data?.state)
+      transactionId = data?.transactionId || payment.gatewayTransactionId || null
+      gatewayResponse = { source: actor, statusResponse }
+    } else {
+      const fetched = await fetchCashfreeOrderAndPaymentsWithRetry({
+        references: [gatewayOrderId, payment.checkoutSession?.referenceId, orderNumberOrGatewayId].filter(Boolean),
+        credentials: { ...credentials, mode: gatewayMode(gatewayConfig) },
+      })
+      if (!fetched.ok) {
+        return {
+          reconciled: false,
+          paid: false,
+          failed: false,
+          status: String(payment.status || "pending"),
+          safeMessage: "Payment status is being verified. Please wait.",
+          gatewayOrderIdUsed: fetched.gatewayOrderIdUsed,
+          attemptedReferences: fetched.attemptedReferences,
+          gatewayHttpStatus: fetched.gatewayHttpStatus,
+          lastGatewayError: fetched.lastGatewayError,
+        }
+      }
+      const orderStatus = fetched.orderStatus
+      const bestPayment = chooseBestCashfreePayment(fetched.payments)
+      outcome = normalizeGatewayStatus(orderStatus.orderStatus, bestPayment?.payment_status || orderStatus.paymentStatus)
+      transactionId = bestPayment?.cf_payment_id || orderStatus.cfOrderId || payment.gatewayTransactionId || null
+      method = paymentMethodFromPayment(bestPayment) || orderStatus.paymentMethod || payment.paymentMethod
+      gatewayResponse = {
+        source: actor,
+        orderStatus,
+        payment: summarizeCashfreePayment(bestPayment),
+        gatewayOrderIdUsed: fetched.gatewayOrderIdUsed,
+        attemptedReferences: fetched.attemptedReferences,
+      }
+    }
+
+    const isSuccess = outcome === "success"
+    const isFailed = outcome === "failed"
+    if (isSuccess && payment.paymentAttempts?.[0]?.id) {
+      const finalized = await finalizeSuccessfulPayment(payment.paymentAttempts[0].id, {
+        actor,
+        amount: payment.gatewayAmount || payment.amount,
+        currency: payment.currency,
+        gatewayOrderId,
+        gatewayPaymentId: transactionId,
+        gatewayTransactionId: transactionId,
+        paymentMethod: method,
+        gatewayResponse,
+        manualVerification: paymentSettings.requireManualVerification,
+        autoProvision: paymentSettings.autoProvisionOnPaymentSuccess,
+      })
+      if (!finalized.finalized) {
+        return {
+          reconciled: true,
+          paid: false,
+          failed: false,
+          status: finalized.reason || "finalization_failed",
+          safeMessage: finalized.reason === "amount_or_currency_mismatch" ? "Gateway amount does not match the invoice amount." : "Payment is paid at gateway but could not be finalized.",
+        }
+      }
+      return {
+        reconciled: true,
+        paid: true,
+        failed: false,
+        status: "paid",
+        gatewayOrderIdUsed: gatewayOrderId,
+        attemptedReferences: [gatewayOrderId],
+        gatewayHttpStatus: 200,
+        lastGatewayError: null,
+        rawGatewaySummary: gatewayResponse ? { payment: (gatewayResponse as any)?.payment || null } : null,
+      }
+    }
+    if (isFailed) {
+      await prisma.paymentAttempt.update({
+        where: { id: payment.paymentAttempts[0].id },
+        data: { status: "failed", failureCode: "PAYMENT_FAILED", failureMessage: "Payment failed at gateway", statusCheckedAt: new Date() },
+      }).catch(() => undefined)
+      await prisma.checkoutSession.update({ where: { id: payment.checkoutSession.id }, data: { status: "payment_failed" } }).catch(() => undefined)
+      return {
+        reconciled: true,
+        paid: false,
+        failed: true,
+        status: "payment_failed",
+        gatewayOrderIdUsed: gatewayOrderId,
+        attemptedReferences: [gatewayOrderId],
+        gatewayHttpStatus: 200,
+        lastGatewayError: null,
+      }
+    }
+    return {
+      reconciled: true,
+      paid: false,
+      failed: false,
+      status: "pending",
+      gatewayOrderIdUsed: gatewayOrderId,
+      attemptedReferences: [gatewayOrderId],
+      gatewayHttpStatus: 200,
+      lastGatewayError: null,
+    }
+  } catch (error: any) {
+    await recordGatewayAttempt({
+      paymentId: payment?.id,
+      gateway: gateway === "phonepe" ? "phonepe" : "cashfree",
+      status: "failed",
+      ...safeGatewayError(error),
+      metadata: { actor, orderNumberOrGatewayId, checkoutSessionId: payment.checkoutSession?.id || null },
+    })
+    return {
+      reconciled: false,
+      paid: false,
+      failed: false,
+      status: String(payment.status || "pending"),
+      safeMessage: "Payment status is being verified. Please wait.",
+      gatewayOrderIdUsed: gatewayOrderId,
+      attemptedReferences: [gatewayOrderId],
+      gatewayHttpStatus: cashfreeErrorStatus(error),
+      lastGatewayError: error?.message || "gateway_lookup_failed",
+    }
+  }
+}
+
 async function reconcileWalletTopupPayment(
   payment: any,
   paymentSettings: PaymentSettings,
@@ -302,7 +464,7 @@ async function reconcileWalletTopupPayment(
 ): Promise<ReconcileResult> {
   const gateway = String(payment.gateway || "cashfree").toLowerCase()
   const gatewayOrderId = payment.gatewayOrderId || payment.topupReference || orderNumberOrGatewayId
-  const gatewayConfig = payment.paymentAttempts?.[0]?.gatewayConfig
+  const gatewayConfig = await resolveReconcileGatewayConfig(gateway, payment.paymentAttempts?.[0]?.gatewayConfig)
   const credentials = gatewayCredentials(gatewayConfig || {})
 
   try {
@@ -493,6 +655,28 @@ export async function reconcileGatewayPayment(orderNumberOrGatewayId: string, ac
       if (intentPayment?.checkoutIntent) {
         return reconcileCheckoutIntentPayment(intentPayment, paymentSettings, orderNumberOrGatewayId, actor)
       }
+      // Checkout-session payments (current VM checkout flow) are not linked to
+      // an order until the session is fulfilled. Server-side verification must
+      // be able to settle them so the status-poll converges with the provider.
+      const sessionPayment = await prisma.payment.findFirst({
+        where: {
+          OR: [
+            { gatewayOrderId: orderNumberOrGatewayId },
+            { idempotencyKey: orderNumberOrGatewayId },
+            { checkoutSession: { referenceId: orderNumberOrGatewayId } },
+            { checkoutSession: { idempotencyKey: orderNumberOrGatewayId } },
+            { paymentAttempts: { some: { merchantOrderId: orderNumberOrGatewayId } } },
+          ],
+        },
+        include: {
+          checkoutSession: true,
+          paymentAttempts: { orderBy: { createdAt: "desc" }, take: 1, include: { gatewayConfig: true } },
+        },
+        orderBy: { createdAt: "desc" },
+      })
+      if (sessionPayment?.checkoutSession) {
+        return reconcileCheckoutSessionPayment(sessionPayment, paymentSettings, orderNumberOrGatewayId, actor)
+      }
       const walletTopupPayment = await prisma.payment.findFirst({
         where: {
           purpose: { in: ["wallet_topup", "topup"] },
@@ -526,7 +710,10 @@ export async function reconcileGatewayPayment(orderNumberOrGatewayId: string, ac
 
   try {
     let resolvedGatewayOrderId = gatewayOrderId
-    const gatewayConfig = payment?.paymentAttempts?.[0]?.gatewayConfig || localOrder.paymentAttempts?.[0]?.gatewayConfig
+    const gatewayConfig = await resolveReconcileGatewayConfig(
+      String(payment?.gateway || "cashfree"),
+      payment?.paymentAttempts?.[0]?.gatewayConfig || localOrder.paymentAttempts?.[0]?.gatewayConfig,
+    )
     const credentials = gatewayCredentials(gatewayConfig || {})
     const fetched = await fetchCashfreeOrderAndPaymentsWithRetry({
       references: gatewayOrderCandidates,

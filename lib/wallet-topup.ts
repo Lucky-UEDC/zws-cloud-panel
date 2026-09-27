@@ -68,9 +68,8 @@ function domainGatewayReady(config: any) {
 function filterUsableTopupGateways(resolution: ResolvedPaymentGateway | null) {
   if (!resolution) return []
   return getUsableGatewayCandidates(resolution, "card_upi")
-    .filter((config) => String(config.gateway || "") === "razorpay")
     .filter(domainGatewayReady)
-    .map((config) => config.gateway) as Array<"razorpay">
+    .map((config) => config.gateway)
 }
 
 function configForGateway(resolution: ResolvedPaymentGateway, gateway: string) {
@@ -90,9 +89,33 @@ function urlsForGateway(resolution: ResolvedPaymentGateway, config: any, merchan
 }
 
 function noGatewayMessage(resolution: ResolvedPaymentGateway | null) {
-  if (!resolution) return "Razorpay payment gateway configuration could not be resolved for this domain. Please contact support."
+  if (!resolution) return "Payment gateway configuration could not be resolved for this domain. Please contact support."
   const defaultGateway = resolution.defaultGateway || resolution.gatewayConfig?.gateway || "none"
-  return `No usable Razorpay Standard Checkout gateway is configured for ${resolution.sourceDomain}. Default gateway: ${defaultGateway}. Please contact support.`
+  return `No usable payment gateway is configured for ${resolution.sourceDomain}. Default gateway: ${defaultGateway}. Please contact support.`
+}
+
+function getGatewaySpecificFields(gateway: string, checkoutOptions: any, gatewayResponse: any, gatewayOrderId: string) {
+  const fields: Record<string, any> = {}
+  if (gateway === "razorpay") {
+    fields.checkoutOptions = checkoutOptions
+    fields.checkout_options = checkoutOptions
+    fields.publicKey = checkoutOptions?.key || gatewayResponse.keyId
+    fields.razorpayOrderId = checkoutOptions?.order_id || gatewayOrderId
+    fields.razorpay_order_id = checkoutOptions?.order_id || gatewayOrderId
+    fields.razorpayFlow = gatewayResponse.razorpayFlow || "order"
+  }
+  if (gateway === "cashfree") {
+    fields.cashfreeOrderId = checkoutOptions?.order_id || gatewayOrderId
+    fields.cashfree_order_id = checkoutOptions?.order_id || gatewayOrderId
+    fields.cfOrderId = checkoutOptions?.order_id || gatewayOrderId
+    fields.paymentSessionId = gatewayResponse.payment_session_id
+  }
+  if (gateway === "phonepe") {
+    fields.phonepeOrderId = checkoutOptions?.order_id || gatewayOrderId
+    fields.phonepe_order_id = checkoutOptions?.order_id || gatewayOrderId
+    fields.merchantOrderId = gatewayResponse.merchantOrderId
+  }
+  return fields
 }
 
 export function walletTopupInitPayload(input: {
@@ -107,6 +130,7 @@ export function walletTopupInitPayload(input: {
   mode?: string | null
   reusedExistingPayment?: boolean
 }) {
+  const gateway = String(input.gateway || "").toLowerCase()
   const gatewayResponse = input.payment?.gatewayResponse && typeof input.payment.gatewayResponse === "object" && !Array.isArray(input.payment.gatewayResponse)
     ? input.payment.gatewayResponse as Record<string, any>
     : {}
@@ -116,6 +140,8 @@ export function walletTopupInitPayload(input: {
   const paymentUrl = input.paymentUrl || null
   const redirectUrl = input.redirectUrl || paymentUrl
   const statusUrl = `/payment/status?order_id=${encodeURIComponent(input.gatewayOrderId || input.payment.gatewayOrderId || input.payment.topupReference || input.payment.id)}`
+  const gatewaySpecific = getGatewaySpecificFields(gateway, checkoutOptions, gatewayResponse, input.gatewayOrderId || input.payment.gatewayOrderId || input.payment.topupReference || input.payment.id)
+  const isRetry = input.reusedExistingPayment
   return {
     ok: true,
     success: true,
@@ -134,15 +160,10 @@ export function walletTopupInitPayload(input: {
     currency: input.payment.currency || "INR",
     mode: input.mode || null,
     purpose: WALLET_TOPUP_PURPOSE,
-    reusedExistingPayment: Boolean(input.reusedExistingPayment),
-    checkoutOptions: input.gateway === "razorpay" ? checkoutOptions || undefined : undefined,
-    checkout_options: input.gateway === "razorpay" ? checkoutOptions || undefined : undefined,
-    publicKey: input.gateway === "razorpay" ? checkoutOptions?.key || gatewayResponse.keyId || undefined : undefined,
-    razorpayOrderId: input.gateway === "razorpay" ? checkoutOptions?.order_id || input.gatewayOrderId || input.payment.gatewayOrderId || undefined : undefined,
-    razorpay_order_id: input.gateway === "razorpay" ? checkoutOptions?.order_id || input.gatewayOrderId || input.payment.gatewayOrderId || undefined : undefined,
-    razorpayFlow: input.gateway === "razorpay" ? gatewayResponse.razorpayFlow || "order" : undefined,
-    message: input.reusedExistingPayment ? "Resuming existing payment..." : "Opening secure Razorpay checkout...",
-    status: input.reusedExistingPayment ? "resuming" : "gateway_started",
+    reusedExistingPayment: isRetry,
+    ...gatewaySpecific,
+    message: isRetry ? "Resuming existing payment..." : `Opening secure ${gateway.charAt(0).toUpperCase() + gateway.slice(1)} checkout...`,
+    status: isRetry ? "resuming" : "gateway_started",
   }
 }
 
@@ -227,7 +248,7 @@ export async function createWalletTopupPayment(input: {
     },
   })
 
-  const startGateway = async (gateway: "razorpay", usedFallback: boolean) => {
+  const startGateway = async (gateway: string, usedFallback: boolean) => {
     const gatewayConfig = configForGateway(resolution, gateway)
     const urls = urlsForGateway(resolution, gatewayConfig, referenceId)
     await recordGatewayAttempt({ gateway, status: "started", requestId: referenceId, metadata: { purpose: WALLET_TOPUP_PURPOSE } })

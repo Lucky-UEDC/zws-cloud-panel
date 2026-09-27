@@ -1,5 +1,5 @@
 import crypto from "node:crypto"
-import { createPaymentOrder, verifyWebhookSignature } from "@/lib/cashfree"
+import { createPaymentOrder, parseWebhookTimestampMs, verifyWebhookSignature } from "@/lib/cashfree"
 import { createPhonePePaymentSession, normalizePhonePeWebhook, verifyPhonePeWebhookRawBody } from "@/lib/phonepe"
 import { verifyRazorpayWebhookSignature, normalizeRazorpayCredentials } from "@/lib/razorpay"
 import type { PaymentSettings } from "@/lib/settings"
@@ -25,18 +25,26 @@ export function rawBodyHash(rawBody: string) {
 export function normalizeCashfreeWebhook(payload: any): NormalizedPaymentWebhook {
   const order = payload?.data?.order || {}
   const payment = payload?.data?.payment || {}
+  const gatewayDetails = payload?.data?.payment_gateway_details || {}
   const type = String(payload?.type || "")
+  const paymentGatewayStatus = String(payment.payment_status || "").toUpperCase()
   const status = type === "PAYMENT_SUCCESS_WEBHOOK"
     ? "success"
     : type === "PAYMENT_FAILED_WEBHOOK"
       ? "failed"
-      : "pending"
+      : type === "PAYMENT_CHARGES_WEBHOOK"
+        ? paymentGatewayStatus === "SUCCESS" || paymentGatewayStatus === "PAID"
+          ? "success"
+          : paymentGatewayStatus === "FAILED" || paymentGatewayStatus === "CANCELLED" || paymentGatewayStatus === "REVERSED"
+            ? "failed"
+            : "pending"
+        : "pending"
   return {
     gateway: "cashfree",
     eventId: String(payment.cf_payment_id || order.cf_order_id || order.order_id || rawBodyHash(JSON.stringify(payload))),
     eventType: type,
-    gatewayOrderId: String(order.cf_order_id || order.order_id || ""),
-    gatewayPaymentId: payment.cf_payment_id ? String(payment.cf_payment_id) : null,
+    gatewayOrderId: String(order.cf_order_id || gatewayDetails.gateway_order_id || order.order_id || ""),
+    gatewayPaymentId: payment.cf_payment_id ? String(payment.cf_payment_id) : gatewayDetails.gateway_payment_id ? String(gatewayDetails.gateway_payment_id) : null,
     status,
     amount: Number(payment.payment_amount || order.order_amount || 0),
     paymentMethod: payment.payment_method ? Object.keys(payment.payment_method)[0] || null : null,
@@ -47,9 +55,20 @@ export function normalizeCashfreeWebhook(payload: any): NormalizedPaymentWebhook
 export function verifyCashfreeRawBody(rawBody: string, headers: Headers, settings: PaymentSettings) {
   const signature = headers.get("x-webhook-signature") || ""
   const timestamp = headers.get("x-webhook-timestamp") || ""
-  const secret = settings.cashfreeWebhookSecret || settings.cashfreeSecretKey
-  if (!secret) return true
-  return verifyWebhookSignature(rawBody, timestamp, signature, secret)
+  // Cashfree signs webhooks with the merchant's API client secret; a
+  // dashboard-configured webhook secret is accepted as a secondary candidate.
+  const candidates = [settings.cashfreeWebhookSecret, settings.cashfreeSecretKey].filter(Boolean)
+  if (!candidates.length) {
+    console.warn("[Payments][Webhook] Cashfree verification failed: cashfree webhook/client secret not configured")
+    return false
+  }
+  // Timestamp freshness check: reject webhooks older than 10 minutes
+  const webhookTime = timestamp ? parseWebhookTimestampMs(timestamp) : null
+  if (webhookTime !== null && Math.abs(Date.now() - webhookTime) > 10 * 60 * 1000) {
+    console.warn("[Payments][Webhook] Cashfree webhook rejected: timestamp stale", { timestamp, ageMs: Math.abs(Date.now() - webhookTime) })
+    return false
+  }
+  return verifyWebhookSignature(rawBody, timestamp, signature, candidates)
 }
 
 export function normalizeGatewayWebhook(gateway: "cashfree" | "phonepe", rawBody: string) {
@@ -108,20 +127,36 @@ export function verifyDomainGatewayWebhookRawBody(gateway: "cashfree" | "phonepe
     }
     return verified
   }
-  const secret = String(credentials.webhookSecret || credentials.secretKey || "")
-  if (!secret) {
-    console.warn("[Payments][Webhook] Cashfree verification failed: missing webhook secret", {
+  // Cashfree signs webhooks with the merchant's API client secret (this is the
+  // documented mechanism and what the gateway driver uses). A configured
+  // dashboard webhook secret is accepted as a secondary candidate. Fails
+  // closed: only real Cashfree credentials are ever used, never a fabricated
+  // secret or another gateway's credential.
+  const candidates = [credentials.webhookSecret, credentials.secretKey, credentials.clientSecret].filter(Boolean)
+  if (!candidates.length) {
+    console.warn("[Payments][Webhook] Cashfree verification failed: cashfree webhook/client secret not configured", {
       gatewayConfigId: gatewayConfig?.id || null,
       hasSignature: Boolean(headers.get("x-webhook-signature")),
       hasTimestamp: Boolean(headers.get("x-webhook-timestamp")),
     })
     return false
   }
+  // Timestamp freshness check: reject webhooks older than 10 minutes
+  const timestamp = headers.get("x-webhook-timestamp") || ""
+  const webhookTime = timestamp ? parseWebhookTimestampMs(timestamp) : null
+  if (webhookTime !== null && Math.abs(Date.now() - webhookTime) > 10 * 60 * 1000) {
+    console.warn("[Payments][Webhook] Cashfree webhook rejected: timestamp stale", {
+      gatewayConfigId: gatewayConfig?.id || null,
+      timestamp,
+      ageMs: Math.abs(Date.now() - webhookTime),
+    })
+    return false
+  }
   const verified = verifyWebhookSignature(
     rawBody,
-    headers.get("x-webhook-timestamp") || "",
+    timestamp,
     headers.get("x-webhook-signature") || "",
-    secret,
+    candidates,
   )
   if (!verified) {
     console.warn("[Payments][Webhook] Cashfree verification failed: signature mismatch", {
@@ -203,7 +238,7 @@ export async function createGatewayPaymentSession(args: {
 }
 
 export async function createDomainGatewayPaymentSession(args: {
-  gateway: "cashfree" | "phonepe" | "razorpay"
+  gateway: string
   orderId: string
   amount: number
   currency?: string | null
@@ -216,7 +251,7 @@ export async function createDomainGatewayPaymentSession(args: {
   invoiceNumber?: string | null
 }) {
   const { getGatewayDriver } = await import("@/lib/payments/gateway-drivers")
-  const driver = getGatewayDriver(args.gateway)
+  const driver = getGatewayDriver(args.gateway as "cashfree" | "phonepe" | "razorpay")
   const session = await driver.initialize({
     merchantOrderId: args.orderId,
     amount: args.amount,

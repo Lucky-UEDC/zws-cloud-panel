@@ -1,32 +1,52 @@
 import { prisma } from "@/lib/db"
-import { customerStepContentForJob, sanitizeCustomerProvisioningMessage } from "@/lib/provisioning-status"
+import {
+  STEP_LABELS,
+  customerStepContentForJob,
+  sanitizeCustomerProvisioningMessage,
+  sanitizeProvisioningError,
+  type ProvisioningStep,
+} from "@/lib/provisioning-status"
 import { createProxmoxClient } from "@/lib/proxmox"
 import { markRuntimeCompleteIfReady, probeVmRuntimeHealth } from "@/lib/vm-runtime-health"
 
 const DEPLOYMENT_STAGES = [
-  { key: "PAYMENT_PENDING", title: "Payment pending", matches: ["payment_pending", "pending_payment", "payment_processing"] },
-  { key: "PAYMENT_CONFIRMED", title: "Payment confirmed", matches: ["paid", "payment_success", "payment_confirmed"] },
-  { key: "ORDER_ACCEPTED", title: "Order accepted", matches: ["order_accepted", "queued", "QUEUED"] },
-  { key: "SELECTING_LOCATION", title: "Selecting deployment location", matches: ["SELECTING_NODE", "WAITING_FOR_CAPACITY", "WAITING_FOR_ADMIN"] },
-  { key: "CLONING_TEMPLATE", title: "Installing operating system", matches: ["CLONING_TEMPLATE", "CLONE_COMPLETE"] },
-  { key: "CONFIGURING_VM", title: "Configuring server", matches: ["CONFIGURING_VM", "RESIZING_DISK"] },
-  { key: "INSTALLING_OS", title: "Applying cloud-init", matches: ["APPLYING_CLOUD_INIT"] },
-  { key: "CONFIGURING_NETWORK", title: "Configuring network", matches: ["ASSIGNING_IP", "ip_reserved"] },
-  { key: "STARTING_VM", title: "Starting server", matches: ["STARTING_VM"] },
-  { key: "DETECTING_IP", title: "Detecting IP address", matches: ["VERIFYING_VM", "starting", "configuring"] },
-  { key: "CONFIGURING_GUEST", title: "Configuring guest", matches: ["STOPPED"] },
-  { key: "VERIFYING_SERVICE", title: "Final verification", matches: ["delivered"] },
-  { key: "SERVICE_ACTIVE", title: "Service active", matches: ["ACTIVE"] },
+  { key: "payment_pending", title: "Payment pending", matches: ["payment_pending", "pending_payment", "payment_processing"] },
+  { key: "payment_confirmed", title: "Payment confirmed", matches: ["paid", "payment_success", "payment_confirmed"] },
+  { key: "order_accepted", title: "Order accepted", matches: ["order_accepted", "queued", "QUEUED"] },
+  { key: "selecting_location", title: "Selecting deployment location", matches: ["SELECTING_NODE", "WAITING_FOR_CAPACITY", "WAITING_FOR_ADMIN"] },
+  { key: "preparing_image", title: "Installing operating system", matches: ["CLONING_TEMPLATE", "CLONE_COMPLETE"] },
+  { key: "configuring_instance", title: "Configuring server", matches: ["CONFIGURING_VM", "RESIZING_DISK"] },
+  { key: "installing_os", title: "Installing operating system", matches: ["APPLYING_CLOUD_INIT"] },
+  { key: "configuring_network", title: "Configuring network", matches: ["ASSIGNING_IP", "ip_reserved"] },
+  { key: "starting_server", title: "Starting server", matches: ["STARTING_VM"] },
+  { key: "detecting_ip", title: "Detecting IP address", matches: ["VERIFYING_VM", "starting", "configuring"] },
+  { key: "configuring_access", title: "Configuring access", matches: ["STOPPED"] },
+  { key: "final_verification", title: "Final verification", matches: ["delivered"] },
+  { key: "service_active", title: "Completed", matches: ["ACTIVE"] },
 ]
+
+const INTERNAL_PROVISIONING_TEXT =
+  /(?:upid|proxmox|qmclone|qmstart|\bqemu\b|\blxc\b|vmid|root@pam|api2\/json|pveapitoken|vncproxy|vncwebsocket|\/nodes\/|worker|scheduler|janitor|storage pool|cloning_template|clone_complete|applying_cloud_init|configuring_vm|resizing_disk|assigning_ip|starting_vm|verifying_vm|selecting_node|waiting_for_capacity|waiting_for_admin|upgrade_queued|updating_config|\bcloning\b|\btemplate (?:clone|os)\b|\btask (?:running|queued|started|stopped)\b)/i
+
+function looksInternalProvisioningText(value: string) {
+  return Boolean(value) && INTERNAL_PROVISIONING_TEXT.test(String(value))
+}
 
 function serializeLog(log: any, jobType?: string | null) {
   const content = customerStepContentForJob(log?.step, jobType)
+  const rawMessage = String(log?.message || "").trim()
+  const sanitized = sanitizeCustomerProvisioningMessage(rawMessage)
+  // Hard client boundary: if the sanitizer let a raw technical string through
+  // unchanged, fall back to the friendly per-step copy instead of echoing it.
+  const message = sanitized && !(rawMessage && looksInternalProvisioningText(rawMessage) && sanitized === rawMessage)
+    ? sanitized
+    : content.message
   return {
     id: log.id,
     createdAt: log.createdAt,
     level: log.level,
     title: content.title,
-    message: sanitizeCustomerProvisioningMessage(log.message) || content.message,
+    message,
   }
 }
 
@@ -35,7 +55,6 @@ function serializeSteps(steps: any[] = [], jobType?: string | null) {
     const content = customerStepContentForJob(step.step, jobType)
     return {
       id: step.id,
-      step: step.step,
       title: step.label || content.title,
       status: step.status,
       message: step.error ? sanitizeCustomerProvisioningMessage(step.error) : content.message,
@@ -46,10 +65,23 @@ function serializeSteps(steps: any[] = [], jobType?: string | null) {
   })
 }
 
-function stageStatus(stage: (typeof DEPLOYMENT_STAGES)[number], index: number, activeIndex: number, failed: boolean) {
+function clientSafeRuntimeHealth(health: any) {
+  if (!health) return null
+  // Never expose Proxmox runtime diagnostics (vmid, nodeName, urls, errors) to
+  // the customer; only the readiness flags are client-safe.
+  return {
+    completionEligible: Boolean(health.completionEligible),
+    pingOk: Boolean(health.pingOk),
+    sshOk: Boolean(health.sshOk),
+    cloudInitOk: Boolean(health.cloudInitOk),
+    checkedAt: health.checkedAt || null,
+  }
+}
+
+function stageStatus(stage: (typeof DEPLOYMENT_STAGES)[number], index: number, activeIndex: number, failed: boolean, complete: boolean) {
   if (failed && index === activeIndex) return "failed"
-  if (index < activeIndex) return "completed"
-  if (index === activeIndex) return stage.key === "SERVICE_READY" ? "completed" : "running"
+  if (index < activeIndex || (index === activeIndex && complete)) return "completed"
+  if (index === activeIndex) return "running"
   return "pending"
 }
 
@@ -120,6 +152,24 @@ export async function getClientDeploymentSnapshot(input: { id: string; customerI
   const progress = complete ? 100 : job?.progress ?? (order.vpsInstance ? 100 : Math.round(((activeIndex + 1) / DEPLOYMENT_STAGES.length) * 100))
   const metadata = job?.metadata && typeof job.metadata === "object" && !Array.isArray(job.metadata) ? job.metadata as Record<string, any> : {}
 
+  const automationRaw = String(job?.status || order.provisioningStatus || order.status || "pending")
+  const automationStepKey = automationRaw.toUpperCase()
+  // Translate raw internal step tokens (CLONING_TEMPLATE, START_FAILED, ...) to
+  // customer-facing labels for the status badge; keep neutral status words.
+  const automationState = automationStepKey in STEP_LABELS
+    ? String(STEP_LABELS[automationStepKey as ProvisioningStep])
+    : automationRaw
+
+  const friendlyFailureReason = (value: unknown) => {
+    try {
+      const friendly = sanitizeProvisioningError(value)
+      return looksInternalProvisioningText(friendly) ? "Deployment requires attention. Our team has been notified." : friendly
+    } catch {
+      return "Deployment requires attention. Our team has been notified."
+    }
+  }
+  const defaultFix = "Provisioning will retry automatically. Open deployment logs if it remains stuck."
+
   return {
     success: true,
     id: order.id,
@@ -127,11 +177,11 @@ export async function getClientDeploymentSnapshot(input: { id: string; customerI
     orderNumber: order.orderNumber,
     status: order.provisioningStatus || order.status,
     serviceStatus: order.vpsInstance?.status || null,
-    automationState: job?.status || order.provisioningStatus || "pending",
+    automationState,
     currentStage: current,
     displayStatus: complete ? "Your cloud server is ready" : job?.displayStatus || (order.vpsInstance ? "Your cloud server is ready" : "Provisioning"),
     progress: Math.max(0, Math.min(100, Number(progress || 0))),
-    runtimeHealth,
+    runtimeHealth: clientSafeRuntimeHealth(runtimeHealth),
     retryState: {
       attempts: job?.attempts || 0,
       maxAttempts: job?.maxAttempts || 3,
@@ -139,13 +189,16 @@ export async function getClientDeploymentSnapshot(input: { id: string; customerI
       retryCountdownSeconds: job?.nextRetryAt ? Math.max(0, Math.ceil((new Date(job.nextRetryAt).getTime() - Date.now()) / 1000)) : null,
     },
     failure: failed ? {
-      reason: order.provisioningError || job?.error || "Deployment requires attention.",
-      code: job?.errorCode || null,
-      suggestedFix: metadata.suggestedFix || "The provisioning worker will retry automatically. Open deployment logs if it remains stuck.",
+      reason: friendlyFailureReason(order.provisioningError || job?.error || "Deployment requires attention."),
+      code: null,
+      suggestedFix: (() => {
+        const fix = String(metadata.suggestedFix || defaultFix)
+        return looksInternalProvisioningText(fix) ? defaultFix : sanitizeCustomerProvisioningMessage(fix) || defaultFix
+      })(),
     } : null,
     vm: {
       id: order.vpsInstance?.id || null,
-      instanceId: order.vpsInstance?.id || order.id,
+      instanceId: order.vpsInstance?.id || null,
       hostname: order.vpsInstance?.name || order.hostname || job?.hostname || null,
       ipAddress: order.vpsInstance?.ipAddress || null,
       status: order.vpsInstance?.status || null,
@@ -160,7 +213,7 @@ export async function getClientDeploymentSnapshot(input: { id: string; customerI
     stages: DEPLOYMENT_STAGES.map((stage, index) => ({
       key: stage.key,
       title: stage.title,
-      status: stageStatus(stage, index, activeIndex === -1 ? 0 : activeIndex, failed),
+      status: stageStatus(stage, index, activeIndex === -1 ? 0 : activeIndex, failed, complete),
     })),
     steps: serializeSteps(job?.steps || [], job?.type),
     logs: (job?.logs || []).map((log) => serializeLog(log, job?.type)),

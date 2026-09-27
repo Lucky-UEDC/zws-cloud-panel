@@ -71,7 +71,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
     headline: `Restoring from backup ${backup.id.split("-")[0] || "backup"}`,
     nodeName: node.nodeName,
     run: async (report) => {
-      report({ phase: "Starting restore", status: "running" as const })
+      report({ phase: "Preparing restore", status: "running" as const, percent: 0 })
       const result = await restoreVmFromBackup({
         customerId,
         vpsInstanceId,
@@ -81,7 +81,8 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
         onProgress: (patch) => report({ ...patch, status: "running" as const }),
       })
       if (result.status === "completed") {
-        report({ phase: "Restore complete", status: "completed" as const, result: { taskId: result.taskId, verifyStatus: result.verifyStatus } })
+        report({ phase: "Verifying restore", status: "running" as const, percent: 99 })
+        report({ phase: "Restore complete", status: "completed" as const, percent: 100, result: { taskId: result.taskId, verifyStatus: result.verifyStatus } })
       } else if (result.status === "unsupported" || result.status === "failed") {
         report({ phase: "Restore failed", status: "failed" as const, error: result.reason || null })
         throw new Error(result.reason || "Restore failed")

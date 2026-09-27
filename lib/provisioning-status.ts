@@ -292,7 +292,12 @@ export function sanitizeCustomerProvisioningMessage(message: unknown): string {
     if (code || detail) return "Provisioning is waiting for manual review. Our team has been notified."
   }
 
-  const blocked = /(upid|proxmox|qmclone|qmstart|qemu|lxc|vmid|root@pam|api2\/json|pveapitoken|vncproxy|vncwebsocket|\/nodes\/|node|cluster|queue|job|automation|storage pool|template clone|token|realm|cloud-init|cloudinit|clone|resize command|stack|password|secret|cookie|\.env)/i
+  // Raw internal step tokens (e.g. "CLONING_TEMPLATE task running") map to the
+  // customer-facing label so nothing technical ever reaches the client.
+  const rawStepToken = value.toUpperCase().match(/\b(CLONING_TEMPLATE|CLONE_COMPLETE|APPLYING_CLOUD_INIT|CONFIGURING_VM|RESIZING_DISK|ASSIGNING_IP|STARTING_VM|VERIFYING_VM|SELECTING_NODE|WAITING_FOR_CAPACITY|WAITING_FOR_ADMIN|UPGRADE_QUEUED|UPDATING_CONFIG|UPGRADE_COMPLETE|START_FAILED|REPAIR_NEEDED|UPGRADE_FAILED)\b/)
+  if (rawStepToken) return STEP_LABELS[rawStepToken[1] as ProvisioningStep] || "Updating your cloud server status"
+
+  const blocked = /(upid|proxmox|qmclone|qmstart|qemu|lxc|vmid|root@pam|api2\/json|pveapitoken|vncproxy|vncwebsocket|\/nodes\/|node|cluster|queue|job|automation|storage pool|template clone|token|realm|cloud-init|cloudinit|clone|cloning|template_?os|task (running|queued|started|stopped)|worker|scheduler|janitor|resize command|stack|password|secret|cookie|\.env)/i
   if (blocked.test(value)) return "Final server optimization"
 
   return clientActivityMessage(value)

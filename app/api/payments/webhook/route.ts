@@ -21,7 +21,7 @@ import { finalizeWalletTopupPayment, isWalletTopupPurpose, markWalletTopupPaymen
 import { getSiteUrl } from "@/lib/settings/site-settings"
 import { getPrimaryPaymentDomain, normalizePaymentDomain } from "@/lib/payments/primary-domain"
 import { recordPaymentWebhookLog } from "@/lib/payments/webhook-logs"
-import { activePaymentGatewayCredentials } from "@/lib/payments/payment-gateway-admin"
+import { fallbackGatewayConfig } from "@/lib/payments/payment-gateway-admin"
 import { getPhonePePaymentStatus } from "@/lib/phonepe"
 import { recordCouponRedemption } from "@/lib/coupons"
 import { paymentLog, paymentRequestId } from "@/lib/payments/trace"
@@ -68,6 +68,9 @@ const KNOWN_WEBHOOK_TYPES = new Set([
   "PAYMENT_FAILED_WEBHOOK",
   "PAYMENT_USER_DROPPED_WEBHOOK",
   "PAYMENT_PENDING_WEBHOOK",
+  // Cashfree's live UPI/charges webhooks for paid orders arrive as
+  // PAYMENT_CHARGES_WEBHOOK with payment_status SUCCESS inside the payload.
+  "PAYMENT_CHARGES_WEBHOOK",
 ])
 
 function safeWebhookHeaderSnapshot(request: NextRequest) {
@@ -173,24 +176,18 @@ async function findWebhookGatewayConfig(gateway: "cashfree" | "phonepe" | "razor
     orderBy: { createdAt: "desc" },
   }).catch(() => null)
   if (attempt?.gatewayConfig) return attempt.gatewayConfig
-  const row = await (prisma as any).paymentGateway.findFirst({
-    where: { OR: [{ code: gateway }, { provider: gateway }], enabled: true },
-    orderBy: [{ priority: "asc" }, { updatedAt: "desc" }],
-  }).catch(() => null)
-  if (!row) return null
-  return {
-    id: null,
-    gateway,
-    enabled: true,
-    environment: String(row.mode || row.environment || "test").toLowerCase() === "production" ? "production" : "sandbox",
-    approvedPaymentDomain: host,
-    credentialsPlain: activePaymentGatewayCredentials(row),
-  }
+  return fallbackGatewayConfig(gateway, host)
 }
 
-function resolveWebhookOutcome(type: string) {
+function resolveWebhookOutcome(type: string, paymentStatus?: string | null) {
   if (type === "PAYMENT_SUCCESS_WEBHOOK") return "success" as const
   if (type === "PAYMENT_FAILED_WEBHOOK") return "failed" as const
+  if (type === "PAYMENT_CHARGES_WEBHOOK") {
+    const value = String(paymentStatus || "").toUpperCase()
+    if (value === "SUCCESS" || value === "PAID") return "success" as const
+    if (value === "FAILED" || value === "CANCELLED" || value === "REVERSED") return "failed" as const
+    return "pending" as const
+  }
   return "pending" as const
 }
 
@@ -654,13 +651,13 @@ export async function POST(request: NextRequest) {
         normalized = null
       }
 
-	    const webhookGatewayConfig = await findWebhookGatewayConfig(gateway, request, {
-	      merchantOrderId: "",
-	      gatewayOrderId: "",
-	      gatewayPaymentId: null,
-	      gatewayTransactionId: null,
-	      bankReferenceId: null,
-	    })
+	    const webhookGatewayConfig = await findWebhookGatewayConfig(
+        gateway,
+        request,
+        normalized?.raw && typeof normalized.raw === "object"
+          ? extractGatewayIds(gateway, normalized.raw)
+          : { merchantOrderId: "", gatewayOrderId: "", gatewayPaymentId: null, gatewayTransactionId: null, bankReferenceId: null },
+      )
 	    if (!webhookGatewayConfig) {
         await createPanelLog({
           category: "Webhook",
@@ -850,7 +847,7 @@ export async function POST(request: NextRequest) {
       order: { order_id: normalized.gatewayOrderId, cf_order_id: normalized.gatewayOrderId, order_amount: normalized.amount, order_currency: "INR", order_status: normalized.status },
       payment: { cf_payment_id: normalized.gatewayPaymentId || normalized.eventId, payment_status: normalized.status, payment_amount: normalized.amount, payment_currency: "INR", payment_message: normalized.status, payment_time: new Date().toISOString(), payment_method: {}, bank_reference: null },
     }
-    const outcome = gateway === "cashfree" ? resolveWebhookOutcome(payload.type) : normalized.status
+    const outcome = gateway === "cashfree" ? resolveWebhookOutcome(payload.type, payload.data?.payment?.payment_status || null) : normalized.status
     const isSuccess = outcome === "success"
     const isFailed = outcome === "failed"
 
@@ -902,6 +899,11 @@ export async function POST(request: NextRequest) {
               orderNumber: order.order_id,
             },
           },
+          // Cashfree webhooks commonly carry only the merchant order id; the
+          // merchant id lives on the checkout session reference / attempt.
+          { checkoutSession: { referenceId: order.order_id } },
+          { checkoutIntent: { referenceId: order.order_id } },
+          { paymentAttempts: { some: { merchantOrderId: order.order_id } } },
         ].filter(Boolean) as any,
       },
       include: {
@@ -1082,7 +1084,9 @@ export async function POST(request: NextRequest) {
     const incomingAmount = Number(payment.payment_amount || 0)
     const expectedCurrency = String(paymentRecord.currency || "INR").toUpperCase()
     const incomingCurrency = String(payment.payment_currency || "INR").toUpperCase()
-    if (isSuccess && (!Number.isFinite(incomingAmount) || Math.abs(incomingAmount - expectedAmount) > 0.009 || incomingCurrency !== expectedCurrency)) {
+    // Compare in INR minor units (₹1.18 === 118 paise) to avoid float drift.
+    const inrMinor = (value: number) => Math.round((Number.isFinite(value) ? value : 0) * 100)
+    if (isSuccess && (!Number.isFinite(incomingAmount) || inrMinor(incomingAmount) !== inrMinor(expectedAmount) || incomingCurrency !== expectedCurrency)) {
       await prisma.paymentWebhookEvent.update({
         where: { id: eventRow.id },
         data: {
