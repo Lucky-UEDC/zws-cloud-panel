@@ -19,6 +19,7 @@ import { applyBandwidthThrottle, restoreBandwidthThrottle } from "@/lib/bandwidt
 import { persistVpsConsoleMetadata } from "@/lib/console-metadata"
 import { resolveCanonicalVmDataForVpsIds } from "@/lib/vm-db-truth"
 import { expandGuestPrimaryDisk } from "@/lib/vm-guest-disk"
+import { resolveVmGuestOs, type VmGuestOsKind } from "@/lib/vm-os-detection"
 import { scanDuplicateManagedVms } from "@/lib/vm-duplicate-quarantine"
 
 function nowIso() {
@@ -1230,7 +1231,14 @@ export async function runAdminVmAction(input: {
       client,
       nodeName: vps.proxmoxNode!.nodeName,
       vmid: vps.vmid,
-      osHint: [vps.operatingSystem?.name, vps.operatingSystem?.osFamily, vps.operatingSystem?.osType, vps.order?.osName].filter(Boolean).join(" "),
+      os: resolveVmGuestOs({
+        osType: vps.operatingSystem?.osType,
+        osFamily: vps.operatingSystem?.osFamily,
+        category: vps.operatingSystem?.category,
+        osName: vps.operatingSystem?.name,
+        vmOsFamily: vps.vmOsFamily,
+        orderOsName: vps.order?.osName,
+      }),
       previousTotalBytes: vps.diskTotalGb ? Number(vps.diskTotalGb) * 1_000_000_000 : null,
     }).catch((error) => ({ ok: false, error: error?.message || String(error) }))
     await prisma.vpsInstance.update({ where: { id: vps.id }, data: { diskGb: Math.ceil(sizeGb) } })
