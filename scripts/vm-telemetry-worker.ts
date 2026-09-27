@@ -5,17 +5,25 @@ import { publishRealtimeEvent, realtimeChannels } from "@/lib/realtime-telemetry
 import { recordBandwidthSample } from "@/lib/bandwidth-accounting"
 import { applyBandwidthThrottle } from "@/lib/bandwidth-enforcement"
 import { vmIdentityNotesMatch, vmIdentityTagsMatch } from "@/lib/proxmox-tags"
-import { collectGuestDiskUsage, configuredMemoryBytes } from "@/lib/vm-guest-disk"
+import { collectGuestDiskUsage, configuredMemoryBytes, type GuestDiskUsage } from "@/lib/vm-guest-disk"
+import { resolveVmGuestOs, type VmGuestOsKind } from "@/lib/vm-os-detection"
 import { dbStatusFromPowerState } from "@/lib/vm-runtime-status"
 
 const POLL_MS = Math.max(30_000, Number(process.env.VM_TELEMETRY_POLL_MS || 30_000))
-const DISK_CHECK_MS = Math.max(60_000, Number(process.env.VM_DISK_USAGE_CHECK_MS || 5 * 60_000))
+// Running VMs get a ~30s disk collection cadence (locked per VM so overlapping
+// ticks never double-exec a guest command). Failures back off before retrying.
+const DISK_CHECK_MS = Math.max(30_000, Number(process.env.VM_DISK_USAGE_CHECK_MS || 30_000))
+const DISK_FAIL_RETRY_MS = Math.max(60_000, Number(process.env.VM_DISK_FAIL_RETRY_MS || 5 * 60_000))
 const CONCURRENCY = Math.max(1, Number(process.env.VM_TELEMETRY_CONCURRENCY || 4))
 const OWNERSHIP_VERIFY_MS = Math.max(60_000, Number(process.env.VM_OWNERSHIP_VERIFY_MS || 10 * 60_000))
 const ONCE = process.argv.includes("--once")
 const FORCE_DISK = process.argv.includes("--force-disk")
 
 let stopping = false
+
+// Per-VM in-flight guard for guest exec, and backoff clock for failed probes.
+const diskCollectionInflight = new Set<string>()
+const diskFailRetryAt = new Map<string, number>()
 
 function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms))
@@ -51,14 +59,15 @@ function diskSnapshotFromVps(vps: any) {
   return { usedBytes, totalBytes, freeBytes: Math.max(0, totalBytes - usedBytes) }
 }
 
-function osHint(vps: any) {
-  return [
-    vps?.operatingSystem?.name,
-    vps?.operatingSystem?.osFamily,
-    vps?.operatingSystem?.osType,
-    vps?.operatingSystem?.category,
-    vps?.order?.osName,
-  ].filter(Boolean).join(" ")
+function vmOsKindFromVps(vps: any): VmGuestOsKind {
+  return resolveVmGuestOs({
+    osType: vps?.operatingSystem?.osType,
+    osFamily: vps?.operatingSystem?.osFamily,
+    category: vps?.operatingSystem?.category,
+    osName: vps?.operatingSystem?.name,
+    vmOsFamily: vps?.vmOsFamily,
+    orderOsName: vps?.order?.osName,
+  })
 }
 
 function shouldCollect(vps: any) {
@@ -71,7 +80,7 @@ function shouldCollect(vps: any) {
     !["external", "manual", "rejected"].includes(ownershipStatus)
 }
 
-function serializeMetric(row: any, runtime: any) {
+function serializeMetric(row: any, runtime: any, os?: VmGuestOsKind | null) {
   const ramUsedBytes = Number(row.ramUsedBytes || 0)
   const ramTotalBytes = Number(row.ramTotalBytes || 0)
   const diskUsedBytes = Number(row.diskUsedBytes || 0)
@@ -95,6 +104,7 @@ function serializeMetric(row: any, runtime: any) {
     networkOutBytes: Number(row.networkOutBytes || 0),
     uptimeSeconds: Number(runtime?.uptime || 0),
     source: "vm-telemetry-worker",
+    os: os || null,
   }
 }
 
@@ -359,20 +369,48 @@ async function collectVps(vps: any) {
   const now = new Date()
   const runtimeStatus = String(runtime?.status || "unknown").toLowerCase()
   const configuredRamTotalBytes = configuredMemoryBytes(config, runtime?.maxmem)
-  const diskCheckDue = FORCE_DISK || !vps.diskUsageCheckedAt || now.getTime() - new Date(vps.diskUsageCheckedAt).getTime() >= DISK_CHECK_MS
-  const shouldCollectDisk = runtimeStatus === "running" && diskCheckDue
-  const guestDisk = shouldCollectDisk
-    ? await collectGuestDiskUsage({ client, nodeName: vps.proxmoxNode.nodeName, vmid: vps.vmid, osHint: osHint(vps) })
-    : null
+  const vmOsKind = vmOsKindFromVps(vps)
+  const lastDiskCheckAt = vps.diskUsageCheckedAt ? new Date(vps.diskUsageCheckedAt).getTime() : 0
+  const lastDiskFailureRetryAt = diskFailRetryAt.get(vps.id) || 0
+  const diskCheckDue = FORCE_DISK || !lastDiskCheckAt || now.getTime() - lastDiskCheckAt >= DISK_CHECK_MS
+  const diskBackoffActive = now.getTime() < lastDiskFailureRetryAt
+  const shouldCollectDisk = runtimeStatus === "running" && diskCheckDue && !diskBackoffActive && !diskCollectionInflight.has(vps.id)
+  let guestDisk: GuestDiskUsage | null = null
+  if (shouldCollectDisk) {
+    diskCollectionInflight.add(vps.id)
+    try {
+      guestDisk = await collectGuestDiskUsage({ client, nodeName: vps.proxmoxNode.nodeName, vmid: vps.vmid, os: vmOsKind })
+    } catch (error: any) {
+      console.error("[vm-telemetry-worker] disk collection threw", {
+        vpsId: vps.id,
+        vmid: vps.vmid,
+        message: error?.message || String(error),
+      })
+      guestDisk = null
+    } finally {
+      diskCollectionInflight.delete(vps.id)
+    }
+  }
+  if (guestDisk && !guestDisk.ok) {
+    diskFailRetryAt.set(vps.id, Date.now() + DISK_FAIL_RETRY_MS)
+    console.warn("[vm-telemetry-worker] disk collection failed", {
+      vpsId: vps.id,
+      vmid: vps.vmid,
+      os: guestDisk.os,
+      errorCode: guestDisk.errorCode,
+      error: guestDisk.error,
+      collectionDurationMs: guestDisk.collectionDurationMs,
+    })
+  } else if (guestDisk?.ok) {
+    diskFailRetryAt.delete(vps.id)
+  }
   const lastKnownDisk = diskSnapshotFromMetric(previousNonZeroDisk) || diskSnapshotFromVps(vps)
   const selectedDisk = guestDisk?.ok
     ? { usedBytes: guestDisk.usedBytes, totalBytes: guestDisk.totalBytes, freeBytes: guestDisk.freeBytes, source: guestDisk.source }
     : lastKnownDisk
       ? { ...lastKnownDisk, source: "last-known" }
       : { usedBytes: 0, totalBytes: 0, freeBytes: 0, source: "unavailable" }
-  const diskUsedBytes = guestDisk?.ok
-    ? selectedDisk.usedBytes
-    : selectedDisk.usedBytes
+  const diskUsedBytes = selectedDisk.usedBytes
   const diskTotalBytes = selectedDisk.totalBytes
   const diskFreeBytes = selectedDisk.freeBytes
   const stopped = runtimeStatus === "stopped"
@@ -400,12 +438,14 @@ async function collectVps(vps: any) {
       diskUsedBytes: BigInt(diskUsedBytes),
       diskTotalBytes: BigInt(diskTotalBytes),
       diskFreeBytes: BigInt(diskFreeBytes),
+      diskPercent: percent(diskUsedBytes, diskTotalBytes),
       diskReadBytes: BigInt(diskReadBytes),
       diskWriteBytes: BigInt(diskWriteBytes),
       networkInBytes: BigInt(netIn),
       networkOutBytes: BigInt(netOut),
       metadata: {
         source: "vm-telemetry-worker",
+        os: vmOsKind,
         uptime: numberValue(runtime?.uptime),
         nodeId: vps.proxmoxNodeId,
         ipAddress: vps.ipAddress || null,
@@ -416,20 +456,33 @@ async function collectVps(vps: any) {
         configuredMemoryMb: numberValue(config?.memory),
         diskUsage: guestDisk ? {
           ok: guestDisk.ok,
+          os: guestDisk.os,
           source: guestDisk.source,
           totalBytes: guestDisk.totalBytes,
           usedBytes: guestDisk.usedBytes,
           freeBytes: guestDisk.freeBytes,
+          filesystem: guestDisk.selectedVolume?.filesystem ?? guestDisk.selectedVolume?.name ?? null,
+          mountPoint: guestDisk.selectedVolume?.mountpoint ?? guestDisk.selectedVolume?.drive ?? null,
           volumes: guestDisk.volumes,
+          selectedVolume: guestDisk.selectedVolume || null,
+          errorCode: guestDisk.errorCode || null,
           error: guestDisk.error || null,
+          collectionDurationMs: guestDisk.collectionDurationMs || null,
+          checkedAt: guestDisk.checkedAt || null,
         } : {
           ok: selectedDisk.source === "last-known",
+          os: vmOsKind,
           source: selectedDisk.source,
           totalBytes: selectedDisk.totalBytes,
           usedBytes: selectedDisk.usedBytes,
           freeBytes: selectedDisk.freeBytes,
           volumes: [],
-          checked: false,
+          selectedVolume: null,
+          errorCode: runtimeStatus === "stopped" ? "VM_STOPPED" : null,
+          error: runtimeStatus === "stopped" ? "Server stopped" : null,
+          collectionDurationMs: null,
+          checkedAt: vps.diskUsageCheckedAt ? new Date(vps.diskUsageCheckedAt).toISOString() : null,
+          attempted: guestDisk !== null || shouldCollectDisk,
         },
       },
       recordedAt: now,
@@ -448,7 +501,12 @@ async function collectVps(vps: any) {
         diskTotal: created.diskTotalBytes,
         networkIn: created.networkInBytes,
         networkOut: created.networkOutBytes,
-        metadata: { sourceMetricId: created.id },
+        metadata: {
+          sourceMetricId: created.id,
+          vpsInstanceId: vps.id,
+          os: vmOsKind,
+          diskSource: selectedDisk.source,
+        },
         createdAt: now,
       },
     }).catch(() => null),
@@ -488,7 +546,7 @@ async function collectVps(vps: any) {
     })
   })
 
-  await publishRealtimeEvent(realtimeChannels.vpsMetric(vps.id), serializeMetric(created, runtime)).catch(() => null)
+  await publishRealtimeEvent(realtimeChannels.vpsMetric(vps.id), serializeMetric(created, runtime, vmOsKind)).catch(() => null)
   if (previous && (rxDelta > 0 || txDelta > 0 || rxRateBps > 0 || txRateBps > 0)) {
     await recordBandwidthSample({
       vpsInstanceId: vps.id,
@@ -532,7 +590,10 @@ async function collectVps(vps: any) {
   })
 }
 
+let enumerateCursor: string | null = null
+
 async function tick() {
+  const batchSize = Math.max(50, Number(process.env.VM_TELEMETRY_BATCH_SIZE || 1000))
   const rows = await prisma.vpsInstance.findMany({
     where: {
       deletedAt: null,
@@ -545,9 +606,15 @@ async function tick() {
       operatingSystem: { select: { name: true, osFamily: true, osType: true, category: true } },
       order: { select: { status: true, osName: true } },
     },
-    orderBy: { createdAt: "asc" },
-    take: Number(process.env.VM_TELEMETRY_BATCH_SIZE || 500),
+    orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+    ...(enumerateCursor ? { cursor: { id: enumerateCursor }, skip: 1 } : {}),
+    take: batchSize,
   })
+  const last = rows[rows.length - 1]
+  // Rotate: when the table is exhausted the next tick restarts from the top, so
+  // every VM is collected even when the fleet exceeds a single batch (the old
+  // `take: 500` + fixed order silently starved every VM past row 500 forever).
+  enumerateCursor = last && rows.length >= batchSize ? last.id : null
   const vpsRows = rows.filter(shouldCollect)
   await mapLimit(vpsRows, CONCURRENCY, async (vps) => {
     await collectVps(vps).catch((error) => {
@@ -559,7 +626,7 @@ async function tick() {
       })
     })
   })
-  console.log("[vm-telemetry-worker] tick", { scanned: rows.length, sampled: vpsRows.length })
+  console.log("[vm-telemetry-worker] tick", { scanned: rows.length, sampled: vpsRows.length, cursor: enumerateCursor })
 }
 
 async function main() {

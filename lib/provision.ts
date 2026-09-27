@@ -38,6 +38,7 @@ import { persistVpsConsoleMetadata } from "@/lib/console-metadata"
 import { ensureCloudInitBeforeStart } from "@/lib/vps-control"
 import { hostnameFromIp, normalizeServerTag } from "@/lib/vm-hostname"
 import { expandGuestPrimaryDisk, waitForGuestExec } from "@/lib/vm-guest-disk"
+import { resolveVmGuestOs, type VmGuestOsKind } from "@/lib/vm-os-detection"
 import { publishLiveVmSnapshot } from "@/lib/proxmox-live"
 import { validateReinstallNetwork } from "@/lib/vm-network-orchestrator"
 import {
@@ -3499,7 +3500,14 @@ async function processUpgradeJob(jobId: string) {
           client,
           nodeName: vps.proxmoxNode.nodeName,
           vmid: vps.vmid,
-          osHint: [vps.operatingSystem?.name, vps.operatingSystem?.osFamily, vps.operatingSystem?.osType, vps.order?.osName].filter(Boolean).join(" "),
+          os: resolveVmGuestOs({
+            osType: vps.operatingSystem?.osType,
+            osFamily: vps.operatingSystem?.osFamily,
+            category: vps.operatingSystem?.category,
+            osName: vps.operatingSystem?.name,
+            vmOsFamily: vps.vmOsFamily,
+            orderOsName: vps.order?.osName,
+          }),
         }).catch((error) => ({ ok: false, error: error?.message || String(error) }))
         await logJob(job.id, { step: "RESIZING_DISK", event: "disk_upgrade:guest_expand", message: "Expanded guest filesystem", response: guestResize })
         if (!guestResize.ok) throw new Error(`guest_disk_expand_failed: ${(guestResize as any).error || "verification_failed"}`)
@@ -3711,7 +3719,15 @@ async function processUpgradeJob(jobId: string) {
         client,
         nodeName: vps.proxmoxNode.nodeName,
         vmid: vps.vmid,
-        osHint: [vps.operatingSystem?.name, vps.operatingSystem?.osFamily, vps.operatingSystem?.osType, vps.order?.osName].filter(Boolean).join(" "),
+        os: resolveVmGuestOs({
+          osType: vps.operatingSystem?.osType,
+          osFamily: vps.operatingSystem?.osFamily,
+          category: vps.operatingSystem?.category,
+          osName: vps.operatingSystem?.name,
+          vmOsFamily: vps.vmOsFamily,
+          orderOsName: vps.order?.osName,
+        }),
+        previousTotalBytes: vps.diskTotalGb ? Number(vps.diskTotalGb) * 1_000_000_000 : null,
       }).catch((error) => ({ ok: false, error: error?.message || String(error) }))
       await logJob(job.id, { step: "RESIZING_DISK", event: "upgrade:guest_expand", message: "Expanded guest filesystem", response: guestResize })
       if (!guestResize.ok) throw new Error(`guest_disk_expand_failed: ${(guestResize as any).error || "verification_failed"}`)
@@ -4538,7 +4554,14 @@ export async function processProvisioningJob(jobId: string) {
         client,
         nodeName,
         vmid,
-        osHint: targetTemplate.osFamily || targetTemplate.osName || null,
+        os: resolveVmGuestOs({
+          osType: targetTemplate?.osType,
+          osFamily: targetTemplate?.osFamily,
+          category: targetTemplate?.category,
+          osName: targetTemplate?.name,
+          vmOsFamily: targetTemplate?.osFamily,
+          orderOsName: null,
+        }),
       }).catch((expandErr: any) => {
         console.warn("[reinstall] expandGuestPrimaryDisk failed (non-fatal):", expandErr?.message)
       })

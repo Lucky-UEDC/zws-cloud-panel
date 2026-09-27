@@ -37,20 +37,22 @@ test("guest disk parsers handle Linux and Windows outputs", () => {
   assert.equal(linux.freeBytes, 156_000_000_000)
 
   const windowsJson = parseWindowsVolumes(JSON.stringify([
-    { DriveLetter: "C", SizeRemaining: 156000000000, Size: 200000000000, FileSystem: "NTFS" },
-    { DriveLetter: "D", SizeRemaining: 400000000000, Size: 500000000000, FileSystem: "NTFS" },
+    { DriveLetter: "C", DriveType: 3, SizeRemaining: 156000000000, Size: 200000000000, FileSystem: "NTFS" },
+    { DriveLetter: "D", DriveType: 3, SizeRemaining: 400000000000, Size: 500000000000, FileSystem: "NTFS" },
   ]))
+  // Totals describe the selected system drive (C:), not the sum of every volume.
   assert.equal(windowsJson.ok, true)
-  assert.equal(windowsJson.totalBytes, 700_000_000_000)
-  assert.equal(windowsJson.usedBytes, 144_000_000_000)
-  assert.equal(windowsJson.freeBytes, 556_000_000_000)
+  assert.equal(windowsJson.totalBytes, 200_000_000_000)
+  assert.equal(windowsJson.usedBytes, 44_000_000_000)
+  assert.equal(windowsJson.freeBytes, 156_000_000_000)
+  assert.equal(windowsJson.selectedVolume?.name, "C:")
   assert.equal(windowsJson.volumes.length, 2)
 
   const windowsWmic = parseWindowsVolumes("DeviceID=C:\r\nFreeSpace=32100000000\r\nSize=49900000000\r\n\r\nDeviceID=D:\r\nFreeSpace=10000000000\r\nSize=20000000000\r\n\r\n")
   assert.equal(windowsWmic.ok, true)
-  assert.equal(windowsWmic.totalBytes, 69_900_000_000)
-  assert.equal(windowsWmic.usedBytes, 27_800_000_000)
-  assert.equal(windowsWmic.freeBytes, 42_100_000_000)
+  assert.equal(windowsWmic.totalBytes, 49_900_000_000)
+  assert.equal(windowsWmic.usedBytes, 17_800_000_000)
+  assert.equal(windowsWmic.freeBytes, 32_100_000_000)
   assert.equal(windowsWmic.volumes.length, 2)
 })
 

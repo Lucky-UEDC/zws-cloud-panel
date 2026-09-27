@@ -6,6 +6,7 @@ import { createProxmoxClient, PROXMOX_METRICS_TIMEOUT_MS } from "@/lib/proxmox"
 import { withRedisLock } from "@/lib/redis"
 import { extractConfiguredVmIp } from "@/lib/vm-ip-discovery"
 import { collectGuestDiskUsage } from "@/lib/vm-guest-disk"
+import { resolveVmGuestOs, type VmGuestOsKind } from "@/lib/vm-os-detection"
 import { dbStatusFromPowerState, normalizeProxmoxPowerState } from "@/lib/vm-runtime-status"
 import { extractMetadataFromNotes, parseVmIdentityTags } from "@/lib/proxmox-tags"
 import { writeStructuredLog } from "@/lib/structured-logger"
@@ -513,7 +514,7 @@ async function runUnlocked(options: Required<Omit<ProductionVpsReconciliationOpt
       ...(options.vpsId ? { OR: [{ id: options.vpsId }, { orderId: options.vpsId }] } : {}),
       ownershipStatus: { notIn: ["external", "manual", "rejected"] },
     },
-    include: { order: true, proxmoxNode: true },
+    include: { order: true, proxmoxNode: true, operatingSystem: { select: { name: true, osFamily: true, osType: true, category: true } } },
     orderBy: { createdAt: "asc" },
     ...(options.limit ? { take: options.limit } : {}),
   })
@@ -708,11 +709,19 @@ async function runUnlocked(options: Required<Omit<ProductionVpsReconciliationOpt
       if (guestAgentStatus === "online") {
         const interfaces = await client.getVMGuestNetworkInterfaces(node.nodeName, vps.vmid).catch(() => null)
         guestAgentIp = extractGuestIpv4Addresses(interfaces)[0] || null
+        const vmOsKind = resolveVmGuestOs({
+          osType: vps.operatingSystem?.osType,
+          osFamily: vps.operatingSystem?.osFamily,
+          category: vps.operatingSystem?.category,
+          osName: vps.operatingSystem?.name,
+          vmOsFamily: vps.vmOsFamily,
+          orderOsName: vps.order?.osName,
+        })
         guestDisk = await collectGuestDiskUsage({
           client,
           nodeName: node.nodeName,
           vmid: vps.vmid,
-          osHint: vps.vmOsFamily || vps.name || vps.hostname,
+          os: vmOsKind,
         }).catch(() => null)
       }
     }
