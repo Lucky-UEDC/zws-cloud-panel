@@ -69,15 +69,35 @@ function isFresh(value: unknown, staleAfter?: unknown) {
   return Date.now() - recorded <= 60_000
 }
 
-function freshness(point: any) {
+export type MetricFreshnessState = "CURRENT" | "STALE" | "UNAVAILABLE"
+
+export function metricFreshness(point: any): { state: MetricFreshnessState; source: string; lastUpdatedAt: string | null } {
   const recordedAt = point?.recordedAt || point?.recorded_at || point?.lastSyncedAt || point?.last_synced_at || null
   const staleAfter = point?.staleAfter || point?.stale_after || null
-  const state = isFresh(recordedAt, staleAfter) ? "LIVE" : recordedAt ? "STALE" : "UNAVAILABLE"
+  const now = Date.now()
+  const recorded = recordedAt ? new Date(String(recordedAt)).getTime() : 0
+  let state: MetricFreshnessState
+  if (!recorded) {
+    state = "UNAVAILABLE"
+  } else if (staleAfter && new Date(String(staleAfter)).getTime() > 0) {
+    state = now <= new Date(String(staleAfter)).getTime() ? "CURRENT" : "STALE"
+  } else {
+    // Default: CURRENT < 90s, STALE 90s–10min, UNAVAILABLE > 10min
+    const age = now - recorded
+    if (age <= 90_000) state = "CURRENT"
+    else if (age <= 600_000) state = "STALE"
+    else state = "UNAVAILABLE"
+  }
   return {
     state,
     source: state === "UNAVAILABLE" ? "unavailable" : "cached",
-    lastUpdatedAt: iso(recordedAt),
+    lastUpdatedAt: recorded ? new Date(recorded).toISOString() : null,
   }
+}
+
+function freshness(point: any) {
+  const mf = metricFreshness(point)
+  return { state: mf.state, source: mf.source, lastUpdatedAt: mf.lastUpdatedAt }
 }
 
 function customerSteps(steps: any[] = [], jobType?: string | null) {
@@ -496,10 +516,10 @@ export async function serializeClientVmStatus(vps: any) {
   const state = canonical.state || {}
   const stateFreshness = freshness(state)
   const metricFreshness = freshness(canonical.metrics)
-  const stateRuntimeStatus = stateFreshness.state === "LIVE" ? (state.runtimeStatus || state.runtime_status || null) : null
-  const metricRuntimeStatus = metricFreshness.state === "LIVE" ? (canonical.metrics?.runtimeStatus || canonical.metrics?.runtime_status || null) : null
+  const stateRuntimeStatus = stateFreshness.state === "CURRENT" ? (state.runtimeStatus || state.runtime_status || null) : null
+  const metricRuntimeStatus = metricFreshness.state === "CURRENT" ? (canonical.metrics?.runtimeStatus || canonical.metrics?.runtime_status || null) : null
   const runtimeStatus = stateRuntimeStatus || metricRuntimeStatus || null
-  const stateStatus = stateFreshness.state === "LIVE" ? state.status : null
+  const stateStatus = stateFreshness.state === "CURRENT" ? state.status : null
   const mapped = mapLiveVpsStatus(runtimeStatus ? { status: runtimeStatus } : null, vps.order.provisioningStatus, stateStatus || "UNKNOWN")
   const runtimeRunning = runtimeStatus === "running" || mapped.status === "ACTIVE"
   const explicitAgentStatus = String(canonical.metrics?.metadata?.agentStatus || canonical.state?.metadata?.agentStatus || "").toLowerCase()
@@ -840,28 +860,32 @@ export async function serializeClientVmStatus(vps: any) {
   }
 }
 
-export async function getClientVmMetricSeries(input: { customerId: string; id: string; range: "1h" | "24h" }) {
+export async function getClientVmMetricSeries(input: { customerId: string; id: string; range: "1h" | "24h" | "48h" }) {
   const vps = await prisma.vpsInstance.findFirst({
     where: { OR: [{ id: input.id }, { orderId: input.id }], customerId: input.customerId, deletedAt: null, status: { not: "DELETED" } },
     select: { id: true, status: true },
   })
   if (!vps) return null
-  const since = new Date(Date.now() - (input.range === "24h" ? 24 : 1) * 60 * 60 * 1000)
+  const rangeHours = input.range === "48h" ? 48 : input.range === "24h" ? 24 : 1
+  const since = new Date(Date.now() - rangeHours * 60 * 60 * 1000)
+  // Target ~288 points for 48h (10-min buckets), 288 for 24h (5-min), 120 for 1h (30s)
+  const targetPoints = input.range === "48h" ? 288 : input.range === "24h" ? 288 : 120
   const [cache, rows] = await Promise.all([
     (prisma as any).vmMetricsCache.findUnique({ where: { vpsInstanceId: vps.id } }).catch(() => null),
     prisma.vpsMetric.findMany({
       where: { vpsInstanceId: vps.id, recordedAt: { gte: since } },
       orderBy: { recordedAt: "asc" },
-      take: input.range === "24h" ? 2880 : 240,
+      take: targetPoints * 2, // oversample for downsampling
     }).catch(() => []),
   ])
-  const points = bucketMetricPoints(rows)
+  const bucketMs = input.range === "48h" ? 10 * 60_000 : input.range === "24h" ? 5 * 60_000 : 30_000
+  const points = bucketMetricPoints(rows, bucketMs)
   if (!points.length && cache) {
     const cachedPoint = metricPoint(cache)
     if (cachedPoint) points.push(cachedPoint as any)
   }
   const latest = points[points.length - 1] || metricPoint(cache)
-  const fresh = freshness(cache || latest)
+  const fresh = metricFreshness(cache || latest)
   const runtimeStatus = String(latest?.runtimeStatus || cache?.runtimeStatus || cache?.runtime_status || "").toLowerCase()
   const running = runtimeStatus === "running"
   return {
