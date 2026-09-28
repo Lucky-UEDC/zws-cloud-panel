@@ -5942,8 +5942,24 @@ model VmUsageHistory {
   metadata      Json     @default("{}")
   createdAt     DateTime @default(now()) @map("created_at")
 
+  // Retention tiers. Raw samples are folded into 5m rows after seven days and
+  // into 1h rows after thirty, so the table holds a bounded number of rows per
+  // VM rather than one every thirty seconds forever. Nullable and defaulted so
+  // every existing row stays valid and counts as raw.
+  vpsInstanceId String?   @map("vps_instance_id")
+  /// "raw" | "5m" | "1h" — the resolution of this row.
+  resolution    String    @default("raw")
+  /// The bucket this row represents. Null on pre-existing rows, which are raw
+  /// samples whose bucket is `createdAt`.
+  recordedAt    DateTime? @map("recorded_at")
+  diskFree      BigInt    @default(0) @map("disk_free")
+  /// How many raw samples this rollup folded. 1 on a raw row.
+  sampleCount   Int       @default(1) @map("sample_count")
+
   @@index([vmId, createdAt])
   @@index([createdAt])
+  @@index([vpsInstanceId, resolution, recordedAt])
+  @@index([resolution, recordedAt])
   @@map("vm_usage_history")
 }
 

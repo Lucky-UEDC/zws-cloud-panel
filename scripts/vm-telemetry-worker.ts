@@ -5,7 +5,9 @@ import { publishRealtimeEvent, realtimeChannels } from "@/lib/realtime-telemetry
 import { recordBandwidthSample } from "@/lib/bandwidth-accounting"
 import { applyBandwidthThrottle } from "@/lib/bandwidth-enforcement"
 import { vmIdentityNotesMatch, vmIdentityTagsMatch } from "@/lib/proxmox-tags"
-import { collectGuestDiskUsage, configuredMemoryBytes, type GuestDiskUsage } from "@/lib/vm-guest-disk"
+import { configuredMemoryBytes } from "@/lib/vm-guest-disk"
+import { backoffState, collectTemplateDiskUsage, runBounded, TELEMETRY_CONCURRENCY, type TelemetryDiskResult } from "@/lib/guest-automation/telemetry"
+import { runRetentionPass } from "@/lib/guest-automation/retention"
 import { resolveVmGuestOs, type VmGuestOsKind } from "@/lib/vm-os-detection"
 import { dbStatusFromPowerState } from "@/lib/vm-runtime-status"
 
@@ -13,17 +15,22 @@ const POLL_MS = Math.max(30_000, Number(process.env.VM_TELEMETRY_POLL_MS || 30_0
 // Running VMs get a ~30s disk collection cadence (locked per VM so overlapping
 // ticks never double-exec a guest command). Failures back off before retrying.
 const DISK_CHECK_MS = Math.max(30_000, Number(process.env.VM_DISK_USAGE_CHECK_MS || 30_000))
-const DISK_FAIL_RETRY_MS = Math.max(60_000, Number(process.env.VM_DISK_FAIL_RETRY_MS || 5 * 60_000))
-const CONCURRENCY = Math.max(1, Number(process.env.VM_TELEMETRY_CONCURRENCY || 4))
+// The per-VM failure backoff moved into the collector, which is where the
+// guarantee belongs: the worker, an admin refresh and a customer page refresh
+// all call the same code and must all get "one collection per VM at a time".
+const CONCURRENCY = TELEMETRY_CONCURRENCY
 const OWNERSHIP_VERIFY_MS = Math.max(60_000, Number(process.env.VM_OWNERSHIP_VERIFY_MS || 10 * 60_000))
 const ONCE = process.argv.includes("--once")
 const FORCE_DISK = process.argv.includes("--force-disk")
+/** Retention runs on its own cadence, not on every thirty-second collection. */
+const RETENTION_ONLY = process.argv.includes("--retention")
+const RETENTION_DRY_RUN = process.argv.includes("--retention-dry-run")
+const RETENTION_MS = Math.max(60 * 60_000, Number(process.env.VM_METRIC_RETENTION_MS || 6 * 60 * 60_000))
 
 let stopping = false
 
-// Per-VM in-flight guard for guest exec, and backoff clock for failed probes.
-const diskCollectionInflight = new Set<string>()
-const diskFailRetryAt = new Map<string, number>()
+// The per-VM in-flight guard and the failure backoff both live in
+// lib/guest-automation/telemetry.ts, not here.
 
 function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms))
@@ -274,16 +281,25 @@ async function upsertDatabaseFirstCaches(input: {
   ])
 }
 
+/**
+ * The bounded queue.
+ *
+ * `runBounded` lives in the telemetry library rather than here so an admin
+ * refresh and a customer page refresh share the same guarantee. The only local
+ * concern is the shutdown flag: a tick interrupted mid-flight must stop pulling
+ * new work, and the shared helper is not aware of a process-level signal.
+ */
 async function mapLimit<T>(items: T[], limit: number, worker: (item: T) => Promise<void>) {
-  let index = 0
-  const runners = Array.from({ length: Math.min(limit, items.length) }, async () => {
-    while (!stopping) {
-      const item = items[index++]
-      if (!item) return
-      await worker(item)
-    }
+  const queue = [...items]
+  await runBounded(queue, limit, async (item) => {
+    if (stopping) throw new Error("shutdown")
+    await worker(item)
+  }, {
+    onError: (item, error) => {
+      if (String((error as any)?.message || error) === "shutdown") return
+      console.error("[vm-telemetry-worker] queue item failed", { message: (error as any)?.message || String(error) })
+    },
   })
-  await Promise.all(runners)
 }
 
 async function verifyOwnershipIfDue(vps: any, client: any) {
@@ -371,28 +387,30 @@ async function collectVps(vps: any) {
   const configuredRamTotalBytes = configuredMemoryBytes(config, runtime?.maxmem)
   const vmOsKind = vmOsKindFromVps(vps)
   const lastDiskCheckAt = vps.diskUsageCheckedAt ? new Date(vps.diskUsageCheckedAt).getTime() : 0
-  const lastDiskFailureRetryAt = diskFailRetryAt.get(vps.id) || 0
+  // The collector refuses while it is already running for this VM, and refuses
+  // again while the VM is backing off. The worker only decides whether a pass
+  // is due at all, from the last successful collection recorded on the server.
   const diskCheckDue = FORCE_DISK || !lastDiskCheckAt || now.getTime() - lastDiskCheckAt >= DISK_CHECK_MS
-  const diskBackoffActive = now.getTime() < lastDiskFailureRetryAt
-  const shouldCollectDisk = runtimeStatus === "running" && diskCheckDue && !diskBackoffActive && !diskCollectionInflight.has(vps.id)
-  let guestDisk: GuestDiskUsage | null = null
+  const shouldCollectDisk = runtimeStatus === "running" && diskCheckDue
+  let guestDisk: TelemetryDiskResult | null = null
   if (shouldCollectDisk) {
-    diskCollectionInflight.add(vps.id)
-    try {
-      guestDisk = await collectGuestDiskUsage({ client, nodeName: vps.proxmoxNode.nodeName, vmid: vps.vmid, os: vmOsKind })
-    } catch (error: any) {
-      console.error("[vm-telemetry-worker] disk collection threw", {
-        vpsId: vps.id,
-        vmid: vps.vmid,
-        message: error?.message || String(error),
-      })
-      guestDisk = null
-    } finally {
-      diskCollectionInflight.delete(vps.id)
-    }
+    // The collector resolves the OS template from the guest's own report and
+    // runs whatever command that template declares. Correcting a command on one
+    // OS family is now a database edit, not a build.
+    guestDisk = await collectTemplateDiskUsage({
+      vpsInstanceId: vps.id,
+      vmid: vps.vmid,
+      node: {
+        nodeName: vps.proxmoxNode.nodeName,
+        host: vps.proxmoxNode.host,
+        tokenId: vps.proxmoxNode.tokenId,
+        tokenSecret: vps.proxmoxNode.tokenSecret,
+        allowInsecureTls: vps.proxmoxNode.allowInsecureTls,
+      },
+      force: FORCE_DISK,
+    })
   }
   if (guestDisk && !guestDisk.ok) {
-    diskFailRetryAt.set(vps.id, Date.now() + DISK_FAIL_RETRY_MS)
     console.warn("[vm-telemetry-worker] disk collection failed", {
       vpsId: vps.id,
       vmid: vps.vmid,
@@ -401,8 +419,6 @@ async function collectVps(vps: any) {
       error: guestDisk.error,
       collectionDurationMs: guestDisk.collectionDurationMs,
     })
-  } else if (guestDisk?.ok) {
-    diskFailRetryAt.delete(vps.id)
   }
   const lastKnownDisk = diskSnapshotFromMetric(previousNonZeroDisk) || diskSnapshotFromVps(vps)
   const selectedDisk = guestDisk?.ok
@@ -457,12 +473,17 @@ async function collectVps(vps: any) {
         diskUsage: guestDisk ? {
           ok: guestDisk.ok,
           os: guestDisk.os,
+          engine: guestDisk.engine,
           source: guestDisk.source,
+          // Which profile produced the number, and which version of it. A disk
+          // figure with no provenance is a number nobody can argue with later.
+          templateId: guestDisk.templateId,
+          templateVersion: guestDisk.templateVersion,
           totalBytes: guestDisk.totalBytes,
           usedBytes: guestDisk.usedBytes,
           freeBytes: guestDisk.freeBytes,
-          filesystem: guestDisk.selectedVolume?.filesystem ?? guestDisk.selectedVolume?.name ?? null,
-          mountPoint: guestDisk.selectedVolume?.mountpoint ?? guestDisk.selectedVolume?.drive ?? null,
+          usedPercent: guestDisk.usedPercent,
+          filesystem: guestDisk.filesystem,
           volumes: guestDisk.volumes,
           selectedVolume: guestDisk.selectedVolume || null,
           errorCode: guestDisk.errorCode || null,
@@ -626,16 +647,69 @@ async function tick() {
       })
     })
   })
-  console.log("[vm-telemetry-worker] tick", { scanned: rows.length, sampled: vpsRows.length, cursor: enumerateCursor })
+  const backoff = backoffState()
+  console.log("[vm-telemetry-worker] tick", {
+    scanned: rows.length,
+    sampled: vpsRows.length,
+    cursor: enumerateCursor,
+    concurrency: CONCURRENCY,
+    inFlight: backoff.inFlight,
+    backingOff: backoff.backingOff,
+  })
+}
+
+/**
+ * Fold and expire metrics.
+ *
+ * A separate cadence from collection, because the two have opposite shapes: one
+ * is small and frequent, the other is large and infrequent. Folding on every
+ * tick would be a full scan of the busiest table thirty times an hour to find
+ * almost nothing new.
+ */
+async function retentionPass(dryRun = false) {
+  const started = Date.now()
+  try {
+    const result = await runRetentionPass({ dryRun })
+    console.log("[vm-telemetry-worker] retention", {
+      dryRun,
+      durationMs: result.durationMs,
+      wallMs: Date.now() - started,
+      fiveMinute: result.fiveMinute,
+      hourly: result.hourly,
+      deleted: result.retention.results.map((entry) => `${entry.resolution}:${entry.deleted}`).join(","),
+    })
+    return result
+  } catch (error: any) {
+    console.error("[vm-telemetry-worker] retention failed", { message: error?.message || String(error) })
+    return null
+  }
 }
 
 async function main() {
-  console.log("[vm-telemetry-worker] started", { pollMs: POLL_MS, concurrency: CONCURRENCY, once: ONCE })
+  console.log("[vm-telemetry-worker] started", {
+    pollMs: POLL_MS,
+    concurrency: CONCURRENCY,
+    once: ONCE,
+    retentionOnly: RETENTION_ONLY,
+    retentionMs: RETENTION_MS,
+  })
+
+  if (RETENTION_ONLY) {
+    await retentionPass(RETENTION_DRY_RUN)
+    return
+  }
+
+  let lastRetentionAt = 0
   while (!stopping) {
     const started = Date.now()
     await tick().catch((error) => {
       console.error("[vm-telemetry-worker] tick failed", { message: error?.message || String(error) })
     })
+    // On the first pass, and then on the retention cadence. Not on every tick.
+    if (Date.now() - lastRetentionAt >= RETENTION_MS) {
+      lastRetentionAt = Date.now()
+      await retentionPass(false)
+    }
     if (ONCE) break
     await sleep(Math.max(1000, POLL_MS - (Date.now() - started)))
   }

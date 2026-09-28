@@ -65,6 +65,8 @@
     "telemetry:worker": "tsx scripts/node-telemetry-worker.ts",
     "vm:telemetry:worker": "tsx scripts/vm-telemetry-worker.ts",
     "vm:telemetry:once": "tsx scripts/vm-telemetry-worker.ts --once",
+    "vm:telemetry:retention": "tsx scripts/vm-telemetry-worker.ts --retention",
+    "vm:telemetry:retention:dry-run": "tsx scripts/vm-telemetry-worker.ts --retention --retention-dry-run",
     "vm:db-first-sync:worker": "tsx scripts/database-first-proxmox-sync-worker.ts",
     "vm:db-first-sync:once": "tsx scripts/database-first-proxmox-sync-worker.ts --once",
     "vm:action:worker": "tsx scripts/vm-action-worker.ts",
