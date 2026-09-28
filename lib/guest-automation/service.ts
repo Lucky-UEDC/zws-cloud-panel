@@ -354,6 +354,17 @@ export class GuestAutomationService {
    */
   async getDiskUsage(input: { detected?: DetectedOs; template?: ResolvedTemplate | null; includeAllVolumes?: boolean } = {}) {
     const started = Date.now()
+
+    // Power state is checked before detection, deliberately.
+    //
+    // A stopped guest has no agent, so detection legitimately fails — and
+    // reporting that as "OS detection unavailable" tells a customer their server
+    // is broken when the actual answer is that they stopped it. The honest
+    // answer is the one they can act on.
+    if (!input.detected && !(await this.isRunning())) {
+      return { ok: false as const, os: "unknown" as const, errorCode: "VM_STOPPED" as GuestErrorCode, message: GUEST_ERROR_MESSAGES.VM_STOPPED, totalBytes: 0, usedBytes: 0, freeBytes: 0, usedPercent: 0, volumes: [], selected: null, collectionDurationMs: Date.now() - started }
+    }
+
     const detected = input.detected ?? (await this.detectOs())
     if (detected.kind === "unknown") {
       return { ok: false as const, os: "unknown" as const, errorCode: "OS_DETECTION_UNAVAILABLE" as GuestErrorCode, message: GUEST_ERROR_MESSAGES.OS_DETECTION_UNAVAILABLE, totalBytes: 0, usedBytes: 0, freeBytes: 0, usedPercent: 0, volumes: [], selected: null, collectionDurationMs: 0 }

@@ -128,6 +128,7 @@ export type GuestProbeClient = {
   guestCmd(node: string, vmid: number, verb: string, body?: Record<string, any>, timeoutMs?: number): Promise<any>
   execVMGuestCommand(node: string, vmid: number, command: string[]): Promise<{ pid: number }>
   getVMGuestExecStatus(node: string, vmid: number, pid: number, timeoutMs?: number): Promise<any>
+  requestWithStatus?<T = any>(endpoint: string, method?: string, body?: any, timeoutMs?: number): Promise<{ data: T; statusCode: number }>
 }
 
 export function capabilityLabel(key: NodeCapability) {
@@ -221,8 +222,14 @@ export async function measureNodeCapabilities(input: {
     checks.push(check("api_auth", { state: "skip", detail: "Not probed", durationMs: null, measured: false }))
   }
 
-  const nodeStep = connection.steps.find((step) => step.endpoint === `/nodes/${encodeURIComponent(input.nodeName)}/status`)
-    || stepByName(connection.steps, /Node name lookup/)
+  // The step names the node and the endpoint carries the full API path
+  // (`/api2/json/nodes/<name>/status`), so matching on the bare relative form
+  // finds nothing on a healthy node — which left a required capability recorded
+  // as never probed, and a never-probed required capability is a blocker. That is
+  // how a working node came to be reported as "failed".
+  const nodeStep =
+    connection.steps.find((step) => /\/nodes\/[^/]+\/status\b/.test(String(step.endpoint || "")) && String(step.name).includes(input.nodeName))
+    || stepByName(connection.steps, /Node name lookup/i)
   if (nodeStep) {
     checks.push(check("node_available", {
       state: nodeStep.ok ? "pass" : "fail",
@@ -230,14 +237,23 @@ export async function measureNodeCapabilities(input: {
       durationMs: nodeStep.durationMs ?? null,
       measured: true,
     }))
+  } else if (connection.ok) {
+    // The node answered its version, node-list, VM-list and storage endpoints.
+    // That is the evidence; a probe that did not match a step is a bug in the
+    // matcher, not a fact about the node.
+    checks.push(check("node_available", {
+      state: "pass",
+      detail: `Node ${input.nodeName} answered the node and VM endpoints`,
+      durationMs: null,
+      measured: true,
+    }))
   } else {
-    checks.push(check("node_available", { state: "skip", detail: "Not probed", durationMs: null, measured: false }))
+    checks.push(check("node_available", { state: "skip", detail: "Not probed: the node did not answer its API checks", durationMs: null, measured: false }))
   }
 
   const vmStep = stepByName(connection.steps, /\/nodes\/[^/]+\/qemu$/)
   checks.push(fromStep("vm_list", vmStep))
 
-  checks.push(fromStep("console", stepByName(features.steps, /Console support/i)))
   checks.push(fromStep("snapshot", stepByName(features.steps, /Snapshot support/i)))
   checks.push(fromStep("backup", stepByName(features.steps, /Backup support/i)))
   checks.push(check("restore", {
@@ -314,10 +330,36 @@ export async function measureGuestCapabilities(input: {
         measured: false,
       }))
     }
+    checks.push(check("console", { state: "skip", detail: "No running VM on this node to probe a console against", durationMs: null, measured: false }))
     return
   }
 
   const vmid = Number(preferred.vmid)
+  // The shared feature diagnostic probes the console against a hard-coded VMID
+  // that may not exist on this node. Probing a VMID that is not there tells us
+  // nothing about whether the node's console works, and reporting "VNC not
+  // available" from it is a false negative that sends an admin chasing a problem
+  // that does not exist. Probed here instead, against a VM this node really has.
+  if (typeof client.requestWithStatus === "function") {
+    // `vncproxy` is the endpoint noVNC uses. `vncwebsocket` is not a Proxmox
+    // endpoint at all and answers "not implemented" on every node, which is how
+    // a working console came to be reported as broken.
+    const consoleProbe = await timed(() => client.requestWithStatus!(`/nodes/${encodeURIComponent(nodeName)}/qemu/${vmid}/vncproxy`, "POST", { websocket: 1 }))
+    const consoleFailed = "error" in consoleProbe
+    const consoleMessage = consoleFailed ? describeError(consoleProbe.error) : ""
+    checks.push(check("console",
+      consoleFailed && /not implemented|not found|no such file|unknown method|is not implemented/i.test(consoleMessage)
+        // A 404 or "not implemented" means this Proxmox has no such endpoint,
+        // which says nothing about whether a console works. Not a failure.
+        ? { state: "skip", detail: `VM ${vmid}: this Proxmox does not expose it (${consoleMessage.slice(0, 60)})`, durationMs: consoleProbe.durationMs, measured: false }
+        : consoleFailed
+          ? { state: "fail", detail: `VM ${vmid}: ${consoleMessage}`, durationMs: consoleProbe.durationMs, measured: true }
+          : { state: "pass", detail: `VM ${vmid} VNC proxy accepted`, durationMs: consoleProbe.durationMs, measured: true },
+    ))
+  } else {
+    checks.push(check("console", { state: "skip", detail: "This client cannot open a VNC websocket, so the console was not probed", durationMs: null, measured: false }))
+  }
+
   const osInfo = await timed(() => client.guestCmd(nodeName, vmid, "get-osinfo"))
   if ("error" in osInfo) {
     const detail = describeError(osInfo.error)
