@@ -22,6 +22,7 @@ import { expandGuestPrimaryDisk } from "@/lib/vm-guest-disk"
 import { resolveVmGuestOs, type VmGuestOsKind } from "@/lib/vm-os-detection"
 import { scanDuplicateManagedVms } from "@/lib/vm-duplicate-quarantine"
 import { GuestAutomationService, osMetadataForVps } from "@/lib/guest-automation/service"
+import { adoptVpsIntoGuestAutomation } from "@/lib/guest-automation/adoption"
 import { guestContextFor } from "@/lib/guest-automation/first-boot"
 
 function nowIso() {
@@ -866,7 +867,8 @@ export async function runAdminVmAction(input: {
     | "terminate"
     | "reassign_node"
     | "reset_provisioning_state"
-    | "rebuild_cloud_init_network"
+    | "adopt_guest_automation"
+    | "guest_adoption_status"
     | "sync_proxmox_state"
     | "reset_password"
     | "resize_disk"
@@ -910,6 +912,42 @@ export async function runAdminVmAction(input: {
 
   const vps = await getVpsForAdmin(input.vpsId)
   const payload = input.payload || {}
+
+  if (normalized === "adopt_guest_automation" || normalized === "guest_adoption_status") {
+    // Detection and recording only. Nothing here reconfigures the guest: an
+    // admin clicking "adopt" must not have a running customer's network
+    // rewritten underneath them. The first real change is a separate, explicit
+    // request, and it goes through the same change-driven plan as any other.
+    const outcome = await adoptVpsIntoGuestAutomation({ vps: vps as any, actorEmail: input.actorEmail })
+    await logAdminVmAction({
+      vps,
+      actorEmail: input.actorEmail,
+      action: normalized,
+      result: outcome.ok
+        ? {
+            status: "ADOPTED",
+            os: outcome.os.id,
+            engine: outcome.os.engine,
+            template: outcome.template?.name || null,
+            templateVersion: outcome.template?.version || null,
+            automationReady: outcome.automationReady,
+            supportedOperations: outcome.supportedOperations.length,
+          }
+        : { status: "NOT_ADOPTED", code: outcome.code, reason: outcome.message, remedy: outcome.remedy },
+    })
+    return outcome.ok
+      ? {
+          ok: true,
+          status: "ADOPTED",
+          os: outcome.os,
+          template: outcome.template,
+          automationReady: outcome.automationReady,
+          supportedOperations: outcome.supportedOperations,
+          observed: outcome.observed,
+          message: `This server runs ${outcome.os.name || outcome.os.id}${outcome.os.version ? ` ${outcome.os.version}` : ""}. It is now managed by guest automation. Nothing was reconfigured.`,
+        }
+      : { ok: false, status: "NOT_ADOPTED", code: outcome.code, reason: outcome.message, remedy: outcome.remedy }
+  }
 
   if (normalized === "mark_provision_complete") {
     await prisma.vpsInstance.update({ where: { id: vps.id }, data: { status: "ACTIVE", activatedAt: vps.activatedAt || new Date() } })

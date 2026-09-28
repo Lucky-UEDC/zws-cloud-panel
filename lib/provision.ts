@@ -1325,10 +1325,21 @@ async function configureGuestAfterBoot(input: {
   displayStatus?: string
   waitForAgentMs?: number
 }) {
-  const step: ProvisioningStep = "VERIFYING_VM"
-  await upsertStep(input.jobId, step, { status: "running", startedAt: new Date(), error: null })
+  // Each first-boot stage becomes its own provisioning step, so the customer's
+  // stage list shows the four real phases rather than one long "configuring"
+  // row. The stage tokens are strings in the database, so adding them is
+  // additive and needs no migration.
+  const STAGE_STEPS: Record<string, ProvisioningStep> = {
+    WAITING_GUEST_AGENT: "WAITING_GUEST_AGENT",
+    DETECTING_OS: "DETECTING_OS",
+    CONFIGURING_GUEST: "CONFIGURING_GUEST",
+    VERIFYING_GUEST: "VERIFYING_GUEST",
+  }
+  let activeStep: ProvisioningStep = "WAITING_GUEST_AGENT"
+  await upsertStep(input.jobId, activeStep, { status: "running", startedAt: new Date(), error: null })
+  await setJobDisplay(input.jobId, activeStep)
   await logJob(input.jobId, {
-    step,
+    step: activeStep,
     event: "guest_automation:start",
     message: "Configuring server through guest automation",
     request: {
@@ -1357,11 +1368,19 @@ async function configureGuestAfterBoot(input: {
     desired: input.desired,
     metadata: input.metadata ?? null,
     waitForAgentMs: input.waitForAgentMs,
+    onStage: async (stage) => {
+      const next = STAGE_STEPS[stage]
+      if (!next || next === activeStep) return
+      await upsertStep(input.jobId, activeStep, { status: "completed", completedAt: new Date(), exitStatus: "OK", error: null })
+      activeStep = next
+      await setJobDisplay(input.jobId, next)
+      await upsertStep(input.jobId, next, { status: "running", startedAt: new Date(), error: null })
+    },
   })
 
   if (!result.ok) {
     await logJob(input.jobId, {
-      step,
+      step: activeStep,
       event: "guest_automation:failed",
       level: "error",
       message: result.message,
@@ -1371,7 +1390,7 @@ async function configureGuestAfterBoot(input: {
   }
 
   await logJob(input.jobId, {
-    step,
+    step: activeStep,
     event: "guest_automation:completed",
     message: "Guest automation completed",
     response: {
@@ -1387,7 +1406,7 @@ async function configureGuestAfterBoot(input: {
       steps: result.steps.map((entry) => ({ operation: entry.operation, status: entry.status })),
     },
   })
-  await upsertStep(input.jobId, step, { status: "completed", completedAt: new Date(), exitStatus: "OK", error: null })
+  await upsertStep(input.jobId, activeStep, { status: "completed", completedAt: new Date(), exitStatus: "OK", error: null })
 
   return result
 }
