@@ -299,6 +299,21 @@ const LINUX_ACCESS: SeedOperation[] = [
     notes: "Idempotent: an existing account is reused rather than recreated.",
   },
   {
+    operation: "update_user",
+    shell: "linux-sh",
+    // Refuses rather than creates. An "update" that silently made a missing
+    // account would hide the real problem — the customer asked to change an
+    // account that is not there.
+    command: "set -e; id -u '{{USERNAME}}' >/dev/null 2>&1 || { echo 'user {{USERNAME}} does not exist' >&2; exit 3; }; usermod -s /bin/bash '{{USERNAME}}'; passwd -l '{{USERNAME}}' >/dev/null 2>&1 || true; passwd -u '{{USERNAME}}' >/dev/null 2>&1 || true",
+    timeoutSeconds: 30,
+    requiresRunning: true,
+    verificationRequired: true,
+    verificationCommand: "get-users",
+    verificationParser: "native-users",
+    stateKey: "access.user",
+    notes: "Refuses if the account does not exist. Re-enables a locked account and normalises its shell.",
+  },
+  {
     operation: "enable_user",
     shell: "linux-sh",
     command: "set -e; usermod -U '{{USERNAME}}' 2>/dev/null || passwd -u '{{USERNAME}}'",
@@ -447,6 +462,20 @@ const WINDOWS_ACCESS: SeedOperation[] = [
     verificationParser: "native-users",
     stateKey: "access.user",
     notes: "Idempotent: an existing account is updated instead of recreated.",
+  },
+  {
+    operation: "update_user",
+    shell: "windows-powershell",
+    // Same rule as the Linux one: refuse a missing account rather than making it.
+    command:
+      "$ErrorActionPreference='Stop'; if (-not (Get-LocalUser -Name '{{USERNAME}}' -ErrorAction SilentlyContinue)) { Write-Error 'user {{USERNAME}} does not exist'; exit 3 }; Set-LocalUser -Name '{{USERNAME}}' -Enabled $true; Add-LocalGroupMember -Group 'Administrators' -Member '{{USERNAME}}' -ErrorAction SilentlyContinue",
+    timeoutSeconds: 30,
+    requiresRunning: true,
+    verificationRequired: true,
+    verificationCommand: "get-users",
+    verificationParser: "native-users",
+    stateKey: "access.user",
+    notes: "Refuses if the account does not exist. Re-enables a disabled account and restores its group membership.",
   },
   {
     operation: "enable_user",

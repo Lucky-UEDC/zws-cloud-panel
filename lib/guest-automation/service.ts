@@ -23,6 +23,7 @@ import {
   GUEST_ERROR_MESSAGES,
   FIRST_BOOT_SEQUENCE,
   assertShellMatchesEngine,
+  crossOsCommandViolations,
   isGuestOperation,
   type GuestEngine,
   type GuestErrorCode,
@@ -41,7 +42,7 @@ import {
 } from "./proxmox-guest"
 import { parseNativeInterfaces, parseNativeOsInfo, parseNativeUsers, parseNativeFsInfo } from "./parsers"
 import { buildPlan, deriveRunStatus, serializePlan, type GuestStateSnapshot, type OperationPlan, type PlanRequest, EMPTY_SNAPSHOT } from "./plan"
-import { maskCommandSecrets, renderTemplate } from "./placeholders"
+import { extractPlaceholders, maskCommandSecrets, renderTemplate, unknownPlaceholders } from "./placeholders"
 import { resolveTemplate, type ResolvedOperation, type ResolvedTemplate } from "./template-resolver"
 import { assertExpectation, observeFromOutput, verifyOperation, type Observation } from "./verification"
 
@@ -95,6 +96,31 @@ export type RunResult = {
 }
 
 const OPS_TABLE = "guest_operation_runs"
+
+/**
+ * Sample values for a dry run and for an admin test.
+ *
+ * Deliberately obviously fake. A dry run that substituted a real customer's
+ * address or password would either leak a secret into a browser tab or, worse,
+ * make a command look safe because it happened to be a no-op for one server.
+ */
+const SAMPLE_VALUES: Record<string, string> = {
+  VMID: "100000",
+  IP: "192.0.2.10",
+  PREFIX: "24",
+  MASK: "255.255.255.0",
+  GATEWAY: "192.0.2.1",
+  DNS1: "192.0.2.53",
+  DNS2: "192.0.2.54",
+  NIC: "eth0",
+  USERNAME: "zwsuser",
+  PASSWORD: "sample-not-a-real-password",
+  TIMEZONE: "Asia/Kolkata",
+}
+
+function sampleValues(): Record<string, string> {
+  return { ...SAMPLE_VALUES }
+}
 
 export class GuestAutomationService {
   private client: ProxmoxGuestClient
@@ -771,6 +797,226 @@ export class GuestAutomationService {
       return { ok: false, errorCode: result.errorCode ?? "GUEST_EXEC_FAILED", message: result.error ?? GUEST_ERROR_MESSAGES.INTERNAL_ERROR, runId: result.runId }
     }
     return { ok: true, runId: result.runId, steps: result.steps }
+  }
+
+  // -------------------------------------------------------------------------
+  // Admin testing
+  // -------------------------------------------------------------------------
+
+  /**
+   * Show what a command would do, without running it.
+   *
+   * This is what "Dry Run" means for an editor: the command is built from the
+   * draft the admin is looking at, every value is substituted from a fixed set
+   * of samples, the result is masked, and nothing is sent to the guest. A dry run
+   * that executed anything would not be a dry run.
+   *
+   * The draft is validated against the guest's real engine first, so a
+   * cross-OS command is reported here rather than discovered on a live guest.
+   */
+  async previewOperation(input: {
+    operation: GuestOperation
+    draft: {
+      commandType: string
+      shell?: string | null
+      command?: string | null
+      verificationCommand?: string | null
+      verificationParser?: string | null
+      successCondition?: string | null
+      dangerLevel?: string
+      requiresConfirmation?: boolean
+      requiresRunning?: boolean
+      requiresStopped?: boolean
+      requiresGuestAgent?: boolean
+      verificationRequired?: boolean
+      timeoutSeconds?: number | null
+    }
+    metadata?: Record<string, unknown> | null
+    values?: Record<string, string>
+  }) {
+    const detected = await this.detectOs(input.metadata)
+    if (detected.kind === "unknown") {
+      return { ok: false as const, errorCode: "OS_DETECTION_UNAVAILABLE" as GuestErrorCode, message: GUEST_ERROR_MESSAGES.OS_DETECTION_UNAVAILABLE }
+    }
+    const engine = detected.engine as GuestEngine
+
+    // The draft's shell is judged against the guest that actually answered, not
+    // against what the template claims — this is the whole point of a dry run on
+    // a real VM.
+    const gate = assertShellMatchesEngine(input.draft.shell ?? null, engine)
+    if (!gate.ok) {
+      return { ok: false as const, errorCode: "CROSS_OS_VIOLATION" as GuestErrorCode, message: gate.reason }
+    }
+    const commandCrossOs = crossOsCommandViolations(String(input.draft.command || ""), engine)
+    if (commandCrossOs.length) {
+      return {
+        ok: false as const,
+        errorCode: "CROSS_OS_VIOLATION" as GuestErrorCode,
+        message: `This command contains ${commandCrossOs.join(", ")}, which belongs to the other engine. It would never run on a ${detected.osId} guest.`,
+      }
+    }
+
+    const values = { ...sampleValues(), ...(input.values || {}) }
+    const rendered = renderTemplate({ template: String(input.draft.command || ""), values, engine })
+    const verification = input.draft.verificationCommand
+      ? renderTemplate({ template: String(input.draft.verificationCommand), values, engine })
+      : null
+
+    return {
+      ok: true as const,
+      detected,
+      engine,
+      commandType: input.draft.commandType,
+      shell: input.draft.shell ?? null,
+      // `masked` is the only form returned. A dry run that printed a live secret
+      // would leak it into a browser tab and a support screenshot.
+      commandMasked: rendered.ok ? rendered.masked : String(input.draft.command || ""),
+      verificationMasked: verification ? (verification.ok ? verification.masked : String(input.draft.verificationCommand)) : null,
+      placeholders: extractPlaceholders(String(input.draft.command || "")),
+      unknownPlaceholders: unknownPlaceholders(String(input.draft.command || "")),
+      successCondition: input.draft.successCondition ?? null,
+      verificationParser: input.draft.verificationParser ?? null,
+      dangerLevel: input.draft.dangerLevel || "safe",
+      requiresConfirmation: input.draft.requiresConfirmation === true,
+      requiresRunning: input.draft.requiresRunning === true,
+      requiresStopped: input.draft.requiresStopped === true,
+      timeoutSeconds: input.draft.timeoutSeconds ?? 60,
+      guestAgentRequired: input.draft.requiresGuestAgent !== false,
+      resolved: rendered.ok ? rendered.resolved : null,
+      stdinRequired: !rendered.ok || rendered.resolved === null,
+    }
+  }
+
+  /**
+   * Run one operation against this VM, on behalf of an admin, and report it.
+   *
+   * Unlike `runSingleOperation` this accepts an unsaved draft, which is what
+   * makes it useful in an editor: an admin can prove a command works before it is
+   * ever stored. The override is validated with exactly the same engine gate as a
+   * stored command, so a test can never prove a command that would be refused in
+   * production.
+   */
+  async testOperation(input: {
+    operation: GuestOperation
+    metadata?: Record<string, unknown> | null
+    actor?: Actor
+    /** An unsaved draft to prove. Omit to test the stored definition. */
+    draft?: {
+      commandType: string
+      shell?: string | null
+      command?: string | null
+      verificationCommand?: string | null
+      verificationParser?: string | null
+      successCondition?: string | null
+      dangerLevel?: string
+      requiresConfirmation?: boolean
+      requiresRunning?: boolean
+      requiresStopped?: boolean
+      requiresGuestAgent?: boolean
+      verificationRequired?: boolean
+      supportsRollback?: boolean
+      timeoutSeconds?: number | null
+    } | null
+    values?: Record<string, string>
+  }): Promise<{ ok: true; runId: string; outcome: OperationOutcome } | { ok: false; errorCode: GuestErrorCode; message: string }> {
+    const detected = await this.detectOs(input.metadata)
+    if (detected.kind === "unknown") {
+      return { ok: false, errorCode: "OS_DETECTION_UNAVAILABLE", message: GUEST_ERROR_MESSAGES.OS_DETECTION_UNAVAILABLE }
+    }
+    const engine = detected.engine as GuestEngine
+
+    let definition: ResolvedOperation
+    if (input.draft) {
+      const gate = assertShellMatchesEngine(input.draft.shell ?? null, engine)
+      if (!gate.ok) return { ok: false, errorCode: "CROSS_OS_VIOLATION", message: gate.reason }
+      const violations = crossOsCommandViolations(String(input.draft.command || ""), engine)
+      if (violations.length) {
+        return { ok: false, errorCode: "CROSS_OS_VIOLATION", message: `Contains ${violations.join(", ")}, which belongs to the other engine.` }
+      }
+      definition = {
+        operation: input.operation,
+        commandType: (input.draft.commandType || "guest-exec") as any,
+        shell: (input.draft.shell || null) as any,
+        command: input.draft.command ?? null,
+        verificationCommand: input.draft.verificationCommand ?? null,
+        verificationParser: (input.draft.verificationParser || null) as any,
+        successCondition: input.draft.successCondition ?? null,
+        dangerLevel: (input.draft.dangerLevel || "safe") as any,
+        requiresConfirmation: input.draft.requiresConfirmation === true,
+        requiresRunning: input.draft.requiresRunning === true,
+        requiresStopped: input.draft.requiresStopped === true,
+        requiresGuestAgent: input.draft.requiresGuestAgent !== false,
+        rebootRequired: false,
+        verificationRequired: input.draft.verificationRequired !== false,
+        supportsRollback: input.draft.supportsRollback === true,
+        timeoutSeconds: input.draft.timeoutSeconds ?? 60,
+        stateKey: null,
+        notes: null,
+        id: "draft",
+        arguments: [],
+        rollbackCommand: null,
+        rollbackArguments: null,
+        fallbacks: [],
+        enabled: true,
+      }
+    } else {
+      const resolved = await this.getTemplate(detected)
+      if (!resolved.ok) return { ok: false, errorCode: resolved.code, message: resolved.reason }
+      const stored = resolved.template.operations.get(input.operation)
+      if (!stored) return { ok: false, errorCode: "UNSUPPORTED_OPERATION", message: `This template does not define ${input.operation}.` }
+      definition = stored
+    }
+
+    const run = await prisma.guestAutomationRun.create({
+      data: {
+        vpsInstanceId: this.ctx.vpsInstanceId,
+        trigger: "admin_test",
+        operations: [input.operation] as any,
+        status: "running",
+        startedAt: new Date(),
+        templateId: definition && "templateId" in definition ? (definition as any).templateId : null,
+        requestedBy: input.actor?.requestedBy ?? null,
+        requestedRole: input.actor?.role ?? null,
+        metadata: { vmid: this.ctx.vmid, node: this.ctx.nodeName, os: detected.osId, operation: input.operation, unsavedDraft: Boolean(input.draft) } as any,
+      },
+    })
+
+    const plan: OperationPlan = {
+      vmid: this.ctx.vmid,
+      detected,
+      template: { id: "", name: input.draft ? "Unsaved draft" : "Stored template", version: 0, operations: new Map([[input.operation, definition]]), enabled: true } as any,
+      noChange: false,
+      operations: [
+        {
+          operation: input.operation,
+          status: "pending",
+          reason: "Admin test.",
+          changed: true,
+          template: definition,
+          values: { ...sampleValues(), ...(input.values || {}) },
+          previous: {},
+          dangerous: definition.dangerLevel === "dangerous",
+          requiresRunning: definition.requiresRunning,
+          requiresStopped: definition.requiresStopped,
+          verificationRequired: definition.verificationRequired,
+          supportsRollback: definition.supportsRollback,
+          rebootRequired: false,
+        },
+      ],
+    }
+
+    const outcome = await this.executeStep(run.id, input.operation, definition, plan, input.actor ?? { requestedBy: "system:admin-test", role: "admin" })
+    await this.persistStep(run.id, outcome, plan)
+    await prisma.guestAutomationRun.update({
+      where: { id: run.id },
+      data: {
+        status: outcome.status === "success" ? "success" : outcome.status === "skipped" ? "success" : "failed",
+        completedAt: new Date(),
+        error: outcome.error,
+      },
+    })
+
+    return { ok: true, runId: run.id, outcome }
   }
 
   // -------------------------------------------------------------------------
