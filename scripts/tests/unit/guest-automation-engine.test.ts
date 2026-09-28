@@ -11,7 +11,7 @@ import {
   isGuestNativeVerb,
 } from "@/lib/guest-automation/constants"
 import { buildGuestCommand, shellArgv, guestNative, execGuestCommand } from "@/lib/guest-automation/proxmox-guest"
-import { classifyGuestOsInfo } from "@/lib/guest-automation/os-detection"
+import { classifyGuestOsInfo, deriveOsId } from "@/lib/guest-automation/os-detection"
 import { scoreTemplate } from "@/lib/guest-automation/template-resolver"
 import { validateTemplateDraft } from "@/lib/guest-automation/validation"
 import { DEFAULT_GUEST_TEMPLATES } from "@/lib/guest-automation/default-templates"
@@ -22,6 +22,8 @@ import {
   parseWindowsFsutil,
   parseNativeInterfaces,
   parseNativeOsInfo,
+  parseHostname,
+  parseTimezone,
   parseNativeUsers,
   parseNativeFsInfo,
 } from "@/lib/guest-automation/parsers"
@@ -620,6 +622,65 @@ describe("native guest payload parsing", () => {
     assert.equal(parseNativeInterfaces(payload).primary, null)
   })
 
+  it("unwraps the agent's result envelope before any parser sees it", () => {
+    // Every `agent/<verb>` response is `{ data: { result: <payload> } }`.
+    // Unwrapping only `data` hands every parser a `{ result: ... }` wrapper
+    // instead of the payload, so `get-osinfo` reading `id` at the top level sees
+    // nothing and every guest classifies as unknown.
+    const payload = { "pretty-name": "Ubuntu 22.04.5 LTS", version: "22.04.5" }
+    const client = {
+      guestCmd: async () => ({ data: { result: payload } }),
+    } as any
+    return guestNative({ client, node: "n", vmid: 1, engine: "unknown" }, "get-osinfo").then((result: any) => {
+      assert.equal(result.ok, true)
+      assert.deepEqual(result.data, payload)
+      assert.equal(classifyGuestOsInfo(result.data).osId, "ubuntu")
+    })
+  })
+
+  it("classifies a guest that only reports pretty-name", () => {
+    // Taken from a live guest on this fleet. Several QEMU Guest Agent builds
+    // omit `id` and `name` entirely and send only `pretty-name`, `version` and
+    // `kernel-version`. A parser that only reads `id` classifies every such guest
+    // as unknown, which is the same as saying no guest on the fleet can be
+    // configured.
+    const parsed = classifyGuestOsInfo({ "pretty-name": "Ubuntu 22.04.5 LTS", version: "22.04.5 LTS (Jammy Jellyfish)", "kernel-version": "#49-Ubuntu SMP" })
+    assert.equal(parsed.kind, "linux")
+    assert.equal(parsed.engine, "linux")
+    assert.equal(parsed.osId, "ubuntu")
+  })
+
+  it("derives the os id from the name, earliest match winning", () => {
+    // Every Linux vendor puts "Linux" in the name, so matching the longest
+    // candidate first resolves all of them to a generic id no template claims.
+    // The distribution name comes first in the string, so position is the signal.
+    assert.equal(deriveOsId("", "Arch Linux"), "arch")
+    assert.equal(deriveOsId("", "Kali GNU/Linux Rolling"), "kali")
+    assert.equal(deriveOsId("", "Debian GNU/Linux 12 (bookworm)"), "debian")
+    assert.equal(deriveOsId("", "Rocky Linux 9.4 (Blue Onyx)"), "rocky")
+    assert.equal(deriveOsId("", "AlmaLinux 8.10 (Cerulean Leopard)"), "almalinux")
+    assert.equal(deriveOsId("", "CentOS Linux release 7.9.2009 (Core)"), "centos")
+    assert.equal(deriveOsId("", "Oracle Linux Server 9.4"), "oracle")
+    assert.equal(deriveOsId("", "Fedora Linux 40"), "fedora")
+    assert.equal(deriveOsId("", "openSUSE Leap 15.6"), "opensuse")
+    assert.equal(deriveOsId("", "Alpine Linux v3.20"), "alpine")
+  })
+
+  it("prefers a real id over the name, and never guesses", () => {
+    assert.equal(deriveOsId("debian", "Anything At All"), "debian")
+    // An unrecognised id stays unrecognised. Refusing to guess is the safe
+    // direction: an unknown OS must not be configured with a guessed profile.
+    assert.equal(deriveOsId("totally-unknown-id", "Whatever"), null)
+    assert.equal(deriveOsId("", "SomethingWeirdOS 1.0"), null)
+    assert.equal(deriveOsId("", ""), null)
+  })
+
+  it("does not match a distribution name inside a longer word", () => {
+    // "search" contains "arch" and "abuse" contains "suse".
+    assert.equal(deriveOsId("", "search-engine-thing"), null)
+    assert.equal(deriveOsId("", "an-abuse-of-terms"), null)
+  })
+
   it("normalises get-osinfo", () => {
     const parsed = parseNativeOsInfo({ id: "rocky", name: "Rocky Linux", "version-id": "9.4", "kernel-release": "5.14.0" })
     assert.equal(parsed.osId, "rocky")
@@ -632,10 +693,117 @@ describe("native guest payload parsing", () => {
   })
 
   it("normalises get-fsinfo", () => {
-    const parsed = parseNativeFsInfo([{ mountpoint: "/", disks: [{ name: "sda1", "total-bytes": 85899345920, "used-bytes": 14336000000, "remaining-bytes": 71563345920, "fs-type": ["ext4"] }] }])
+    // The real shape, taken from a live guest. The sizes are on the filesystem
+    // entry; `disk` carries identity only. Reading the sizes off the disk object
+    // finds nothing and yields an empty list on every guest.
+    const parsed = parseNativeFsInfo([
+      { mountpoint: "/", type: "ext4", name: "sda1", "total-bytes": 85899345920, "used-bytes": 14336000000, disk: [{ dev: "/dev/sda1", serial: "QM00005" }] },
+    ])
     assert.equal(parsed.length, 1)
     assert.equal(parsed[0].totalBytes, 85899345920)
+    assert.equal(parsed[0].usedBytes, 14336000000)
+    assert.equal(parsed[0].freeBytes, 85899345920 - 14336000000)
     assert.equal(parsed[0].type, "ext4")
+    assert.equal(parsed[0].name, "/dev/sda1")
+    assert.equal(parsed[0].mountpoint, "/")
+  })
+
+  it("ignores a filesystem with no size rather than reporting it as full or empty", () => {
+    // `/snap/*` mounts report a size but a backing disk list is empty; an entry
+    // with no size at all is not a measurement.
+    const parsed = parseNativeFsInfo([{ mountpoint: "/run", type: "tmpfs", name: "tmpfs", "used-bytes": 123, disk: [] }])
+    assert.deepEqual(parsed, [])
+  })
+
+  it("accepts either the payload or the agent's result wrapper", () => {
+    // Every agent response is wrapped, but a caller reaching a parser through
+    // `guestNative` holds the unwrapped payload. Both must work: a parser that
+    // accepts only one fails silently on the other.
+    const payload = [{ mountpoint: "/", type: "ext4", name: "sda1", "total-bytes": 1000, "used-bytes": 400, disk: [] }]
+    assert.equal(parseNativeFsInfo(payload).length, 1)
+    assert.equal(parseNativeFsInfo({ result: payload }).length, 1)
+    assert.equal(parseNativeUsers({ result: [{ name: "root" }] })[0]?.name, "root")
+    assert.equal(parseNativeInterfaces({ result: [{ name: "eth0", "ip-addresses": [{ "ip-address-type": "ipv4", "ip-address": "10.0.0.5" }] }] }).primary?.name, "eth0")
+  })
+
+  it("reads the address family the agent actually sends", () => {
+    // `ip-address-type` arrives as the string "ipv4", not the number 4. Reading
+    // it as a number collects nothing, and the result looks like a network
+    // fault rather than a parsing one.
+    const parsed = parseNativeInterfaces([
+      { name: "eth0", "hardware-address": "aa:bb:cc:dd:ee:ff", "ip-addresses": [
+        { "ip-address-type": "ipv4", "ip-address": "10.0.0.5" },
+        { "ip-address-type": "ipv6", "ip-address": "fe80::1" },
+      ] },
+    ])
+    assert.deepEqual(parsed.primary?.ipv4, ["10.0.0.5"])
+    assert.deepEqual(parsed.primary?.ipv6, ["fe80::1"])
+  })
+})
+
+describe("payload shapes taken from real guests", () => {
+  /**
+   * Every assertion in this block is a shape copied from a live guest on this
+   * fleet, not from the specification. Each one was wrong in the code before it
+   * was read off a real `get-*` response, and each wrong one failed silently —
+   * an empty list, an `undefined`, or a guest that could not be identified.
+   */
+
+  it("a Windows template claims the id a Windows guest actually reports", () => {
+    // `get-osinfo` returns `mswindows`. A template claiming only "windows"
+    // matches no real guest, so every Windows server reported "this operating
+    // system is not yet supported" while the platform looked correctly
+    // configured. Verified against VMID 102, which reports `mswindows`.
+    const windows = DEFAULT_GUEST_TEMPLATES.filter((template) => template.engine === "windows")
+    assert.ok(windows.length >= 1)
+    for (const template of windows) {
+      assert.ok(template.osIds.includes("mswindows"), `${template.slug} does not claim mswindows`)
+    }
+  })
+
+  it("no seeded template has a duplicated os id", () => {
+    for (const template of DEFAULT_GUEST_TEMPLATES) {
+      const unique = new Set(template.osIds)
+      assert.equal(unique.size, template.osIds.length, `${template.slug} has a duplicated os id: ${template.osIds.join(",")}`)
+    }
+  })
+
+  it("every seeded template claims at least one os id", () => {
+    for (const template of DEFAULT_GUEST_TEMPLATES) {
+      assert.ok(template.osIds.length > 0, `${template.slug} claims no os id and can never be selected`)
+    }
+  })
+
+  it("get-fsinfo puts the sizes on the filesystem, not on the backing disk", () => {
+    // Real payload:
+    //   { mountpoint: "/", type: "ext4", name: "sda1",
+    //     "total-bytes": 83263205376, "used-bytes": 2610900992,
+    //     disk: [ { dev: "/dev/sda1", serial: "QM00005" } ] }
+    // The disk array carries identity only. Reading sizes off it yields nothing
+    // and presents as "this server reports no disks".
+    const parsed = parseNativeFsInfo([
+      { mountpoint: "/", type: "ext4", name: "sda1", "total-bytes": 83263205376, "used-bytes": 2610900992, disk: [{ dev: "/dev/sda1", serial: "QM00005" }] },
+    ])
+    assert.equal(parsed.length, 1)
+    assert.equal(parsed[0].name, "/dev/sda1")
+    assert.equal(parsed[0].mountpoint, "/")
+    assert.equal(parsed[0].type, "ext4")
+    assert.equal(parsed[0].freeBytes, 83263205376 - 2610900992)
+  })
+
+  it("get-timezone reports zone, and the hostname verb reports host-name", () => {
+    // Both were read under the wrong key, so every server reported no timezone
+    // and no hostname — which for the hostname also means every change-driven
+    // plan believed a rename was needed.
+    assert.equal((parseTimezone({ zone: "India Standard Time", offset: 19800 }) as string).includes("India"), true)
+    assert.equal(parseHostname({ "host-name": "ip-103-216-170-233" }), "ip-103-216-170-233")
+    assert.equal(parseHostname({ name: "LUCKY" }), "LUCKY")
+  })
+
+  it("get-users on Windows reports user, and Linux reports name", () => {
+    // Real Windows payload: { "login-time": ..., "user": "Administrator", "domain": "LUCKY" }
+    assert.deepEqual(parseNativeUsers([{ "user": "Administrator", domain: "LUCKY" }]).map((user) => user.name), ["Administrator"])
+    assert.deepEqual(parseNativeUsers([{ name: "root" }]).map((user) => user.name), ["root"])
   })
 })
 

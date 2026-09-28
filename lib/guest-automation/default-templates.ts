@@ -45,6 +45,28 @@ export type SeedOperation = {
   fallbacks?: Array<{ command: string; notes?: string; verificationParser?: string | null }>
 }
 
+/**
+ * The OS ids each family actually reports from `get-osinfo`.
+ *
+ * These are the strings templates are matched on, so they have to be the strings
+ * the agent emits — not the names a vendor uses on its website. Two families
+ * were wrong before this was checked against real guests:
+ *
+ * - Windows reports `mswindows`. A template claiming only `windows` matches no
+ *   real Windows guest, so every Windows server said "this operating system is
+ *   not yet supported" while the platform appeared correctly configured.
+ * - The RHEL family list contained a duplicated entry, which matched nothing
+ *   but made the stored `osIds` array look wrong in the editor.
+ */
+const WINDOWS_OS_IDS = [
+  "mswindows", "windows", "win32", "win64", "winnt", "win",
+  "microsoft-windows", "windows-server", "srv",
+]
+
+const RHEL_OS_IDS = ["rhel", "redhat", "rocky", "rocky-linux", "almalinux", "centos", "centos-stream", "ol", "oracle", "fedora"]
+
+const RHEL_OS_IDS_WITHOUT_CENTOS = RHEL_OS_IDS.filter((id) => id !== "centos" && id !== "centos-stream")
+
 export type SeedTemplate = {
   slug: string
   name: string
@@ -702,7 +724,7 @@ export const DEFAULT_GUEST_TEMPLATES: SeedTemplate[] = [
     slug: "rhel-8",
     name: "RHEL / Rocky / Alma 8",
     family: "rhel",
-    osIds: ["rhel", "rocky", "almalinux", "almalinux", "centos"],
+    osIds: RHEL_OS_IDS,
     versionPattern: "^8(\\D|$)",
     priority: 300,
     description: "RHEL-compatible 8 using network-scripts and NetworkManager.",
@@ -713,7 +735,7 @@ export const DEFAULT_GUEST_TEMPLATES: SeedTemplate[] = [
     slug: "rhel-9",
     name: "RHEL / Rocky / Alma 9",
     family: "rhel",
-    osIds: ["rhel", "rocky", "almalinux", "almalinux", "centos"],
+    osIds: RHEL_OS_IDS,
     versionPattern: "^9(\\D|$)",
     priority: 310,
     description: "RHEL-compatible 9 using network-scripts and NetworkManager.",
@@ -724,7 +746,7 @@ export const DEFAULT_GUEST_TEMPLATES: SeedTemplate[] = [
     slug: "rhel-10",
     name: "RHEL / Rocky / Alma 10",
     family: "rhel",
-    osIds: ["rhel", "rocky", "almalinux", "almalinux"],
+    osIds: RHEL_OS_IDS_WITHOUT_CENTOS,
     versionPattern: "^10(\\D|$)",
     priority: 320,
     description: "RHEL-compatible 10.",
@@ -748,7 +770,7 @@ export const DEFAULT_GUEST_TEMPLATES: SeedTemplate[] = [
     slug: "windows-server-2019",
     name: "Windows Server 2019",
     family: "windows",
-    osIds: ["windows"],
+    osIds: WINDOWS_OS_IDS,
     versionPattern: "2019|10\\.0\\.17763",
     priority: 300,
     description: "Windows Server 2019 with PowerShell/CIM and netsh.",
@@ -759,7 +781,7 @@ export const DEFAULT_GUEST_TEMPLATES: SeedTemplate[] = [
     slug: "windows-server-2022",
     name: "Windows Server 2022",
     family: "windows",
-    osIds: ["windows"],
+    osIds: WINDOWS_OS_IDS,
     versionPattern: "2022|10\\.0\\.20348",
     priority: 310,
     description: "Windows Server 2022 with PowerShell/CIM and netsh.",
@@ -770,7 +792,7 @@ export const DEFAULT_GUEST_TEMPLATES: SeedTemplate[] = [
     slug: "windows-server-2025",
     name: "Windows Server 2025",
     family: "windows",
-    osIds: ["windows"],
+    osIds: WINDOWS_OS_IDS,
     versionPattern: "2025|10\\.0\\.26100",
     priority: 320,
     description: "Windows Server 2025 with PowerShell/CIM and netsh.",

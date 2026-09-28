@@ -388,7 +388,7 @@ export type ParsedNetwork = {
  * `Ethernet`: the interface actually holding the guest address is selected.
  */
 export function parseNativeInterfaces(payload: unknown): ParsedNetwork {
-  const raw = Array.isArray(payload) ? payload : []
+  const raw = unwrapAgentPayload(payload)
   const interfaces: ParsedInterface[] = []
   for (const entry of raw) {
     if (!entry || typeof entry !== "object") continue
@@ -399,11 +399,16 @@ export function parseNativeInterfaces(payload: unknown): ParsedNetwork {
     const ipv4: string[] = []
     const ipv6: string[] = []
     for (const address of Array.isArray(record["ip-addresses"]) ? record["ip-addresses"] : []) {
-      const type = Number(address?.["ip-address-type"])
+      // The agent reports the family as the string "ipv4"/"ipv6" in practice.
+      // Reading it as a number and comparing to 4 silently collects nothing, and
+      // the result is an interface list with no addresses on it — which looks
+      // like a network problem rather than a parsing one.
+      const rawType = address?.["ip-address-type"]
+      const type = typeof rawType === "number" ? rawType : Number(String(rawType ?? "").replace(/[^0-9]/g, ""))
       const value = String(address?.["ip-address"] ?? "").trim()
       if (!value) continue
-      if (type === 4) ipv4.push(value)
-      else if (type === 6) ipv6.push(value)
+      if (type === 4 || /ipv4/i.test(String(rawType ?? ""))) ipv4.push(value)
+      else if (type === 6 || /ipv6/i.test(String(rawType ?? ""))) ipv6.push(value)
     }
     interfaces.push({
       name,
@@ -452,12 +457,40 @@ export function parseNativeOsInfo(payload: unknown): { osId: string | null; name
   }
 }
 
+/**
+ * The `get-host-name` payload.
+ *
+ * The agent reports `host-name`, hyphenated, on both engines. Reading a flat
+ * `name` yields an empty string, and an empty hostname is not cosmetic: every
+ * change-driven plan then believes a rename is needed, because it cannot prove
+ * the server already has the name it was asked for.
+ */
+export function parseHostname(payload: unknown): string {
+  if (!payload || typeof payload !== "object") return ""
+  const record = payload as Record<string, any>
+  return String(record["host-name"] ?? record.name ?? "").trim()
+}
+
+/**
+ * The `get-timezone` payload.
+ *
+ * The key is `zone`, not `timezone`. Reading the wrong one reports every server
+ * as having no timezone set, which makes a timezone change look un-applied every
+ * time it is checked.
+ */
+export function parseTimezone(payload: unknown): string {
+  if (!payload || typeof payload !== "object") return ""
+  const record = payload as Record<string, any>
+  return String(record.zone ?? record.timezone ?? "").trim()
+}
+
 export function parseNativeUsers(payload: unknown): Array<{ name: string; uid?: number | null; shell?: string | null; home?: string | null }> {
-  const raw = Array.isArray(payload) ? payload : []
+  const raw = unwrapAgentPayload(payload)
   const users: Array<{ name: string; uid?: number | null; shell?: string | null; home?: string | null }> = []
   for (const entry of raw) {
     if (!entry || typeof entry !== "object") continue
     const record = entry as Record<string, any>
+    // Windows reports `user`; Linux builds vary between `user` and `name`.
     const name = String(record.name ?? record.user ?? "").trim()
     if (!name) continue
     users.push({
@@ -470,28 +503,64 @@ export function parseNativeUsers(payload: unknown): Array<{ name: string; uid?: 
   return users
 }
 
+/**
+ * `get-fsinfo` payload shape, as the agent actually sends it.
+ *
+ * ```
+ * { result: [ { mountpoint, type, name,
+ *                total-bytes, used-bytes,
+ *                disk: [ { dev, serial, bus, ... } ] } ] }
+ * ```
+ *
+ * The sizes live on the **filesystem** entry. The `disk` array is a list of
+ * backing devices and carries identity only — no sizes at all. Reading
+ * `total-bytes` off the disk object, which is the obvious reading, finds
+ * nothing and produces an empty filesystem list on every guest, which presents
+ * as "this server reports no disks" rather than as a parsing fault.
+ */
 export function parseNativeFsInfo(payload: unknown): Array<{ name: string; mountpoint: string | null; totalBytes: number; usedBytes: number; freeBytes: number; type: string | null }> {
-  const raw = Array.isArray(payload) ? payload : []
+  const raw = unwrapAgentPayload(payload)
   const out: Array<{ name: string; mountpoint: string | null; totalBytes: number; usedBytes: number; freeBytes: number; type: string | null }> = []
   for (const entry of raw) {
     if (!entry || typeof entry !== "object") continue
     const record = entry as Record<string, any>
-    const list = Array.isArray(record.disks) ? record.disks : []
-    for (const disk of list) {
-      if (!disk || typeof disk !== "object") continue
-      const total = bytes(disk["total-bytes"])
-      const used = bytes(disk["used-bytes"])
-      const remaining = Number.isFinite(Number(disk["remaining-bytes"])) ? bytes(disk["remaining-bytes"]) : 0
-      if (!(total > 0)) continue
-      out.push({
-        name: String(disk.name ?? disk["alias"] ?? ""),
-        mountpoint: record.mountpoint ? String(record.mountpoint) : null,
-        totalBytes: total,
-        usedBytes: used,
-        freeBytes: remaining || Math.max(0, total - used),
-        type: Array.isArray(disk["fs-type"]) ? (disk["fs-type"] as string[]).join(",") : (disk["fs-type"] ? String(disk["fs-type"]) : null),
-      })
-    }
+    const total = bytes(record["total-bytes"])
+    const used = bytes(record["used-bytes"])
+    if (!(total > 0)) continue
+    const remainingRaw = record["remaining-bytes"]
+    const remaining = Number.isFinite(Number(remainingRaw)) ? bytes(remainingRaw) : 0
+    // The device name when the agent gives one, else the filesystem's own name.
+    // `/dev/sda1` is more useful to a human than `sda1`, and it is what the
+    // disk templates interpolate as {{NIC}}-adjacent values elsewhere.
+    const backing = Array.isArray(record.disk) ? record.disk[0] : Array.isArray(record.disks) ? record.disks[0] : null
+    const device = backing?.dev ? String(backing.dev) : null
+    out.push({
+      name: device || String(record.name ?? record.alias ?? ""),
+      mountpoint: record.mountpoint ? String(record.mountpoint) : null,
+      totalBytes: total,
+      usedBytes: used,
+      freeBytes: remaining || Math.max(0, total - used),
+      type: record.type ? String(record.type) : (Array.isArray(record["fs-type"]) ? (record["fs-type"] as string[]).join(",") : record["fs-type"] ? String(record["fs-type"]) : null),
+    })
   }
   return out
+}
+
+/**
+ * Accept either the payload itself or the `{ result: payload }` wrapper.
+ *
+ * Every `agent/<verb>` response is wrapped. Callers that reach a parser
+ * through `guestNative` get the unwrapped payload; a caller holding a raw
+ * response does not. Both should work, because a parser that only accepts one
+ * of them fails silently on the other.
+ */
+function unwrapAgentPayload(payload: unknown): any[] {
+  if (Array.isArray(payload)) return payload
+  if (payload && typeof payload === "object") {
+    const record = payload as Record<string, any>
+    if (Array.isArray(record.result)) return record.result
+    if (Array.isArray(record.data)) return record.data
+    if (record.data && typeof record.data === "object" && Array.isArray(record.data.result)) return record.data.result
+  }
+  return []
 }

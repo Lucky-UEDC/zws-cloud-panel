@@ -40,7 +40,7 @@ import {
   type GuestTarget,
   type ProxmoxGuestClient,
 } from "./proxmox-guest"
-import { parseNativeInterfaces, parseNativeOsInfo, parseNativeUsers, parseNativeFsInfo } from "./parsers"
+import { parseHostname, parseNativeFsInfo, parseNativeInterfaces, parseNativeOsInfo, parseNativeUsers, parseTimezone } from "./parsers"
 import { buildPlan, deriveRunStatus, serializePlan, type GuestStateSnapshot, type OperationPlan, type PlanRequest, EMPTY_SNAPSHOT } from "./plan"
 import { extractPlaceholders, maskCommandSecrets, renderTemplate, unknownPlaceholders } from "./placeholders"
 import { enabledOperations, resolveTemplate, type ResolvedOperation, type ResolvedTemplate } from "./template-resolver"
@@ -157,8 +157,44 @@ export class GuestAutomationService {
     return { client: this.client, node: this.ctx.nodeName, vmid: this.ctx.vmid, engine }
   }
 
-  /** Detect the live OS. Guest agent is authoritative; metadata is the fallback. */
+  /**
+   * How long a detection result is reused.
+   *
+   * Short, because a guest that is being re-imaged or upgraded changes what it
+   * reports, and a stale OS means a template that no longer matches. Long enough
+   * that a single request — which detects, resolves, snapshots and plans — makes
+   * one call rather than four, and a burst of calls cannot hammer the agent into
+   * dropping a `get-osinfo` it would otherwise have answered.
+   */
+  private static readonly DETECTION_TTL_MS = 30_000
+  private detectionCache: { at: number; key: string; detected: DetectedOs } | null = null
+
+  /**
+   * Detect the live OS. The guest agent is authoritative; metadata is only a
+   * fallback for a guest that is not running.
+   *
+   * Cached per metadata key for a short window. Detection is called several times
+   * per request and once per VM per telemetry tick, and an uncached version both
+   * costs a round trip each time and can fail intermittently under that load —
+   * which presents as a guest that is sometimes "unsupported" for no reason.
+   */
   async detectOs(metadata?: Record<string, unknown> | null): Promise<DetectedOs> {
+    const cacheKey = JSON.stringify(metadata ?? null)
+    const cached = this.detectionCache
+    if (cached && cached.key === cacheKey && Date.now() - cached.at < GuestAutomationService.DETECTION_TTL_MS) {
+      return cached.detected
+    }
+    const detected = await this.detectOsUncached(metadata)
+    this.detectionCache = { at: Date.now(), key: cacheKey, detected }
+    return detected
+  }
+
+  /** Drop the cached detection. Called when a VM's state changes underneath us. */
+  invalidateDetection() {
+    this.detectionCache = null
+  }
+
+  private async detectOsUncached(metadata?: Record<string, unknown> | null): Promise<DetectedOs> {
     const running = await this.isRunning()
     const detected = await detectGuestOs({
       client: this.client,
@@ -167,14 +203,21 @@ export class GuestAutomationService {
       running,
       metadata: (metadata ?? null) as any,
     })
-    if (detected.kind === "unknown") {
-      await persistDetection({
-        vpsInstanceId: this.ctx.vpsInstanceId,
-        detected,
-        automationReady: false,
-        unsupportedReason: GUEST_ERROR_MESSAGES.OS_DETECTION_UNAVAILABLE,
-      }).catch(() => null)
-    }
+    // Recorded on both outcomes. The adoption row is the cached view admin
+    // pages and later operations share, so a successful detection that is not
+    // recorded leaves every admin page re-probing Proxmox and shows the server as
+    // un-adopted even though automation works on it.
+    //
+    // Best-effort in both directions: a failed bookkeeping write must not turn a
+    // guest we just identified into "OS detection unavailable", which is what
+    // happens if the write is allowed to throw.
+    await persistDetection({
+      vpsInstanceId: this.ctx.vpsInstanceId,
+      detected,
+      guestAgentReachable: detected.kind !== "unknown",
+      automationReady: detected.kind !== "unknown",
+      unsupportedReason: detected.kind === "unknown" ? GUEST_ERROR_MESSAGES.OS_DETECTION_UNAVAILABLE : null,
+    }).catch(() => null)
     return detected
   }
 
@@ -280,7 +323,7 @@ export class GuestAutomationService {
     ])
 
     const parsedInterfaces = networks?.ok ? parseNativeInterfaces(networks.data) : null
-    const parsedHostname = hostname?.ok ? String((hostname.data as any)?.name ?? "") : ""
+    const parsedHostname = hostname?.ok ? parseHostname(hostname.data) : ""
     const parsedUsers = users?.ok ? parseNativeUsers(users.data) : []
     const parsedFs = fsinfo?.ok ? parseNativeFsInfo(fsinfo.data) : []
 
@@ -293,7 +336,7 @@ export class GuestAutomationService {
       users: parsedUsers.map((user) => user.name),
       gateway: null,
       dns: [],
-      timezone: timezone?.ok ? String((timezone.data as any)?.timezone ?? "") || null : null,
+      timezone: timezone?.ok ? parseTimezone(timezone.data) || null : null,
       diskMounts: parsedFs.map((entry) => entry.mountpoint || entry.name),
       collectedAt: Date.now(),
     }
@@ -414,7 +457,12 @@ export class GuestAutomationService {
       usedBytes: parsed.selected.usedBytes,
       freeBytes: parsed.selected.freeBytes,
       usedPercent: parsed.selected.usedPercent,
-      filesystem: parsed.selected.name,
+      // The filesystem's own type, and separately where it is mounted. POSIX df
+      // reports no type, so this is null rather than a guess from the device
+      // name; conflating the two is how "ext4" ends up displayed as "/".
+      filesystem: parsed.selected.filesystem ?? null,
+      mountPoint: parsed.selected.name,
+      device: parsed.selected.device ?? null,
       volumes: parsed.volumes,
       selected: parsed.selected,
       collectionDurationMs: Date.now() - started,
@@ -471,15 +519,42 @@ export class GuestAutomationService {
         lastMessage = `Collector "${operation}" did not return disk data.`
         continue
       }
-      const full = observation as Extract<Observation, { kind: "disk" }>
-      // Re-parse for the full volume list; the observation only carries the
-      // selected volume.
+      const summary = observation as Extract<Observation, { kind: "disk" }>
+      // Re-parse for the full volume list and the selected volume's own fields.
+      //
+      // The observation is a summary: it carries the numbers and a `filesystem`
+      // label, but not the device and not the type. Selecting from it therefore
+      // loses both, and reading `selected.name` off it yields undefined. The
+      // re-parse is what gives a `ParsedVolume` with everything on it.
       const detail = await this.volumeDetail(target, candidate, engine, operation, outcome.output)
-      const volumes = detail.ok ? detail.volumes : [full]
-      return { ok: true, volumes, selected: full, collector: candidate.verificationParser ?? "unknown" }
+      const volumes = detail.ok ? detail.volumes : []
+      const selected = detail.ok
+        ? detail.volumes.find((volume) => volume.name === summary.filesystem) || detail.volumes[0]
+        : this.volumeFromSummary(summary)
+      return { ok: true, volumes, selected, collector: candidate.verificationParser ?? "unknown" }
     }
 
     return { ok: false, errorCode: lastError, error: lastMessage }
+  }
+
+  /**
+   * A `ParsedVolume` built from a summary observation alone.
+   *
+   * Only reached when the re-parse failed, which means we have the numbers but
+   * not the device or the type. Reporting the numbers with an explicit null for
+   * what we do not know beats reporting nothing.
+   */
+  private volumeFromSummary(summary: Extract<Observation, { kind: "disk" }>) {
+    return {
+      name: summary.filesystem,
+      filesystem: null,
+      device: null,
+      totalBytes: summary.totalBytes,
+      usedBytes: summary.usedBytes,
+      freeBytes: summary.freeBytes,
+      usedPercent: summary.usedPercent,
+      system: true,
+    }
   }
 
   private async volumeDetail(
@@ -893,12 +968,15 @@ export class GuestAutomationService {
     }
     const engine = detected.engine as GuestEngine
 
-    // The draft's shell is judged against the guest that actually answered, not
-    // against what the template claims — this is the whole point of a dry run on
-    // a real VM.
-    const gate = assertShellMatchesEngine(input.draft.shell ?? null, engine)
-    if (!gate.ok) {
-      return { ok: false as const, errorCode: "CROSS_OS_VIOLATION" as GuestErrorCode, message: gate.reason }
+    // A guest-native operation is run by the agent, not by a shell, so its
+    // stored shell is inert and must not be judged against the engine. Judging
+    // it anyway refuses every native verb, which on Windows includes the whole
+    // password path.
+    if (input.draft.commandType !== "guest-native") {
+      const gate = assertShellMatchesEngine(input.draft.shell ?? null, engine)
+      if (!gate.ok) {
+        return { ok: false as const, errorCode: "CROSS_OS_VIOLATION" as GuestErrorCode, message: gate.reason }
+      }
     }
     const commandCrossOs = crossOsCommandViolations(String(input.draft.command || ""), engine)
     if (commandCrossOs.length) {
@@ -980,8 +1058,11 @@ export class GuestAutomationService {
 
     let definition: ResolvedOperation
     if (input.draft) {
-      const gate = assertShellMatchesEngine(input.draft.shell ?? null, engine)
-      if (!gate.ok) return { ok: false, errorCode: "CROSS_OS_VIOLATION", message: gate.reason }
+      // Same rule as the dry run: a native verb has no shell to check.
+      if (input.draft.commandType !== "guest-native") {
+        const gate = assertShellMatchesEngine(input.draft.shell ?? null, engine)
+        if (!gate.ok) return { ok: false, errorCode: "CROSS_OS_VIOLATION", message: gate.reason }
+      }
       const violations = crossOsCommandViolations(String(input.draft.command || ""), engine)
       if (violations.length) {
         return { ok: false, errorCode: "CROSS_OS_VIOLATION", message: `Contains ${violations.join(", ")}, which belongs to the other engine.` }
