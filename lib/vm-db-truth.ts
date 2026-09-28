@@ -635,7 +635,6 @@ export async function serializeClientVmStatus(vps: any) {
       lastSyncedAt: iso(canonical.network?.lastSyncedAt),
       source: canonical.network?.source || canonical.primaryAssignment?.source || "unavailable",
     },
-    cloudInit: null,
     firewall: null,
     additionalIps: canonical.additionalIps || [],
     ipHistory: (canonical.ipHistory || []).map(clientIpHistoryRow),

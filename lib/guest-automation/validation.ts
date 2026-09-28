@@ -251,12 +251,18 @@ export function validateTemplateDraft(draft: TemplateDraft): ValidationResult {
   }
 
   if (draft.versionPattern) {
-    try {
-      // eslint-disable-next-line no-new
-      new RegExp(String(draft.versionPattern))
-    } catch {
-      errors.push(issue("versionPattern", "Version pattern is not a valid regular expression."))
-    }
+    // Compiling the pattern is the validation. A template whose version pattern
+    // cannot compile would never match any OS, so it must be rejected on save
+    // rather than silently resolving nothing at provision time.
+    const compiles = (() => {
+      try {
+        RegExp(String(draft.versionPattern))
+        return true
+      } catch {
+        return false
+      }
+    })()
+    if (!compiles) errors.push(issue("versionPattern", "Version pattern is not a valid regular expression."))
   }
 
   if (!Array.isArray(draft.operations) || draft.operations.length === 0) {

@@ -9,13 +9,24 @@ export function unsupportedTemplateReason(row: AnyRecord): string | null {
   return osTemplateUnavailableReason(row, { purpose: "reinstall" })
 }
 
-function templateWarnings(row: AnyRecord, isWindows: boolean) {
+/**
+ * Is the QEMU guest agent channel open on this template?
+ *
+ * This is the only part of guest-agent readiness the host can see. Whether the
+ * agent is actually installed inside the image cannot be known from the host, so
+ * it is never reported here as fact — it is proven on the first clone.
+ */
+export function guestAgentChannelEnabled(row: AnyRecord): boolean {
+  const config = row?.proxmoxConfig && typeof row.proxmoxConfig === "object" ? row.proxmoxConfig : {}
+  return Object.entries(config as Record<string, unknown>).some(
+    ([key, value]) => /^agent(\d+)?$/i.test(key) && Number(value) === 1,
+  )
+}
+
+function templateWarnings(row: AnyRecord, _isWindows: boolean) {
   const warnings: string[] = []
-  if (isWindows) {
-    warnings.push("Windows requires Cloudbase-Init installed in template.")
-    if (!row.cloudInitSupported) {
-      warnings.push("Cloud-init drive support was not detected during sync. Save is allowed, but verify the template before provisioning.")
-    }
+  if (!guestAgentChannelEnabled(row)) {
+    warnings.push("Guest agent channel is not enabled on this template. Guest automation configures servers through the QEMU guest agent, so a server cloned from this template cannot be configured until the channel is open.")
   }
   return warnings
 }
@@ -61,9 +72,8 @@ export function serializeOperatingSystem(row: AnyRecord): AnyRecord {
     family: distro,
     version: isWindows ? normalized.version || row.osVersion || null : row.osVersion || normalized.version || null,
     architecture: inferArchitecture(row),
-    supportsCloudInit: isWindows ? true : Boolean(row.cloudInitSupported),
     supportsSSH: !isWindows,
-    cloudInitLabel: isWindows ? "Cloudbase-init" : "Cloud-init",
+    guestAgentChannel: guestAgentChannelEnabled(row),
     osType: isWindows ? "windows" : "linux",
     osFamily: isWindows ? "windows" : row.osFamily || normalized.family,
     osVersion: isWindows ? normalized.version || null : row.osVersion || normalized.version || null,
@@ -72,7 +82,7 @@ export function serializeOperatingSystem(row: AnyRecord): AnyRecord {
     eolWarningText: row.eolWarningText || null,
     reinstallEnabled: row.reinstallEnabled !== false,
     supported: !unsupportedTemplateReason(row),
-    cloudInitSupported: Boolean(row.cloudInitSupported),
+
     consoleType: normalizeConsoleType(row.consoleType),
     resolvedConsoleType: resolveConsoleType({ template: row }).consoleType,
     unsupportedReason: unsupportedTemplateReason(row),

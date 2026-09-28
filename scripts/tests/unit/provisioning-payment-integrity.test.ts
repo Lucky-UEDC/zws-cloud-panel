@@ -5,6 +5,11 @@ import { buildCloudInitConfig, validateCloudInitDump } from "@/lib/cloud-init-co
 
 const read = (path: string) => readFileSync(path, "utf8")
 
+/**
+ * Retained, and asserted, because the legacy module is still used to read old
+ * template state. It is not on any provisioning path any more — that is asserted
+ * separately in cloud-init-removal.test.ts.
+ */
 test("hostname absence never fails cloud-init verification", () => {
   const built = buildCloudInitConfig({
     vmid: 101,
@@ -28,12 +33,32 @@ test("hostname absence never fails cloud-init verification", () => {
   assert.equal(result.ok, true)
 })
 
-test("guest identity and reachability are warning-only provisioning evidence", () => {
+test("guest-reported network is a hard gate and guest identity stays warning-only", () => {
   const source = read("lib/provision.ts")
-  assert.match(source, /const warnings = \{\s*guestAgentOnline:/)
+  // The guest agent is no longer advisory. Without it the guest cannot be
+  // configured at all, so a deployment that passed the gate without it would be
+  // a server nobody can reach.
+  assert.match(source, /const checks = \{[\s\S]*?guestAgentOnline: qga\.ok/)
+  assert.match(source, /const checks = \{[\s\S]*?guestIpApplied: guestIps\.includes\(input\.expectedIp\)/)
+  assert.match(source, /const checks = \{[\s\S]*?guestGatewayApplied:/)
+  assert.match(source, /const checks = \{[\s\S]*?guestDnsApplied:/)
+  // Hostname and search domain are things a customer may legitimately change
+  // themselves, so they are reported and never block delivery.
+  assert.match(source, /const warnings = \{\s*guestSearchDomainApplied:/)
+  assert.match(source, /const warnings = \{[\s\S]*?guestHostnameApplied:/)
+  assert.match(source, /const warnings = \{[\s\S]*?networkReachable: reachability\.ok/)
   assert.match(source, /const failed = Object\.entries\(checks\)/)
   assert.doesNotMatch(source, /const failed = Object\.entries\(warnings\)/)
-  assert.match(source, /Hostname differs \(informational only\)/)
+  // The gate is no longer built on what was injected into the VM config. The
+  // strings still appear in comments and in the secret-redaction list, so the
+  // assertion is on code with both stripped.
+  // `cipassword` survives only in the secret-redaction list at the top of the
+  // file, which is a read that protects logs. What must not exist is a write.
+  const code = source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "")
+  assert.doesNotMatch(code, /\bciuser\s*[:=]/)
+  assert.doesNotMatch(code, /\bipconfig0\s*[:=]/)
+  assert.doesNotMatch(code, /\bnameserver\s*[:=]/)
+  assert.equal(code.match(/cipassword/g)?.length, 1, "cipassword may appear only in the redaction list")
 })
 
 test("checkout and renewal financial writes use serializable transactions", () => {

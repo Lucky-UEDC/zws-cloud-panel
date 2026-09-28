@@ -11,6 +11,9 @@ import { withRedisLock } from "@/lib/redis"
 import { ensureVmIdentityNotes, vmIdentityNotesMatch, vmIdentityTagsMatch } from "@/lib/proxmox-tags"
 import { publishLiveVmSnapshot } from "@/lib/proxmox-live"
 import { ensureProvisioningIdentity } from "@/lib/provisioning-identity"
+import { GuestAutomationService, osMetadataForVps } from "@/lib/guest-automation/service"
+import { guestContextFor } from "@/lib/guest-automation/first-boot"
+import { decryptSecretValue } from "@/lib/secret-crypto"
 
 const ACTIVE_IP_STATUSES = ["active", "moved", "pending"]
 const ACTIVE_ALLOC_STATUSES = ["RESERVED", "reserved", "ASSIGNED", "assigned", "USED", "used"]
@@ -185,10 +188,6 @@ function buildNet0(input: { model?: string | null; macAddress?: string | null; b
   const tag = Number.isInteger(Number(input.vlanTag)) ? Number(input.vlanTag) : null
   const attrs = [bridge ? `bridge=${bridge}` : "bridge=vmbr0", tag !== null ? `tag=${tag}` : null].filter(Boolean)
   return [base, ...attrs].join(",")
-}
-
-function hasCloudInitDrive(config: Record<string, any>) {
-  return Object.keys(config || {}).some((key) => /^(ide|scsi|sata)\d+$/i.test(key) && String(config[key] || "").toLowerCase().includes("cloudinit"))
 }
 
 function buildPrimaryIpConfig(input: { ip: string; cidr: unknown; gateway: string }) {
@@ -1004,7 +1003,21 @@ async function invokeExternalHooks(input: {
   return { adapter: "noop", ok: true }
 }
 
-async function updatePrimaryCloudInitAndConfig(input: {
+/**
+ * Apply a primary-IP change to a guest.
+ *
+ * This used to be "write `ipconfig0`, run `qm cloudinit update`, read back
+ * `qm cloudinit dump network` and hope the cloud-init disk applied it on the next
+ * boot". Three things were wrong with that: it only worked for guests with a
+ * cloud-init drive (so any guest-agent-only VM was rejected outright), it
+ * verified a file on the host rather than the guest's real configuration, and it
+ * left the change pending until the customer happened to reboot.
+ *
+ * The change is now applied by the guest, through the OS profile that matches the
+ * guest that answered, and verified by asking the guest what it now has. The
+ * bridge is still a host-side fact, so the host still owns it.
+ */
+async function updatePrimaryGuestNetwork(input: {
   vm: VmRecord
   targetIp: string
   pool: any
@@ -1020,16 +1033,27 @@ async function updatePrimaryCloudInitAndConfig(input: {
   const unlocked = await ensureUnlockedConfig({ vm: input.vm, config: input.existingConfig })
   const currentConfig = unlocked.config
 
-  if (!hasCloudInitDrive(currentConfig)) {
-    throw new Error("VM does not support automatic network reconfiguration")
-  }
-
   const currentNet0 = String(currentConfig.net0 || "")
   const parsedNet0 = parseNet0(currentNet0)
   const nodeBridges = await verifyBridgeOnNode({ vm: input.vm, bridge: input.bridge })
-  const ipconfig0 = buildPrimaryIpConfig({ ip: input.targetIp, cidr: input.pool.cidr, gateway: String(input.pool.gateway || "") })
+  const gateway = String(input.pool.gateway || "")
+  const cidr = Number(input.pool.cidr || 24)
+  const dns = String(input.pool.dns || "1.1.1.1")
+  const ipconfig0 = buildPrimaryIpConfig({ ip: input.targetIp, cidr: input.pool.cidr, gateway })
   const endpoint = `/nodes/${encodeURIComponent(nodeName)}/qemu/${input.vm.vmid}/config`
-  const payload = { ipconfig0 }
+
+  // The bridge is the host's decision, so it is the host's write.
+  const bridgeChange: Record<string, string> = {}
+  if (parsedNet0.bridge && parsedNet0.bridge !== input.bridge) {
+    bridgeChange.net0 = `${parsedNet0.model},bridge=${input.bridge}`
+  }
+  if (Object.keys(bridgeChange).length) {
+    await client.updateVMConfig(nodeName, input.vm.vmid, bridgeChange).catch((error: any) => {
+      const details = proxmoxErrorMetadata(error)
+      throw new Error(`proxmox_config_update_failed: ${details.message}`)
+    })
+  }
+
   const diagnostics = {
     vmDatabaseId: input.vm.id,
     proxmoxVmid: input.vm.vmid,
@@ -1045,21 +1069,21 @@ async function updatePrimaryCloudInitAndConfig(input: {
       bridge: input.bridge,
     },
     targetIp: input.targetIp,
-    generatedGateway: input.pool.gateway,
-    generatedCidr: Number(input.pool.cidr),
+    generatedGateway: gateway,
+    generatedCidr: cidr,
     generatedIpconfig0: ipconfig0,
     currentNet0,
     parsedNet0,
     bridge: input.bridge,
     apiEndpoint: endpoint,
-    proxmoxPayload: payload,
-    cloudInitDrivePresent: true,
+    proxmoxPayload: bridgeChange,
+    bridgeChangeApplied: Object.keys(bridgeChange).length > 0,
     unlocked: { unlocked: unlocked.unlocked, lock: unlocked.lock },
     relink: input.relink || null,
     nodeBridges,
   }
 
-  console.log("[vm-network] primary_ip_proxmox_precheck", diagnostics)
+  console.log("[vm-network] primary_ip_guest_precheck", diagnostics)
   await logNetworkEvent({
     vm: input.vm,
     eventType: "change_primary_ip_precheck",
@@ -1067,49 +1091,108 @@ async function updatePrimaryCloudInitAndConfig(input: {
     reason: input.reason || null,
     stage: "preflight",
     status: "completed",
-    oldState: {
-      ipconfig0: String(currentConfig.ipconfig0 || ""),
-      net0: currentNet0,
-    },
-    newState: { ipconfig0 },
+    oldState: { ipconfig0: String(currentConfig.ipconfig0 || ""), net0: currentNet0 },
+    newState: { ip: input.targetIp, cidr, gateway, bridge: input.bridge },
     metadata: { idempotencyKey: input.idempotencyKey, diagnostics },
   })
 
-  await client.updateVMConfig(nodeName, input.vm.vmid, payload).catch((error: any) => {
-    const details = proxmoxErrorMetadata(error)
-    throw new Error(`proxmox_config_update_failed: ${details.message}`)
+  // The guest applies its own network. The plan is change-driven, so a guest
+  // that already has this address is left alone and the run reports no change.
+  const service = new GuestAutomationService(
+    guestContextFor({ vpsInstanceId: input.vm.id, vmid: input.vm.vmid, node: input.vm.proxmoxNode! }),
+  )
+  const result = await service.applyChange({
+    desired: {
+      ip: input.targetIp,
+      prefix: cidr,
+      gateway,
+      dns: dns.split(/[,\s]+/).map((value) => value.trim()).filter(Boolean),
+      hostname: String(input.vm.name || input.vm.hostname || ""),
+      username: String(input.vm.adminUsername || input.vm.username || "root"),
+      password: resolveGuestPassword(input.vm),
+    },
+    metadata: osMetadataForVps(input.vm),
+    actor: { requestedBy: input.actorEmail, role: "admin" },
   })
 
-  await client.updateCloudInit(nodeName, input.vm.vmid).catch((error: any) => {
-    const details = proxmoxErrorMetadata(error)
-    throw new Error(`cloudinit_update_failed: ${details.message}`)
-  })
-
-  const verify = await currentPrimarySnapshot(input.vm)
-  const parsed = parseIpConfig0(String((verify.config as any)?.ipconfig0 || ""))
-  if (parsed.ip !== input.targetIp || parsed.cidr !== Number(input.pool.cidr || 24) || parsed.gateway !== String(input.pool.gateway || "")) {
-    throw new Error("Post-update Proxmox ipconfig0 verification failed")
+  if ("message" in result) {
+    await logNetworkEvent({
+      vm: input.vm,
+      eventType: "change_primary_ip_precheck",
+      actorEmail: input.actorEmail,
+      reason: input.reason || null,
+      stage: "apply",
+      status: "failed",
+      metadata: { idempotencyKey: input.idempotencyKey, errorCode: result.errorCode, message: result.message },
+    })
+    throw new Error(`guest_automation_failed:${result.errorCode}: ${result.message}`)
   }
 
-  const networkDump = await client.dumpCloudInit(nodeName, input.vm.vmid, "network").catch((error: any) => {
-    const details = proxmoxErrorMetadata(error)
-    throw new Error(`cloudinit_network_dump_failed: ${details.message}`)
-  })
-  const networkDumpText = typeof networkDump === "string" ? networkDump : JSON.stringify(networkDump || "")
-  if (!networkDumpText.includes(input.targetIp)) {
-    throw new Error("cloudinit_network_dump_missing_ip")
+  const applied = result.steps.filter((step) => step.status === "success").map((step) => step.operation)
+  const failed = result.steps.filter((step) => step.status === "failed").map((step) => step.operation)
+  if (failed.length) {
+    await logNetworkEvent({
+      vm: input.vm,
+      eventType: "change_primary_ip_precheck",
+      actorEmail: input.actorEmail,
+      reason: input.reason || null,
+      stage: "apply",
+      status: "failed",
+      metadata: { idempotencyKey: input.idempotencyKey, failed, runId: result.runId },
+    })
+    throw new Error(`guest_automation_failed: ${failed.join(", ")}`)
   }
+
+  await logNetworkEvent({
+    vm: input.vm,
+    eventType: "change_primary_ip_applied",
+    actorEmail: input.actorEmail,
+    reason: input.reason || null,
+    stage: "apply",
+    status: "completed",
+    oldState: { ipconfig0: String(currentConfig.ipconfig0 || ""), net0: currentNet0 },
+    newState: { ip: input.targetIp, cidr, gateway, bridge: input.bridge },
+    metadata: {
+      idempotencyKey: input.idempotencyKey,
+      runId: result.runId,
+      os: result.detected.osId,
+      template: result.template?.name || null,
+      templateVersion: result.template?.version || null,
+      operations: applied,
+      guestIps: result.steps.length ? undefined : null,
+    },
+  })
 
   return {
-    net0: currentNet0,
-    ipconfig0: String((verify.config as any)?.ipconfig0 || ""),
-    payload,
+    net0: Object.keys(bridgeChange).length ? bridgeChange.net0 : currentNet0,
+    ipconfig0,
+    payload: bridgeChange,
     endpoint,
-    nameserver: String((verify.config as any)?.nameserver || ""),
-    searchdomain: String((verify.config as any)?.searchdomain || ""),
+    nameserver: dns,
+    searchdomain: String(input.pool.searchDomain || ""),
     networkDumpVerified: true,
+    guestAutomationRunId: result.runId,
+    guestOperations: applied,
+    guestIps: applied.includes("set_ip") ? [input.targetIp] : [],
     unlocked: unlocked.unlocked,
     relink: input.relink || null,
+  }
+}
+
+/**
+ * The password the guest will be asked to set, if one is needed.
+ *
+ * Network changes never need it, but the plan shape carries it, so it is passed
+ * through as a decrypted value and never logged. When there is none, the plan
+ * simply skips the password step.
+ */
+function resolveGuestPassword(vm: any): string {
+  const encrypted = String(vm?.passwordEncrypted || "")
+  if (!encrypted) return ""
+  try {
+    return decryptSecretValue(encrypted) || ""
+  } catch {
+    return ""
   }
 }
 
@@ -1395,7 +1478,7 @@ export async function changePrimaryIp(input: ChangePrimaryIpInput) {
         })
 
     try {
-      const proxmoxUpdate = await updatePrimaryCloudInitAndConfig({
+      const proxmoxUpdate = await updatePrimaryGuestNetwork({
         vm,
         targetIp: reservation.ipAddress,
         pool: { ...reservation.pool, gateway: networkPool.gateway, cidr: networkPool.cidr, dns: networkPool.dns, bridge: desiredBridge, bridgeOverride: desiredBridge },
@@ -1824,7 +1907,7 @@ export async function promoteSecondaryIp(input: PromoteSecondaryIpInput) {
 
   if (target.pool) {
     const snapshot = await currentPrimarySnapshot(vm)
-    await updatePrimaryCloudInitAndConfig({
+    await updatePrimaryGuestNetwork({
       vm,
       targetIp: String(target.ipAddress || ""),
       pool: target.pool,
@@ -2094,7 +2177,7 @@ export async function rebuildNetwork(input: VmNetworkActionInput) {
     }
   }
 
-  const proxmoxUpdate = await updatePrimaryCloudInitAndConfig({
+  const proxmoxUpdate = await updatePrimaryGuestNetwork({
     vm,
     targetIp: primary.ipAddress,
     pool: {
@@ -2231,7 +2314,7 @@ export async function repairNetwork(input: VmNetworkActionInput) {
 
       if (primary?.ipAddress && snapshot.ipconfig0.ip && primary.ipAddress !== snapshot.ipconfig0.ip) {
         const pool = primary.poolId ? await tx.ipPool.findUnique({ where: { id: primary.poolId } }) : null
-        await updatePrimaryCloudInitAndConfig({
+        await updatePrimaryGuestNetwork({
           vm,
           targetIp: primary.ipAddress,
           pool: {

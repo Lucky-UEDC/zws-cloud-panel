@@ -21,6 +21,8 @@ import { resolveCanonicalVmDataForVpsIds } from "@/lib/vm-db-truth"
 import { expandGuestPrimaryDisk } from "@/lib/vm-guest-disk"
 import { resolveVmGuestOs, type VmGuestOsKind } from "@/lib/vm-os-detection"
 import { scanDuplicateManagedVms } from "@/lib/vm-duplicate-quarantine"
+import { GuestAutomationService, osMetadataForVps } from "@/lib/guest-automation/service"
+import { guestContextFor } from "@/lib/guest-automation/first-boot"
 
 function nowIso() {
   return new Date().toISOString()
@@ -1202,11 +1204,21 @@ export async function runAdminVmAction(input: {
     const password = String(input.payload?.password || "").trim()
     if (password.length < 8) throw new Error("Password must be at least 8 characters")
     const username = String(input.payload?.username || vps.username || vps.adminUsername || "root").trim()
-    await client.updateVMConfig(vps.proxmoxNode!.nodeName, vps.vmid, {
-      ciuser: username,
-      cipassword: password,
+    // The password is set inside the guest, by the OS profile for the guest that
+    // actually answered. The Cloud-Init version wrote `ciuser`/`cipassword` and
+    // ran `qm cloudinit update`, which changed the password on the next boot
+    // rather than now, and did nothing at all for a guest with no cloud-init
+    // drive.
+    const service = new GuestAutomationService(
+      guestContextFor({ vpsInstanceId: vps.id, vmid: vps.vmid, node: vps.proxmoxNode! }),
+    )
+    const changed = await service.setPassword({
+      username,
+      password,
+      metadata: osMetadataForVps(vps),
+      actor: { requestedBy: input.actorEmail, role: "admin" },
     })
-    await client.updateCloudInit(vps.proxmoxNode!.nodeName, vps.vmid).catch(() => undefined)
+    if (!changed.ok) throw new Error(`password_reset_failed:${changed.errorCode}`)
     const encrypted = encryptSecretValue(password)
     await prisma.vpsInstance.update({
       where: { id: vps.id },
@@ -1216,7 +1228,12 @@ export async function runAdminVmAction(input: {
       where: { id: vps.orderId },
       data: { adminUsername: username, passwordEncrypted: encrypted },
     }).catch(() => undefined)
-    await logAdminVmAction({ vps, actorEmail: input.actorEmail, action: normalized, result: { status: "PASSWORD_RESET", username } })
+    await logAdminVmAction({
+      vps,
+      actorEmail: input.actorEmail,
+      action: normalized,
+      result: { status: "PASSWORD_RESET", username, runId: changed.runId, os: changed.detected.osId, template: changed.template?.name || null },
+    })
     return { ok: true, status: "PASSWORD_RESET", username }
   }
 

@@ -16,7 +16,7 @@ export type VmRuntimeHealth = {
   qgaOk: boolean
   pingOk: boolean
   sshOk: boolean
-  cloudInitOk: boolean
+  guestConfiguredOk: boolean
   completionEligible: boolean
   diagnostics: Record<string, unknown>
 }
@@ -85,20 +85,27 @@ async function qemuGuestAgentPing(client: ProxmoxClientLike, nodeName: string, v
   }
 }
 
-async function cloudInitHealthy(client: ProxmoxClientLike, nodeName: string, vmid: number, config: Record<string, any> | null | undefined) {
-  const hasCloudInitConfig = Boolean(
-    String(config?.ipconfig0 || "").trim() ||
-    String(config?.ciuser || "").trim() ||
-    String(config?.cipassword || "").trim() ||
-    Object.values(config || {}).some((value) => String(value || "").toLowerCase().includes("cloudinit")),
-  )
-  if (hasCloudInitConfig) return { ok: true, source: "config" }
-  const [userDump, networkDump] = await Promise.all([
-    client.dumpCloudInit(nodeName, vmid, "user").catch(() => null),
-    client.dumpCloudInit(nodeName, vmid, "network").catch(() => null),
-  ])
-  const hasDump = [userDump, networkDump].some((dump) => String(typeof dump === "string" ? dump : JSON.stringify(dump || "")).trim().length > 0)
-  return { ok: hasDump, source: hasDump ? "dump" : "none" }
+/**
+ * Is the guest actually configured?
+ *
+ * This used to look for `ipconfig0`/`ciuser`/`cipassword` in the Proxmox config
+ * and fall back to reading `qm cloudinit dump`. None of that is written any more,
+ * so both checks would report a healthy guest as unconfigured. The guest agent
+ * is the only channel that can answer, so it is the only one consulted: if it
+ * answers, the guest is reachable and therefore configured well enough to serve.
+ */
+async function guestConfigured(client: ProxmoxClientLike, nodeName: string, vmid: number) {
+  const ping = await client
+    .requestWithStatus?.(`/nodes/${encodeURIComponent(nodeName)}/qemu/${vmid}/agent/ping`, "POST")
+    .then(() => ({ ok: true as const }))
+    .catch((error: unknown) => ({ ok: false as const, error: safeMessage(error) }))
+  if (!ping.ok) return { ok: false, source: "agent_ping_failed" as const }
+  if (client.guestCmd) {
+    const hostName = await client.guestCmd(nodeName, vmid, "get-host-name").catch(() => null)
+    if (hostName) return { ok: true, source: "guest_agent" as const }
+    return { ok: false, source: "guest_agent_no_reply" as const }
+  }
+  return { ok: true, source: "agent_ping" as const }
 }
 
 export async function probeVmRuntimeHealth(input: {
@@ -125,11 +132,11 @@ export async function probeVmRuntimeHealth(input: {
     allocatedIp: input.allocatedIp,
     hostname: input.hostname,
   }).catch(() => ({ ipAddress: input.allocatedIp || null, source: input.allocatedIp ? "panel_allocation" as const : "none" as const }))
-  const [qga, pingOk, sshOk, cloudInit] = await Promise.all([
+  const [qga, pingOk, sshOk, guestConfig] = await Promise.all([
     qemuGuestAgentPing(input.client, input.nodeName, input.vmid),
     pingOnce(discovered.ipAddress),
     tcpPortOpen(discovered.ipAddress, 22),
-    cloudInitHealthy(input.client, input.nodeName, input.vmid, configObject),
+    guestConfigured(input.client, input.nodeName, input.vmid),
   ])
   const panelStatus = panelStatusFromProxmox({ runtimeStatus, config: configObject, dbStatus: input.dbStatus })
   const completionEligible = runtimeStatus === "running" && Boolean(discovered.ipAddress) && qga.ok
@@ -142,7 +149,7 @@ export async function probeVmRuntimeHealth(input: {
     qgaOk: qga.ok,
     pingOk,
     sshOk,
-    cloudInitOk: cloudInit.ok,
+    guestConfiguredOk: guestConfig.ok,
     completionEligible,
     diagnostics: {
       vmid: input.vmid,
@@ -150,7 +157,7 @@ export async function probeVmRuntimeHealth(input: {
       runtimeError: (runtime as any)?.__error || null,
       configError: (config as any)?.__error || null,
       qgaError: qga.error,
-      cloudInitSource: cloudInit.source,
+      guestConfiguredSource: guestConfig.source,
     },
   }
 }
@@ -194,7 +201,7 @@ export async function markRuntimeCompleteIfReady(input: {
         qgaOk: health.qgaOk,
         pingOk: health.pingOk,
         sshOk: health.sshOk,
-        cloudInitOk: health.cloudInitOk,
+        guestConfiguredOk: health.guestConfiguredOk,
       },
     },
   }
