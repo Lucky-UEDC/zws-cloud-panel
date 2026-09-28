@@ -928,7 +928,7 @@ export async function runProxmoxDiagnostics(input: {
   steps.push(storage.step)
 
   // Capability checks
-  const capabilities = await diagnosticCapabilities({
+  const capabilities = await runProxmoxFeatureDiagnostics({
     ...input,
     host: normalizedHost,
     timeoutMs,
@@ -950,7 +950,18 @@ export async function runProxmoxDiagnostics(input: {
   }
 }
 
-async function diagnosticCapabilities(input: {
+/**
+ * Feature probes: console, snapshot, backup and the reported guest-agent flag.
+ *
+ * Exported because the node capability model reports each of these as its own
+ * named check rather than as one lumped "capabilities" step, and because an admin
+ * adding a node needs to see which of them failed. Note what the guest-agent
+ * probe actually does: it reads Proxmox's own `agent` flag from the VM list. That
+ * is the hypervisor saying the channel is open — not proof that an agent is
+ * installed in the image and answering. `node-capabilities.ts` proves that part
+ * for real, and does not accept this flag as a substitute.
+ */
+export async function runProxmoxFeatureDiagnostics(input: {
   host: string
   nodeName: string
   tokenId: string

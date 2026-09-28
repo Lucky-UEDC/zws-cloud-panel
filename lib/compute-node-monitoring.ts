@@ -247,6 +247,31 @@ function safeNode(node: DbNode) {
     createdAt: node.createdAt,
     updatedAt: node.updatedAt,
     hasTokenSecret: Boolean(node.tokenSecret),
+    // The cached guest-automation verdict, so the node list can say whether a
+    // node can actually configure a guest rather than only whether it is
+    // connected. Read straight from the cached row: measuring here would put a
+    // guest-exec round trip on every list render.
+    guestCapabilities: (node as any).guestCapabilities
+      ? {
+          status: String((node as any).guestCapabilities.status || "pending"),
+          pass: Array.isArray((node as any).guestCapabilities.checks)
+            ? ((node as any).guestCapabilities.checks as any[]).filter((entry) => entry?.state === "pass").length
+            : 0,
+          fail: Array.isArray((node as any).guestCapabilities.checks)
+            ? ((node as any).guestCapabilities.checks as any[]).filter((entry) => entry?.state === "fail").length
+            : 0,
+          skip: Array.isArray((node as any).guestCapabilities.checks)
+            ? ((node as any).guestCapabilities.checks as any[]).filter((entry) => entry?.state === "skip").length
+            : 0,
+          total: Array.isArray((node as any).guestCapabilities.checks) ? (node as any).guestCapabilities.checks.length : 0,
+          lastCheckedAt: (node as any).guestCapabilities.lastCheckedAt || null,
+          lastSuccessAt: (node as any).guestCapabilities.lastSuccessAt || null,
+          lastError: (node as any).guestCapabilities.lastError || null,
+          stale: (node as any).guestCapabilities.lastCheckedAt
+            ? Date.now() - new Date((node as any).guestCapabilities.lastCheckedAt).getTime() > 30 * 60 * 1000
+            : true,
+        }
+      : { status: "pending", pass: 0, fail: 0, skip: 0, total: 0, lastCheckedAt: null, lastSuccessAt: null, lastError: null, stale: true },
   }
 }
 
@@ -783,7 +808,10 @@ export async function getNodeMonitoring(id: string, options: { logErrors?: boole
 }
 
 export async function listComputeNodes() {
-  const nodes = await prisma.proxmoxNode.findMany({ orderBy: { createdAt: "desc" } })
+  const nodes = await prisma.proxmoxNode.findMany({
+    orderBy: { createdAt: "desc" },
+    include: { guestCapabilities: true },
+  })
   return mapLimit(nodes, NODE_LIST_CONCURRENCY, (node) => getNodeMonitoring(node.id))
 }
 
