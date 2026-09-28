@@ -43,7 +43,7 @@ import {
 import { parseNativeInterfaces, parseNativeOsInfo, parseNativeUsers, parseNativeFsInfo } from "./parsers"
 import { buildPlan, deriveRunStatus, serializePlan, type GuestStateSnapshot, type OperationPlan, type PlanRequest, EMPTY_SNAPSHOT } from "./plan"
 import { extractPlaceholders, maskCommandSecrets, renderTemplate, unknownPlaceholders } from "./placeholders"
-import { resolveTemplate, type ResolvedOperation, type ResolvedTemplate } from "./template-resolver"
+import { enabledOperations, resolveTemplate, type ResolvedOperation, type ResolvedTemplate } from "./template-resolver"
 import { assertExpectation, observeFromOutput, verifyOperation, type Observation } from "./verification"
 
 export type VmContext = {
@@ -199,14 +199,67 @@ export class GuestAutomationService {
     }
   }
 
-  /** Guest agent health, cached briefly. */
+  /**
+   * What this guest can be asked to do.
+   *
+   * Two separate questions, kept separate because they fail for different
+   * reasons: whether the agent answers at all, and whether the OS it reports has
+   * an enabled template with the operations we would need. A guest with a
+   * working agent but no matching template is reachable and still not
+   * manageable, and collapsing the two would report that as healthy.
+   */
   async getCapabilities() {
     const running = await this.isRunning()
     if (!running) {
-      return { running: false, guestAgentReachable: false, reason: GUEST_ERROR_MESSAGES.VM_STOPPED as string }
+      return {
+        running: false,
+        guestAgentReachable: false,
+        automationSupported: false,
+        supportedOperations: [] as GuestOperation[],
+        reason: GUEST_ERROR_MESSAGES.VM_STOPPED as string,
+      }
     }
     const health = await isGuestAgentReachable({ target: this.target(), bypassCache: true })
-    return { running: true, guestAgentReachable: health.reachable, checkedAt: new Date(health.checkedAt).toISOString() }
+    if (!health.reachable) {
+      return {
+        running: true,
+        guestAgentReachable: false,
+        automationSupported: false,
+        supportedOperations: [] as GuestOperation[],
+        reason: GUEST_ERROR_MESSAGES.GUEST_AGENT_UNREACHABLE as string,
+        checkedAt: new Date(health.checkedAt).toISOString(),
+      }
+    }
+    const detected = await this.detectOs()
+    if (detected.kind === "unknown") {
+      return {
+        running: true,
+        guestAgentReachable: true,
+        automationSupported: false,
+        supportedOperations: [] as GuestOperation[],
+        reason: GUEST_ERROR_MESSAGES.OS_DETECTION_UNAVAILABLE as string,
+        checkedAt: new Date(health.checkedAt).toISOString(),
+      }
+    }
+    const resolved = await this.getTemplate(detected)
+    if (!resolved.ok) {
+      return {
+        running: true,
+        guestAgentReachable: true,
+        automationSupported: false,
+        supportedOperations: [] as GuestOperation[],
+        reason: resolved.reason,
+        checkedAt: new Date(health.checkedAt).toISOString(),
+      }
+    }
+    return {
+      running: true,
+      guestAgentReachable: true,
+      automationSupported: true,
+      supportedOperations: enabledOperations(resolved.template).map((entry) => entry.operation),
+      template: { id: resolved.template.id, name: resolved.template.name, version: resolved.template.version },
+      checkedAt: new Date(health.checkedAt).toISOString(),
+    }
   }
 
   /**

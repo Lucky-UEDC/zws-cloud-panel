@@ -96,6 +96,10 @@ export type PlanRequest = {
     password?: string
     timezone?: string
     createUser?: { username: string; password: string }
+    /** Account lifecycle. Named per action so a plan cannot half-apply one. */
+    enableUser?: string
+    disableUser?: string
+    deleteUser?: string
     diskMount?: string
   }
   /** first_boot runs the full sequence; a change runs only what differs. */
@@ -160,6 +164,19 @@ function alreadyMatches(snapshot: GuestStateSnapshot, operation: GuestOperation,
       // A password hash is never readable through the guest API, so we cannot
       // prove the current value. Idempotency is not claimed; it is re-applied.
       return { matches: false, previous: { username: desired.username ?? snapshot.username } }
+    case "disable_user":
+    case "delete_user": {
+      const target = userFor(operation, desired)
+      // Disabling or deleting an account that is not there is the state the
+      // customer asked for, so it is reported as already applied.
+      return { matches: !target || !snapshot.users.includes(target), previous: { users: snapshot.users } }
+    }
+    case "enable_user": {
+      const target = userFor(operation, desired)
+      // Whether an account is enabled is not visible through the guest API, so
+      // enabling is always re-applied rather than claimed idempotent.
+      return { matches: false, previous: { users: snapshot.users, target } }
+    }
     default:
       return { matches: false, previous: {} }
   }
@@ -184,6 +201,9 @@ export function buildPlan(request: PlanRequest): OperationPlan {
     if (desired.hostname !== undefined) wanted.push("set_hostname")
     if (desired.password !== undefined) wanted.push("set_password")
     if (desired.createUser) wanted.push("create_user")
+    if (desired.enableUser) wanted.push("enable_user")
+    if (desired.disableUser) wanted.push("disable_user")
+    if (desired.deleteUser) wanted.push("delete_user")
     if (desired.timezone !== undefined) wanted.push("timezone")
   }
 
@@ -249,6 +269,14 @@ export function buildPlan(request: PlanRequest): OperationPlan {
   }
 }
 
+/** The account an account-lifecycle operation is about. */
+function userFor(operation: GuestOperation, desired: PlanRequest["desired"]): string | null {
+  if (operation === "enable_user") return desired.enableUser ?? null
+  if (operation === "disable_user") return desired.disableUser ?? null
+  if (operation === "delete_user") return desired.deleteUser ?? null
+  return null
+}
+
 function placeholderValues(operation: GuestOperation, desired: PlanRequest["desired"]): Record<string, string> {
   const values: Record<string, string> = {}
   const put = (key: string, value: string | number | undefined) => {
@@ -274,6 +302,11 @@ function placeholderValues(operation: GuestOperation, desired: PlanRequest["desi
       break
     case "create_user":
       put("USERNAME", desired.createUser?.username)
+      break
+    case "enable_user":
+    case "disable_user":
+    case "delete_user":
+      put("USERNAME", userFor(operation, desired) ?? undefined)
       break
     case "timezone":
       put("TIMEZONE", desired.timezone)
