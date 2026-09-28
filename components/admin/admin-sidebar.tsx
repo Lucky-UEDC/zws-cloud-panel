@@ -33,6 +33,7 @@ import {
   Users,
   Wallet,
   Webhook,
+  TerminalSquare,
   X,
 } from "lucide-react"
 import { cn } from "@/lib/utils"
@@ -71,6 +72,7 @@ const groups: NavGroup[] = [
     items: [
       { label: "Nodes", href: "/admin/compute-nodes", icon: Cpu },
       { label: "Templates", href: "/admin/os-templates", icon: ImageIcon },
+      { label: "OS Guest Automation", href: "/admin/os-guest-automation", icon: TerminalSquare },
       { label: "Virtual Machines", href: "/admin/vms", icon: MonitorCog },
       { label: "Backups", href: "/admin/vm-backups", icon: HardDriveDownload },
       { label: "Snapshots", href: "/admin/snapshots", icon: Camera },
