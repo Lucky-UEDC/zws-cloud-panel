@@ -20,6 +20,9 @@ export type ProxmoxNodePayload = {
 
 export function nodeResponse(node: any) {
   return {
+    // The cached capability verdict, so the node list can say "Ready" or say why
+    // not without re-measuring every node on every page load.
+    guestCapabilities: summariseCachedCapabilities(node?.guestCapabilities),
     id: node.id,
     name: node.name,
     host: node.host,
@@ -38,6 +41,31 @@ export function nodeResponse(node: any) {
     hasTokenId: Boolean(node.tokenId),
     hasTokenSecret: Boolean(node.tokenSecret),
     templatesCount: Number(node?.templatesCount ?? node?._count?.templates ?? 0),
+  }
+}
+
+/**
+ * A one-line capability verdict from a cached row.
+ *
+ * Returns `pending` when nothing has been measured, which is deliberately not
+ * the same as ready: a node whose guest capabilities have never been checked is
+ * not known to be usable.
+ */
+function summariseCachedCapabilities(row: any) {
+  const status = String(row?.status || "pending")
+  const checks = Array.isArray(row?.checks) ? row.checks : []
+  return {
+    status,
+    pass: checks.filter((entry: any) => entry?.state === "pass").length,
+    fail: checks.filter((entry: any) => entry?.state === "fail").length,
+    skip: checks.filter((entry: any) => entry?.state === "skip").length,
+    total: checks.length,
+    lastCheckedAt: row?.lastCheckedAt || null,
+    lastSuccessAt: row?.lastSuccessAt || null,
+    // A report older than half an hour is a claim nobody verified in this
+    // session, so the UI shows it as stale rather than as current.
+    stale: row?.lastCheckedAt ? Date.now() - new Date(row.lastCheckedAt).getTime() > 30 * 60 * 1000 : true,
+    lastError: row?.lastError || null,
   }
 }
 

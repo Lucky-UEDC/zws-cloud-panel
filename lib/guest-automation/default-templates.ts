@@ -751,12 +751,52 @@ export const DEFAULT_GUEST_TEMPLATES: SeedTemplate[] = [
 ]
 
 /** Guest-agent install hints surfaced on the template page. */
+/**
+ * How to install the QEMU Guest Agent inside each supported image.
+ *
+ * Shown to an admin adding a node, because a node with no image carrying an
+ * agent is a node we can create servers on but never configure. The agent belongs
+ * in the VM image; nothing is installed on the hypervisor for it.
+ *
+ * The host-side counterpart — the `agent=1` channel on the VM config — is a
+ * separate step and is applied by the "verify guest agent" template action.
+ */
 export const GUEST_AGENT_INSTALL_HINTS: Record<string, string[]> = {
-  "debian/ubuntu": ["apt-get update", "apt-get install -y qemu-guest-agent", "systemctl enable --now qemu-guest-agent"],
+  debian: ["apt-get update", "apt-get install -y qemu-guest-agent", "systemctl enable --now qemu-guest-agent"],
+  ubuntu: ["apt-get update", "apt-get install -y qemu-guest-agent", "systemctl enable --now qemu-guest-agent"],
+  kali: ["apt-get update", "apt-get install -y qemu-guest-agent", "systemctl enable --now qemu-guest-agent"],
   rhel: ["dnf install -y qemu-guest-agent", "systemctl enable --now qemu-guest-agent"],
+  fedora: ["dnf install -y qemu-guest-agent", "systemctl enable --now qemu-guest-agent"],
+  rocky: ["dnf install -y qemu-guest-agent", "systemctl enable --now qemu-guest-agent"],
+  almalinux: ["dnf install -y qemu-guest-agent", "systemctl enable --now qemu-guest-agent"],
+  oracle: ["dnf install -y qemu-guest-agent", "systemctl enable --now qemu-guest-agent"],
   "centos-7": ["yum install -y qemu-guest-agent", "systemctl enable --now qemu-guest-agent"],
   suse: ["zypper -n in qemu-guest-agent", "systemctl enable --now qemu-guest-agent"],
   arch: ["pacman -S --noconfirm qemu-guest-agent", "systemctl enable --now qemu-guest-agent"],
   alpine: ["apk add qemu-guest-agent", "rc-update add qemu-guest-agent", "rc-service qemu-guest-agent start"],
-  windows: ["Install QEMU Guest Agent from the VirtIO/QEMU guest tools package", "Enable the QEMU Guest Agent service"],
+  windows: [
+    "Mount the VirtIO guest tools ISO and run virtio-win-guest-tools.exe",
+    "Enable the QEMU Guest Agent service (QEMU Guest Agent) and set it to start automatically",
+  ],
+}
+
+/**
+ * The install commands for a template's family, with a Linux default.
+ *
+ * A family with no exact entry falls back to the Debian instructions rather than
+ * to nothing: a wrong-looking command an admin can correct is better than a blank
+ * panel that reads as "no installation needed".
+ */
+export function guestAgentInstallCommands(family: string | null | undefined): { family: string; commands: string[]; exact: boolean } {
+  const key = String(family || "").trim().toLowerCase()
+  if (key && GUEST_AGENT_INSTALL_HINTS[key]) {
+    return { family: key, commands: GUEST_AGENT_INSTALL_HINTS[key], exact: true }
+  }
+  if (/debian|ubuntu|kali|raspbian|mint/.test(key)) {
+    return { family: key || "debian", commands: GUEST_AGENT_INSTALL_HINTS.debian, exact: true }
+  }
+  if (/rhel|centos|rocky|alma|oracle|fedora|redhat/.test(key)) {
+    return { family: key, commands: GUEST_AGENT_INSTALL_HINTS.rhel, exact: true }
+  }
+  return { family: key || "debian", commands: GUEST_AGENT_INSTALL_HINTS.debian, exact: false }
 }

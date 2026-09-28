@@ -18,6 +18,15 @@ import { Progress } from "@/components/ui/progress"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Skeleton } from "@/components/ui/skeleton"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
+import {
+  NODE_WIZARD_STEPS,
+  NodeWizardStepBody,
+  NodeWizardSteps,
+  canAdvanceFromWizard,
+  type CapabilityReport,
+  type WizardDiagnosticStep,
+  type WizardForm,
+} from "./NodeWizard"
 
 type NodeHealthState = "healthy" | "warning" | "critical" | "full" | "offline" | "overloaded" | "failed"
 
@@ -38,6 +47,17 @@ type ComputeNode = {
     resolvedIp?: string | null
     hasTokenId?: boolean
     hasTokenSecret: boolean
+    guestCapabilities?: {
+      status: "ready" | "degraded" | "failed" | "pending"
+      pass: number
+      fail: number
+      skip: number
+      total: number
+      lastCheckedAt: string | null
+      lastSuccessAt: string | null
+      stale: boolean
+      lastError: string | null
+    }
   }
   status: NodeHealthState
   checkedAt: string
@@ -139,6 +159,10 @@ export default function ComputeNodesPage() {
   const [form, setForm] = useState<FormState>(emptyForm)
   const [testState, setTestState] = useState<TestState>(emptyTest)
   const [lastRefreshedAt, setLastRefreshedAt] = useState<Date | null>(null)
+  const [wizardStep, setWizardStep] = useState(0)
+  const [wizardCapabilities, setWizardCapabilities] = useState<CapabilityReport | null>(null)
+  const [wizardMeasuring, setWizardMeasuring] = useState(false)
+  const [wizardWarning, setWizardWarning] = useState<string | null>(null)
   const loadInFlightRef = useRef(false)
   const nodeFailuresRef = useRef<Record<string, number>>({})
 
@@ -203,6 +227,62 @@ export default function ComputeNodesPage() {
   )
   const canSave = Boolean(form.name.trim()) && canTest && testState.status === "success" && !saving
 
+  function openAddWizard() {
+    setEditingNode(null)
+    setForm(emptyForm)
+    setTestState(emptyTest)
+    setWizardStep(0)
+    setWizardCapabilities(null)
+    setWizardWarning(null)
+    setIsDialogOpen(true)
+  }
+
+  function wizardForm(): WizardForm {
+    return {
+      name: form.name,
+      host: form.host,
+      nodeName: form.nodeName,
+      tokenId: form.tokenId,
+      tokenSecret: form.tokenSecret,
+      location: form.location,
+      allowInsecureTls: form.allowInsecureTls,
+    }
+  }
+
+  const wizardCanAdvance = canAdvanceFromWizard({
+    step: wizardStep,
+    form: wizardForm(),
+    connection: { status: testState.status, message: testState.message, code: testState.code, nodes: testState.nodes, host: testState.host, steps: testState.steps as WizardDiagnosticStep[] },
+    capabilities: wizardCapabilities,
+  })
+
+  /**
+   * Pre-flight the capabilities before the node exists.
+   *
+   * This cannot write the cached row — there is no node id yet — so it asks the
+   * test endpoint, which runs the same probes. The authoritative measurement is
+   * still taken on create; this step exists so an admin sees the verdict before
+   * committing, not after.
+   */
+  async function measureWizardCapabilities() {
+    setWizardMeasuring(true)
+    try {
+      const res = await fetch("/api/admin/proxmox-nodes/test", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ...wizardForm(), capabilitiesOnly: true }),
+      })
+      const data = await readJsonResponse<any>(res)
+      const report = data?.capabilities as CapabilityReport | undefined
+      if (!res.ok || !report) throw new Error(data?.error || "Capability measurement failed")
+      setWizardCapabilities(report)
+    } catch (err: any) {
+      toast.error(err?.message || "Capability measurement failed")
+    } finally {
+      setWizardMeasuring(false)
+    }
+  }
+
   async function loadNodes(options: { silent?: boolean } = {}) {
     if (loadInFlightRef.current) return
     loadInFlightRef.current = true
@@ -230,13 +310,6 @@ export default function ComputeNodesPage() {
     } finally {
       setRefreshing(false)
     }
-  }
-
-  function openAddDialog() {
-    setEditingNode(null)
-    setForm(emptyForm)
-    setTestState(emptyTest)
-    setIsDialogOpen(true)
   }
 
   async function openEditDialog(node: ComputeNode) {
@@ -338,11 +411,20 @@ export default function ComputeNodesPage() {
           }),
         ])
       }
-      toast.success(editingNode ? "Server updated" : "Node agent installed")
-      setIsDialogOpen(false)
+      if (editingNode) {
+        toast.success("Server updated")
+        setIsDialogOpen(false)
+      } else {
+        setWizardWarning(data?.warning || null)
+        if (data?.warning) toast.warning(data.warning)
+        else toast.success("Node added")
+      }
       setEditingNode(null)
       setForm(emptyForm)
       setTestState(emptyTest)
+      setWizardCapabilities(null)
+      setWizardStep(0)
+      if (!editingNode && !data?.warning) setIsDialogOpen(false)
       await loadNodes()
     } catch (err: any) {
       toast.error(err?.message || "Save failed")
@@ -403,6 +485,28 @@ export default function ComputeNodesPage() {
     }
   }
 
+  /**
+   * Re-measure a node's guest capabilities.
+   *
+   * A cached verdict goes stale, and a stale "Ready" is a claim nobody verified
+   * in this session — so the badge marks it and this is the way to renew it.
+   */
+  async function handleRecheckCapabilities(id: string) {
+    setTestingId(id)
+    try {
+      const res = await fetch(`/api/admin/proxmox-nodes/${id}/capabilities`, { method: "POST", cache: "no-store" })
+      const data = await readJsonResponse<any>(res)
+      if (!res.ok || !data?.success) throw new Error(data?.error || "Capability check failed")
+      if (data.status === "ready") toast.success(data.headline || "Guest capabilities verified")
+      else toast.warning(data.headline || "Guest automation is not available on this node")
+      await loadNodes({ silent: true })
+    } catch (err: any) {
+      toast.error(err?.message || "Capability check failed")
+    } finally {
+      setTestingId(null)
+    }
+  }
+
   async function handleRefreshNode(id: string) {
     setTestingId(id)
     try {
@@ -431,9 +535,9 @@ export default function ComputeNodesPage() {
             <RefreshCw className="h-4 w-4" />
             Refresh
           </Button>
-          <Button onClick={openAddDialog} className="gap-2">
+          <Button onClick={openAddWizard} className="gap-2">
             <Plus className="h-4 w-4" />
-            Install Node Agent
+            Add compute node
           </Button>
         </div>
       </div>
@@ -459,6 +563,7 @@ export default function ComputeNodesPage() {
                 <TableHead>Node</TableHead>
                 <TableHead>Host</TableHead>
                 <TableHead>Status</TableHead>
+                <TableHead>Guest automation</TableHead>
                 <TableHead>CPU</TableHead>
                 <TableHead>RAM</TableHead>
                 <TableHead>Uptime</TableHead>
@@ -474,12 +579,12 @@ export default function ComputeNodesPage() {
               {loading ? (
                 Array.from({ length: 3 }).map((_, index) => (
                   <TableRow key={index}>
-                    <TableCell colSpan={12}><Skeleton className="h-10 w-full" /></TableCell>
+                    <TableCell colSpan={13}><Skeleton className="h-10 w-full" /></TableCell>
                   </TableRow>
                 ))
               ) : nodes.length === 0 ? (
                 <TableRow>
-                  <TableCell colSpan={12} className="py-10 text-center text-muted-foreground">No compute nodes configured.</TableCell>
+                  <TableCell colSpan={13} className="py-10 text-center text-muted-foreground">No compute nodes configured.</TableCell>
                 </TableRow>
               ) : nodes.map((entry) => (
                 <TableRow key={entry.node.id} className="align-middle">
@@ -489,6 +594,9 @@ export default function ComputeNodesPage() {
                   </TableCell>
                   <TableCell className="max-w-48 truncate text-xs text-muted-foreground">{entry.node.host}</TableCell>
                   <TableCell><div className="space-y-1"><StatusBadge status={entry.status} critical={entry.health?.critical} />{entry.node.schedulingEnabled === false ? <Badge variant="outline" className="border-amber-500/40 text-amber-300" title={entry.node.drainReason || "New placement disabled"}>Drained</Badge> : null}</div></TableCell>
+                  <TableCell>
+                    <GuestAutomationBadge nodeId={entry.node.id} capabilities={entry.node.guestCapabilities} onRecheck={handleRecheckCapabilities} busy={testingId === entry.node.id} />
+                  </TableCell>
                   <TableCell><Usage value={entry.cpu.usagePercent} label={`${entry.cpu.totalCores || 0} cores`} available={entry.status !== "offline"} /></TableCell>
                   <TableCell><Usage value={entry.memory.usagePercent} label={`${entry.memory.used} / ${entry.memory.total}`} available={entry.status !== "offline"} /></TableCell>
                   <TableCell className="whitespace-nowrap">{entry.uptime.readable}</TableCell>
@@ -558,59 +666,122 @@ export default function ComputeNodesPage() {
         </CardContent>
       </Card>
 
-      <Dialog open={isDialogOpen} onOpenChange={setIsDialogOpen}>
-        <DialogContent className="flex max-h-[min(92dvh,760px)] max-w-2xl flex-col overflow-hidden p-0">
-          <DialogHeader className="shrink-0 px-6 pt-6">
-            <DialogTitle>{editingNode ? "Edit Server / Node" : "Install Node Agent"}</DialogTitle>
-            <DialogDescription>Test connection before saving. Existing token values can be kept without exposing them.</DialogDescription>
-          </DialogHeader>
-          <form onSubmit={saveNode} className="flex min-h-0 flex-1 flex-col">
-            <div className="min-h-0 flex-1 space-y-5 overflow-y-auto overflow-x-hidden px-6 py-5">
-              <div className="grid gap-4 md:grid-cols-2">
-                <Field label="Display Name" value={form.name} onChange={(value) => updateForm("name", value)} placeholder="Mumbai DC1" />
-                <Field label="Node Name" value={form.nodeName} onChange={(value) => updateForm("nodeName", value)} placeholder="pve" />
-              </div>
-              <Field label="Host URL" value={form.host} onChange={(value) => updateForm("host", value)} placeholder="node.example.com" />
-              <div className="grid gap-4 md:grid-cols-2">
-                <Field label="Token ID" value={form.tokenId} onChange={(value) => updateForm("tokenId", value)} placeholder={editingNode?.hasTokenId ? "Leave blank to keep existing token ID" : "root@pam!token"} />
-                <Field label="Token Secret" value={form.tokenSecret} onChange={(value) => updateForm("tokenSecret", value)} placeholder={editingNode?.hasTokenSecret ? "Leave blank to keep existing secret" : ""} type="password" />
-              </div>
-              <div className="grid gap-4 md:grid-cols-[1fr_auto] md:items-end">
-                <Field label="Location" value={form.location} onChange={(value) => updateForm("location", value)} placeholder="Mumbai, India" />
-                <label className="flex h-10 items-center gap-3 rounded-md border border-border/40 px-3 text-sm">
-                  <Checkbox checked={form.allowInsecureTls} onCheckedChange={(checked) => updateForm("allowInsecureTls", checked === true)} />
-                  Allow insecure TLS
-                </label>
-              </div>
-              <div className="rounded-md border border-border/40 p-4 space-y-3">
-                <div>
-                  <p className="text-sm font-medium">SSH Credentials — QEMU Kill Fallback (optional)</p>
-                  <p className="text-xs text-muted-foreground mt-0.5">Used as a last resort to kill stuck QEMU processes when the Proxmox API force-stop fails. Leave blank to skip tier-3 stop.</p>
-                </div>
+      {/* Adding a node is a ten-step wizard; editing one is a single form. The
+          difference is deliberate: an edit cannot change whether the node can
+          configure a guest, while an addition decides it up front. */}
+      {editingNode ? (
+        <Dialog open={isDialogOpen} onOpenChange={setIsDialogOpen}>
+          <DialogContent className="flex max-h-[min(92dvh,760px)] max-w-2xl flex-col overflow-hidden p-0">
+            <DialogHeader className="shrink-0 px-6 pt-6">
+              <DialogTitle>Edit Server / Node</DialogTitle>
+              <DialogDescription>Test connection before saving. Existing token values can be kept without exposing them.</DialogDescription>
+            </DialogHeader>
+            <form onSubmit={saveNode} className="flex min-h-0 flex-1 flex-col">
+              <div className="min-h-0 flex-1 space-y-5 overflow-y-auto overflow-x-hidden px-6 py-5">
                 <div className="grid gap-4 md:grid-cols-2">
-                  <Field label="SSH Username" value={form.sshUsername} onChange={(value) => updateForm("sshUsername", value)} placeholder="root" />
-                  <Field label="SSH Password" value={form.sshPassword} onChange={(value) => updateForm("sshPassword", value)} placeholder={editingNode ? "Leave blank to keep existing" : ""} type="password" />
+                  <Field label="Display Name" value={form.name} onChange={(value) => updateForm("name", value)} placeholder="Mumbai DC1" />
+                  <Field label="Node Name" value={form.nodeName} onChange={(value) => updateForm("nodeName", value)} placeholder="pve" />
+                </div>
+                <Field label="Host URL" value={form.host} onChange={(value) => updateForm("host", value)} placeholder="node.example.com" />
+                <div className="grid gap-4 md:grid-cols-2">
+                  <Field label="Token ID" value={form.tokenId} onChange={(value) => updateForm("tokenId", value)} placeholder={editingNode?.hasTokenId ? "Leave blank to keep existing token ID" : "root@pam!token"} />
+                  <Field label="Token Secret" value={form.tokenSecret} onChange={(value) => updateForm("tokenSecret", value)} placeholder={editingNode?.hasTokenSecret ? "Leave blank to keep existing secret" : ""} type="password" />
+                </div>
+                <div className="grid gap-4 md:grid-cols-[1fr_auto] md:items-end">
+                  <Field label="Location" value={form.location} onChange={(value) => updateForm("location", value)} placeholder="Mumbai, India" />
+                  <label className="flex h-10 items-center gap-3 rounded-md border border-border/40 px-3 text-sm">
+                    <Checkbox checked={form.allowInsecureTls} onCheckedChange={(checked) => updateForm("allowInsecureTls", checked === true)} />
+                    Allow insecure TLS
+                  </label>
+                </div>
+                <div className="rounded-md border border-border/40 p-4 space-y-3">
+                  <div>
+                    <p className="text-sm font-medium">SSH Credentials — QEMU Kill Fallback (optional)</p>
+                    <p className="text-xs text-muted-foreground mt-0.5">Used as a last resort to kill stuck QEMU processes when the Proxmox API force-stop fails. Leave blank to skip tier-3 stop.</p>
+                  </div>
+                  <div className="grid gap-4 md:grid-cols-2">
+                    <Field label="SSH Username" value={form.sshUsername} onChange={(value) => updateForm("sshUsername", value)} placeholder="root" />
+                    <Field label="SSH Password" value={form.sshPassword} onChange={(value) => updateForm("sshPassword", value)} placeholder={editingNode ? "Leave blank to keep existing" : ""} type="password" />
+                  </div>
+                </div>
+                {testState.nodes.length > 0 ? (
+                  <div className="space-y-2">
+                    <Label>Available Nodes</Label>
+                    <Select value={form.nodeName} onValueChange={(value) => updateForm("nodeName", value)}>
+                      <SelectTrigger><SelectValue placeholder="Select detected node" /></SelectTrigger>
+                      <SelectContent>{testState.nodes.map((node) => <SelectItem key={node} value={node}>{node}</SelectItem>)}</SelectContent>
+                    </Select>
+                  </div>
+                ) : null}
+                <ConnectionStatus state={testState} />
+              </div>
+              <div className="flex shrink-0 flex-col-reverse gap-2 border-t border-border/40 bg-background/95 px-6 py-4 backdrop-blur sm:flex-row sm:justify-end">
+                <Button type="button" variant="outline" onClick={() => setIsDialogOpen(false)}>Cancel</Button>
+                <Button type="button" variant="outline" onClick={testFormConnection} disabled={!canTest || testState.status === "testing"} className="gap-2"><Activity className="h-4 w-4" />{testState.status === "testing" ? "Testing..." : "Test Connection"}</Button>
+                <Button type="submit" disabled={!canSave}>{saving ? "Saving..." : "Save Node"}</Button>
+              </div>
+            </form>
+          </DialogContent>
+        </Dialog>
+      ) : (
+        <Dialog open={isDialogOpen} onOpenChange={setIsDialogOpen}>
+          <DialogContent className="flex max-h-[min(92dvh,860px)] max-w-3xl flex-col overflow-hidden p-0">
+            <DialogHeader className="shrink-0 px-6 pt-6">
+              <DialogTitle>Add a compute node</DialogTitle>
+              <DialogDescription>
+                Step {wizardStep + 1} of {NODE_WIZARD_STEPS.length} — {NODE_WIZARD_STEPS[wizardStep]?.description}
+              </DialogDescription>
+              <Progress value={((wizardStep + 1) / NODE_WIZARD_STEPS.length) * 100} className="mt-1 h-1" />
+            </DialogHeader>
+            <form
+              onSubmit={(event) => { event.preventDefault(); void saveNode(event) }}
+              className="flex min-h-0 flex-1 flex-col"
+            >
+              <div className="grid min-h-0 flex-1 gap-0 overflow-hidden md:grid-cols-[220px_1fr]">
+                <div className="hidden overflow-y-auto border-r border-border/40 bg-muted/20 p-4 md:block">
+                  <NodeWizardSteps current={wizardStep} />
+                </div>
+                <div className="min-h-0 overflow-y-auto px-6 py-5">
+                  <NodeWizardStepBody
+                    step={wizardStep}
+                    form={wizardForm()}
+                    updateForm={updateForm}
+                    connection={{ status: testState.status, message: testState.message, code: testState.code, nodes: testState.nodes, host: testState.host, steps: testState.steps as WizardDiagnosticStep[] }}
+                    capabilities={wizardCapabilities}
+                    onTestConnection={() => void testFormConnection()}
+                    onMeasure={() => void measureWizardCapabilities()}
+                    measuring={wizardMeasuring}
+                  />
+                  {wizardWarning ? (
+                    <p className="mt-4 rounded-md border border-amber-500/30 bg-amber-500/5 p-3 text-xs text-amber-200">{wizardWarning}</p>
+                  ) : null}
                 </div>
               </div>
-              {testState.nodes.length > 0 ? (
-                <div className="space-y-2">
-                  <Label>Available Nodes</Label>
-                  <Select value={form.nodeName} onValueChange={(value) => updateForm("nodeName", value)}>
-                    <SelectTrigger><SelectValue placeholder="Select detected node" /></SelectTrigger>
-                    <SelectContent>{testState.nodes.map((node) => <SelectItem key={node} value={node}>{node}</SelectItem>)}</SelectContent>
-                  </Select>
+              <div className="flex shrink-0 flex-col-reverse gap-2 border-t border-border/40 bg-background/95 px-6 py-4 backdrop-blur sm:flex-row sm:items-center sm:justify-between">
+                <Button type="button" variant="ghost" onClick={() => setWizardStep((current) => Math.max(0, current - 1))} disabled={wizardStep === 0 || saving}>
+                  Back
+                </Button>
+                <div className="flex flex-col-reverse gap-2 sm:flex-row">
+                  <Button type="button" variant="outline" onClick={() => setIsDialogOpen(false)} disabled={saving}>Cancel</Button>
+                  {wizardStep < NODE_WIZARD_STEPS.length - 1 ? (
+                    <Button
+                      type="button"
+                      onClick={() => setWizardStep((current) => Math.min(NODE_WIZARD_STEPS.length - 1, current + 1))}
+                      disabled={!wizardCanAdvance}
+                    >
+                      Next
+                    </Button>
+                  ) : (
+                    <Button type="submit" disabled={saving || !wizardCanAdvance}>
+                      {saving ? "Adding..." : "Add node"}
+                    </Button>
+                  )}
                 </div>
-              ) : null}
-              <ConnectionStatus state={testState} />
-            </div>
-            <div className="flex shrink-0 flex-col-reverse gap-2 border-t border-border/40 bg-background/95 px-6 py-4 backdrop-blur sm:flex-row sm:justify-end">
-              <Button type="button" variant="outline" onClick={() => setIsDialogOpen(false)}>Cancel</Button>
-              <Button type="button" variant="outline" onClick={testFormConnection} disabled={!canTest || testState.status === "testing"} className="gap-2"><Activity className="h-4 w-4" />{testState.status === "testing" ? "Testing..." : "Test Connection"}</Button>
-              <Button type="submit" disabled={!canSave}>{saving ? "Saving..." : editingNode ? "Save Node" : "Install Agent"}</Button>
-            </div>
-          </form>
-        </DialogContent>
-      </Dialog>
+              </div>
+            </form>
+          </DialogContent>
+        </Dialog>
+      )}
     </div>
   )
 }
@@ -732,6 +903,62 @@ function Field({ label, value, onChange, placeholder, type = "text" }: { label: 
       <Label>{label}</Label>
       <Input value={value} onChange={(event) => onChange(event.target.value)} placeholder={placeholder} type={type} />
     </div>
+  )
+}
+
+/**
+ * The one thing an admin needs to know about a node at a glance: can it
+ * configure a guest?
+ *
+ * "Connected" and "can configure a guest" are different claims. This badge
+ * answers the second one, and a stale verdict says so rather than pretending to
+ * be current.
+ */
+function GuestAutomationBadge({
+  nodeId,
+  capabilities,
+  onRecheck,
+  busy,
+}: {
+  nodeId: string
+  capabilities?: {
+    status: "ready" | "degraded" | "failed" | "pending"
+    pass: number
+    fail: number
+    skip: number
+    total: number
+    lastCheckedAt: string | null
+    lastSuccessAt: string | null
+    stale: boolean
+    lastError: string | null
+  }
+  onRecheck: (id: string) => void
+  busy: boolean
+}) {
+  const status = capabilities?.status || "pending"
+  const label = status === "ready" ? "Ready" : status === "degraded" ? "Degraded" : status === "failed" ? "Unavailable" : "Not measured"
+  const variant = status === "ready" ? "default" : status === "degraded" ? "outline" : "destructive"
+  const title = capabilities?.lastError
+    || (status === "pending"
+      ? "Guest capabilities have not been measured. A node we cannot measure is not known to be usable."
+      : capabilities?.stale
+        ? "This verdict is older than 30 minutes. Re-check to renew it."
+        : `${capabilities?.pass ?? 0} of ${capabilities?.total ?? 0} checks passed`)
+  return (
+    <span className="inline-flex items-center gap-1.5">
+      <Badge variant={variant} title={title}>{label}</Badge>
+      {capabilities?.stale ? <span className="text-[10px] text-muted-foreground">stale</span> : null}
+      <Button
+        type="button"
+        size="icon-sm"
+        variant="ghost"
+        title="Re-measure guest capabilities"
+        disabled={busy}
+        onClick={() => onRecheck(nodeId)}
+      >
+        <RefreshCw className={busy ? "h-3.5 w-3.5 animate-spin" : "h-3.5 w-3.5"} />
+      </Button>
+    </span>
   )
 }
 
