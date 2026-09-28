@@ -152,9 +152,33 @@ export function summariseFirstBoot(
  * `GUEST_AGENT_UNREACHABLE`, which is an actionable message, rather than
  * hanging a provisioning job.
  */
+/**
+ * The first-boot stages, in the order they happen.
+ *
+ * Reported rather than inferred, so a customer watching a four-minute
+ * deployment can see that the wait is their operating system booting instead of
+ * watching one spinner for the whole time.
+ */
+export const FIRST_BOOT_STAGES = [
+  "WAITING_GUEST_AGENT",
+  "DETECTING_OS",
+  "CONFIGURING_GUEST",
+  "VERIFYING_GUEST",
+] as const
+
+export type FirstBootStage = (typeof FIRST_BOOT_STAGES)[number]
+
 export async function runFirstBoot(
-  input: FirstBootRequest & { waitForAgentMs?: number; pollIntervalMs?: number; now?: () => number; sleep?: (ms: number) => Promise<void> },
+  input: FirstBootRequest & {
+    waitForAgentMs?: number
+    pollIntervalMs?: number
+    now?: () => number
+    sleep?: (ms: number) => Promise<void>
+    /** Called on entry to each stage and on every wait-loop tick. */
+    onStage?: (stage: FirstBootStage, detail: { attempt: number; waitedMs: number; maxWaitMs: number }) => void | Promise<void>
+  },
 ): Promise<FirstBootResult> {
+  const onStage = input.onStage ?? (() => undefined)
   const waitMs = input.waitForAgentMs ?? 180_000
   const pollMs = input.pollIntervalMs ?? 5_000
   const now = input.now ?? (() => Date.now())
@@ -170,8 +194,12 @@ export async function runFirstBoot(
 
   const target = { client: service.proxmoxClient, node: input.vms.nodeName, vmid: input.vms.vmid, engine: "unknown" as const }
   const deadline = now() + waitMs
+  const startedAt = now()
   let reachable = false
+  let attempt = 0
   do {
+    attempt += 1
+    await onStage("WAITING_GUEST_AGENT", { attempt, waitedMs: now() - startedAt, maxWaitMs: waitMs })
     const health = await isGuestAgentReachable({ target, bypassCache: true }).catch(() => ({ reachable: false }))
     reachable = health.reachable
     if (reachable) break
@@ -190,6 +218,13 @@ export async function runFirstBoot(
     }
   }
 
+  // Past this point the agent answers, so the OS is knowable. Announced before
+  // the call because `firstBoot` does the detection internally and the customer
+  // should see the step turn over rather than sit on "detecting" while the whole
+  // configuration runs.
+  await onStage("DETECTING_OS", { attempt, waitedMs: now() - startedAt, maxWaitMs: waitMs })
+  await onStage("CONFIGURING_GUEST", { attempt, waitedMs: now() - startedAt, maxWaitMs: waitMs })
+
   const result = await service.firstBoot({
     desired: {
       ip: input.desired.ip,
@@ -206,6 +241,10 @@ export async function runFirstBoot(
     metadata: input.metadata ?? null,
     actor: { requestedBy: "system:first-boot", role: "system" },
   })
+
+  // Reading the guest back is a distinct stage: the run has executed, and now
+  // every operation is being confirmed from inside the guest.
+  await onStage("VERIFYING_GUEST", { attempt, waitedMs: now() - startedAt, maxWaitMs: waitMs })
 
   // `firstBoot` returns either a plan failure (which carries `message`) or a
   // completed run. Narrowing on `message` is what distinguishes them.

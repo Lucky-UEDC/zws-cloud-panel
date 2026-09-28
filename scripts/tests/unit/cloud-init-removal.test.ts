@@ -120,6 +120,7 @@ test("every remaining Cloud-Init reference in the repo is a read, a label, or a 
     ["app/api/client/vps/[id]/password/route.ts", "a comment explaining why the Cloud-Init fallback was removed"],
     ["app/admin/compute-nodes/[id]/page.tsx", "the legacy cloudInitSupported column, relabelled as guest-agent readiness"],
     ["lib/provisioning-placement.ts", "a comment describing the check that replaced the Cloud-Init one"],
+    ["lib/guest-automation/adoption.ts", "a comment explaining which servers predate the removal"],
   ])
 
   const offenders: string[] = []

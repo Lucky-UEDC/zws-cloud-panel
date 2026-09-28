@@ -3,7 +3,9 @@
 import Link from "next/link"
 import { useRouter, useSearchParams } from "next/navigation"
 import { useEffect, useMemo, useState } from "react"
-import { CalendarPlus, Link2, MoreHorizontal, Network, Play, Power, ReceiptText, RefreshCw, RotateCw, Search, Settings2, Square, Terminal, Trash2 } from "lucide-react"
+import { CalendarPlus, Link2, MoreHorizontal, Network, Play, Power, ReceiptText, RefreshCw, RotateCw, Search, Settings2, Sparkles, Square, Terminal, Trash2,
+} from "lucide-react"
+import { toast } from "sonner"
 import { readJsonResponse } from "@/lib/client/safe-json"
 import { dedupedAdminErrorToast } from "@/lib/client/admin-toast"
 import { useAdminVmQuery } from "@/lib/hooks/use-admin-vm-query"
@@ -152,6 +154,7 @@ export function AdminVmsClient({ initialData = null }: { initialData?: VmListPay
   const [search, setSearch] = useState("")
   const [page, setPage] = useState(1)
   const [busyId, setBusyId] = useState<string | null>(null)
+  const [adoptionResult, setAdoptionResult] = useState<null | { ok: boolean; name: string; os?: string; osVersion?: string | null; engine?: string; template?: string; operations?: number; reason?: string; remedy?: string | null }>(null)
   const [selected, setSelected] = useState<VmRow | null>(null)
   const [details, setDetails] = useState<any>(null)
   const [detailsLoading, setDetailsLoading] = useState(false)
@@ -271,6 +274,47 @@ export function AdminVmsClient({ initialData = null }: { initialData?: VmListPay
     }
   }
 
+  /**
+   * Adopt a server into guest automation.
+   *
+   * Separate from `callAction` because the answer matters: an admin needs to see
+   * which OS was detected and whether it is supported, not a generic "action
+   * succeeded". And it changes nothing about the server, which the result says
+   * explicitly so nobody assumes otherwise.
+   */
+  async function adoptGuestAutomation(row: VmRow) {
+    setBusyId(row.id)
+    setAdoptionResult(null)
+    try {
+      const res = await fetch(`/api/admin/vms/${row.id}/actions`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "adopt_guest_automation" }),
+      })
+      const body = await readJsonResponse<any>(res)
+      const result = body?.result
+      if (!result?.ok) {
+        setAdoptionResult({ ok: false, name: row.name, reason: result?.reason || body?.error || "Adoption did not complete", remedy: result?.remedy || null })
+        return
+      }
+      setAdoptionResult({
+        ok: true,
+        name: row.name,
+        os: result.os?.name || result.os?.id,
+        osVersion: result.os?.version,
+        engine: result.os?.engine,
+        template: result.template?.name,
+        operations: result.supportedOperations?.length ?? 0,
+      })
+      toast.success("Adopted. Nothing on the server was changed.")
+      await reload()
+    } catch (actionError: any) {
+      setAdoptionResult({ ok: false, name: row.name, reason: actionError?.message || "Adoption failed", remedy: null })
+    } finally {
+      setBusyId(null)
+    }
+  }
+
   function openVm(row: VmRow) {
     setSelected(row)
     router.push(`/admin/vms?vm=${encodeURIComponent(row.id)}`, { scroll: false })
@@ -367,6 +411,8 @@ export function AdminVmsClient({ initialData = null }: { initialData?: VmListPay
                           <DropdownMenuContent align="end" className="w-52">
                             <DropdownMenuLabel>Actions</DropdownMenuLabel>
                             <DropdownMenuItem onClick={() => openVm(row)}><Settings2 className="mr-2 h-4 w-4" />Manage</DropdownMenuItem>
+                            {/* Reads the server and records it. Never reconfigures it. */}
+                            <DropdownMenuItem onClick={() => void adoptGuestAutomation(row)}><Sparkles className="mr-2 h-4 w-4" />Adopt Guest Automation</DropdownMenuItem>
                             <DropdownMenuItem onClick={() => void callAction(row, "start")}><Power className="mr-2 h-4 w-4" />Power Start</DropdownMenuItem>
                             <DropdownMenuItem onClick={() => void callAction(row, "reboot")}><RefreshCw className="mr-2 h-4 w-4" />Power Restart</DropdownMenuItem>
                             <DropdownMenuItem asChild><Link href={`/admin/vms/${row.id}/console`}><Terminal className="mr-2 h-4 w-4" />Console</Link></DropdownMenuItem>
@@ -394,6 +440,30 @@ export function AdminVmsClient({ initialData = null }: { initialData?: VmListPay
           </div>
         </CardContent>
       </Card>
+
+      {adoptionResult ? (
+        <div className="fixed bottom-4 right-4 z-50 max-w-sm rounded-md border border-border/60 bg-background p-4 text-sm shadow-lg">
+          <div className="flex items-start justify-between gap-3">
+            <div>
+              <div className="font-medium">{adoptionResult.ok ? `${adoptionResult.name} adopted` : `${adoptionResult.name} not adopted`}</div>
+              {adoptionResult.ok ? (
+                <p className="mt-1 text-xs text-muted-foreground">
+                  Reports {adoptionResult.os}{adoptionResult.osVersion ? ` ${adoptionResult.osVersion}` : ""}
+                  {adoptionResult.template ? `, configured by ${adoptionResult.template}` : ""}
+                  {adoptionResult.operations ? `, ${adoptionResult.operations} operations available` : ""}.
+                  Nothing on the server was changed.
+                </p>
+              ) : (
+                <div className="mt-1 text-xs text-red-300">
+                  <p>{adoptionResult.reason}</p>
+                  {adoptionResult.remedy ? <p className="mt-1 text-muted-foreground">{adoptionResult.remedy}</p> : null}
+                </div>
+              )}
+            </div>
+            <button type="button" className="text-muted-foreground" onClick={() => setAdoptionResult(null)} aria-label="Dismiss">×</button>
+          </div>
+        </div>
+      ) : null}
 
       <Sheet open={Boolean(selected)} onOpenChange={(open) => { if (!open) closeVm() }}>
         <SheetContent className="w-[min(980px,96vw)] sm:max-w-none">
