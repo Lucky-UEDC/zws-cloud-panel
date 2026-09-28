@@ -163,32 +163,53 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
       metadata: { nodeId: id, templateId: template.id, sourceVmid, newVmid, name, result },
     }).catch(() => null)
     return NextResponse.json({ success: true, action, nodeId: id, template: serializeOperatingSystem(template), result, refreshedAt: new Date().toISOString() }, { headers: NO_CACHE_HEADERS })
-  } else if (action === "rebuild_cloudinit") {
+  } else if (action === "verify_guest_agent") {
+    // Replaces "rebuild cloudinit".
+    //
+    // Regenerating a cloud-init disk prepared a guest the platform no longer
+    // configures that way. What a template actually needs now is a working
+    // QEMU Guest Agent channel, because that is the only channel guest
+    // automation uses. A template VM is not running, so all that can be checked
+    // from the host is that the channel is enabled; whether the agent is really
+    // installed inside the image is proven on the first clone, not asserted here.
     const vmid = Number(template.proxmoxVmid || 0)
-    if (!vmid) return NextResponse.json({ success: false, error: "Template VMID is required to rebuild cloud-init." }, { status: 400, headers: NO_CACHE_HEADERS })
-    if (text(body.confirm).toLowerCase() !== "rebuild") {
-      return NextResponse.json({ success: false, error: "Type rebuild to confirm cloud-init regeneration." }, { status: 400, headers: NO_CACHE_HEADERS })
+    if (!vmid) return NextResponse.json({ success: false, error: "Template VMID is required." }, { status: 400, headers: NO_CACHE_HEADERS })
+    if (text(body.confirm).toLowerCase() !== "verify") {
+      return NextResponse.json({ success: false, error: "Type verify to confirm the guest agent check." }, { status: 400, headers: NO_CACHE_HEADERS })
     }
     const client = createProxmoxClient(node.host, node.tokenId, node.tokenSecret, {
       allowInsecureTls: node.allowInsecureTls,
       timeoutMs: PROXMOX_LONG_TIMEOUT_MS,
     })
-    const result = await client.updateCloudInit(node.nodeName, vmid)
     const config = await client.getVMConfig(node.nodeName, vmid).catch(() => null)
+    const agentChannelEnabled = config
+      ? Object.entries(config).some(([key, value]) => /^agent(\d+)?$/i.test(key) && Number(value) === 1)
+      : false
+    if (config && !agentChannelEnabled) {
+      await client.updateVMConfig(node.nodeName, vmid, { agent: "1" }).catch(() => null)
+    }
+    const refreshed = config && !agentChannelEnabled ? await client.getVMConfig(node.nodeName, vmid).catch(() => config) : config
+    const result = {
+      vmid,
+      agentChannelEnabledBefore: agentChannelEnabled,
+      agentChannelEnabledAfter: refreshed
+        ? Object.entries(refreshed).some(([key, value]) => /^agent(\d+)?$/i.test(key) && Number(value) === 1)
+        : false,
+      note: "Guest automation configures the guest through qm guest; the QEMU guest agent must be installed inside the image.",
+    }
     updated = await prisma.osTemplate.update({
       where: { id: template.id },
       data: {
-        cloudInitSupported: config ? cloudInitSupported(config) : true,
-        proxmoxConfig: config || template.proxmoxConfig || undefined,
+        proxmoxConfig: refreshed || template.proxmoxConfig || undefined,
         lastSyncedAt: new Date(),
       },
     })
     await createPanelLog({
       category: "Compute Node",
-      message: "node_template_cloudinit_rebuilt",
+      message: "node_template_guest_agent_verified",
       actorType: "admin",
       actorEmail: String(admin.email),
-      metadata: { nodeId: id, templateId: template.id, vmid, result },
+      metadata: { nodeId: id, templateId: template.id, ...result },
     }).catch(() => null)
   } else if (action === "refresh_storage_mapping") {
     const vmid = Number(template.proxmoxVmid || 0)

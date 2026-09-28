@@ -112,6 +112,17 @@ export class GuestAutomationService {
     return this.ctx.vmid
   }
 
+  /**
+   * The Proxmox connection this service talks over.
+   *
+   * Exposed so a caller that needs to probe the agent directly (the first-boot
+   * wait loop) uses the same authenticated client the service does, rather than
+   * opening a second connection with its own credentials.
+   */
+  get proxmoxClient(): ProxmoxGuestClient {
+    return this.client
+  }
+
   // -------------------------------------------------------------------------
   // Discovery
   // -------------------------------------------------------------------------
@@ -579,16 +590,20 @@ export class GuestAutomationService {
   }
 
   /** First-boot automation: run the full sequence once, verify, then activate. */
-  async firstBoot(input: { desired: PlanRequest["desired"]; metadata?: Record<string, unknown> | null; actor?: Actor }) {
+  async firstBoot(
+    input: { desired: PlanRequest["desired"]; metadata?: Record<string, unknown> | null; actor?: Actor },
+  ): Promise<{ ok: false; errorCode: GuestErrorCode; message: string; runId: null; steps: [] } | RunResult> {
     const planned = await this.plan({ desired: input.desired, mode: "first_boot", metadata: input.metadata })
-    if (!planned.ok) return { ok: false as const, errorCode: planned.errorCode, message: planned.message, runId: null as string | null, steps: [] }
+    if (!planned.ok) return { ok: false, errorCode: planned.errorCode, message: planned.message, runId: null, steps: [] }
     return this.executePlan({ plan: planned.plan, trigger: "first_boot", actor: input.actor })
   }
 
   /** A customer change: only the affected operations are planned and run. */
-  async applyChange(input: { desired: PlanRequest["desired"]; actor?: Actor; metadata?: Record<string, unknown> | null }) {
+  async applyChange(
+    input: { desired: PlanRequest["desired"]; actor?: Actor; metadata?: Record<string, unknown> | null },
+  ): Promise<{ ok: false; errorCode: GuestErrorCode; message: string; runId: null; steps: [] } | RunResult> {
     const planned = await this.plan({ desired: input.desired, mode: "change", metadata: input.metadata })
-    if (!planned.ok) return { ok: false as const, errorCode: planned.errorCode, message: planned.message, runId: null as string | null, steps: [] }
+    if (!planned.ok) return { ok: false, errorCode: planned.errorCode, message: planned.message, runId: null, steps: [] }
     return this.executePlan({ plan: planned.plan, trigger: "customer_change", actor: input.actor })
   }
 
@@ -596,8 +611,12 @@ export class GuestAutomationService {
   // Single operations
   // -------------------------------------------------------------------------
 
-  async setIP(input: { ip: string; prefix: number; gateway: string; dns?: string[]; actor?: Actor; metadata?: Record<string, unknown> | null }) {
-    return this.applyChange({ desired: { ip: input.ip, prefix: input.prefix, gateway: input.gateway, dns: input.dns }, actor: input.actor, metadata: input.metadata })
+  async setIP(input: { ip: string; prefix: number; gateway: string; dns?: string[]; searchDomain?: string; actor?: Actor; metadata?: Record<string, unknown> | null }) {
+    return this.applyChange({
+      desired: { ip: input.ip, prefix: input.prefix, gateway: input.gateway, dns: input.dns, searchDomain: input.searchDomain },
+      actor: input.actor,
+      metadata: input.metadata,
+    })
   }
 
   async setDNS(input: { dns: string[]; searchDomain?: string; actor?: Actor; metadata?: Record<string, unknown> | null }) {

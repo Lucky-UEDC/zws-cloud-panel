@@ -523,11 +523,20 @@ export async function validateProvisioningPreflight(input: PlacementInput) {
     metadata: { templateId: template?.id || null, vmid: template?.proxmoxVmid || null },
   })
 
+  // Replaces the Cloud-Init capability check. Guest automation configures the
+  // server through the QEMU guest agent, so the channel being open is what
+  // matters. Whether the agent is installed inside the image cannot be checked
+  // from the host and is proven on the first clone.
+  const guestAgentChannel = Object.entries((templateConfig as any) || {}).some(
+    ([key, value]) => /^agent(\d+)?$/i.test(key) && Number(value) === 1,
+  )
   checks.push({
-    name: "cloud_init",
-    ok: Boolean(template?.cloudInitSupported || (templateConfig as any)?.ide2 || (templateConfig as any)?.scsi1 || (templateConfig as any)?.sata0),
-    message: "Cloud-init capability checked",
-    metadata: { cloudInitSupported: Boolean(template?.cloudInitSupported), ide2: Boolean((templateConfig as any)?.ide2), scsi1: Boolean((templateConfig as any)?.scsi1) },
+    name: "guest_agent",
+    ok: guestAgentChannel,
+    message: guestAgentChannel
+      ? "Guest agent channel is enabled on the template"
+      : "Guest agent channel is not enabled on the template; guest automation cannot configure servers cloned from it",
+    metadata: { agent: guestAgentChannel, osType: template?.osType || null },
   })
 
   const memoryTotal = Number((apiStatus as any)?.memory?.total || 0)

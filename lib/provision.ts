@@ -15,7 +15,6 @@ import { recoverIpBlockedProvisioning } from "@/lib/provisioning-ipam-recovery"
 import { normalizeOsFamily } from "@/lib/os-template-normalization"
 import { isWindowsOsTemplate, resolveAvailableOsTemplate } from "@/lib/os-template-availability"
 import { acquireNodeWorkerSlot, recoverNodeWorkerSlots, releaseNodeWorkerSlot } from "@/lib/node-workers"
-import { buildCloudInitConfig, validateCloudInitDump, validateCloudInitPreBoot } from "@/lib/cloud-init-config"
 import { buildVmNotes } from "@/lib/proxmox-tags"
 import {
   STEP_LABELS,
@@ -35,7 +34,10 @@ import { calculateInvoiceTotals, invoiceTaxWriteFields } from "@/lib/invoices/ta
 import { discoverVmIpAddress } from "@/lib/vm-ip-discovery"
 import { assertPaymentVerifiedForProvisioning } from "@/lib/payment-state"
 import { persistVpsConsoleMetadata } from "@/lib/console-metadata"
-import { ensureCloudInitBeforeStart } from "@/lib/vps-control"
+import { ensureGuestBeforeStartAction } from "@/lib/vps-control"
+import { buildPreBootVmConfig, guestContextFor, runFirstBoot } from "@/lib/guest-automation/first-boot"
+import { GuestAutomationService } from "@/lib/guest-automation/service"
+import { GUEST_ERROR_MESSAGES } from "@/lib/guest-automation/constants"
 import { hostnameFromIp, normalizeServerTag } from "@/lib/vm-hostname"
 import { expandGuestPrimaryDisk, waitForGuestExec } from "@/lib/vm-guest-disk"
 import { resolveVmGuestOs, type VmGuestOsKind } from "@/lib/vm-os-detection"
@@ -638,20 +640,106 @@ type ProvisioningHardGateInput = {
   expectedHostname?: string | null
   sshKeyRequired?: boolean
   isWindows: boolean
-  cloudInitEvidence?: unknown
+  /** Result of the guest-automation run that configured the guest. */
+  guestAutomationEvidence?: unknown
+}
+
+/**
+ * Prove the guest is configured, before anything is called delivered.
+ *
+ * The Cloud-Init version asserted that `ciuser`, `cipassword` and `nameserver`
+ * were present in the Proxmox config, that a cloud-init disk was attached, and
+ * that `qm cloudinit dump user` was non-empty. Every one of those checks is
+ * gone: none of those fields are written any more.
+ *
+ * What replaces them is the only statement that can be wrong if the guest is
+ * wrong — the guest's own report. The account must exist (read back through
+ * `get-users`), the OS must be one we have a profile for, and the address must
+ * match the allocation.
+ */
+async function verifyGuestConfigured(input: {
+  jobId: string
+  client: ProxmoxClient
+  nodeName: string
+  vmid: number
+  vpsInstanceId: string
+  node: { nodeName: string; host: string; tokenId: string; tokenSecret: string; allowInsecureTls?: boolean | null }
+  metadata: Record<string, unknown> | null
+  expectedUser: string
+  expectedIp: string
+  isWindows: boolean
+}) {
+  const service = new GuestAutomationService(guestContextFor({ vpsInstanceId: input.vpsInstanceId, vmid: input.vmid, node: input.node }))
+  const detected = await service.detectOs(input.metadata)
+  if (detected.kind === "unknown") {
+    throw new Error(`guest_verify_os_detection_failed: ${GUEST_ERROR_MESSAGES.OS_DETECTION_UNAVAILABLE}`)
+  }
+  const resolved = await service.getTemplate(detected)
+  if (!resolved.ok) {
+    throw new Error(`guest_verify_template_failed: ${resolved.code}`)
+  }
+  const state = await service.getState(detected.engine)
+  const guestUsers = state.users.map((user) => String(user).toLowerCase())
+  const wanted = String(input.expectedUser).toLowerCase()
+  // Windows keeps the requested account; a Linux template may provision either
+  // the requested user or root, so either match is acceptance.
+  const userPresent = guestUsers.includes(wanted) || (detected.engine === "linux" && guestUsers.includes("root"))
+  const ipPresent = state.ipv4.includes(input.expectedIp)
+  const lastRun = await prisma.guestAutomationRun
+    .findFirst({ where: { vpsInstanceId: input.vpsInstanceId }, orderBy: { startedAt: "desc" }, select: { id: true } })
+    .catch(() => null)
+
+  await logJob(input.jobId, {
+    step: "VERIFYING_VM",
+    event: "guest_automation:verify",
+    level: userPresent && ipPresent ? "info" : "error",
+    message: userPresent && ipPresent ? "Guest automation verification passed" : "Guest automation verification failed",
+    response: {
+      vmid: input.vmid,
+      os: detected.osId,
+      osVersion: detected.version,
+      engine: detected.engine,
+      template: resolved.template.name,
+      templateVersion: resolved.template.version,
+      hostname: state.hostname,
+      primaryInterface: state.primaryInterface,
+      guestIps: state.ipv4,
+      expectedIp: input.expectedIp,
+      userPresent,
+      wantedUser: input.expectedUser,
+      users: guestUsers,
+    },
+  })
+
+  if (!userPresent) throw new Error(`guest_verify_user_missing: ${input.expectedUser}`)
+  if (!ipPresent) throw new Error(`guest_verify_ip_missing: ${input.expectedIp}`)
+  return { runId: lastRun?.id ?? null, detected, template: resolved.template, state }
+}
+
+/**
+ * Authoritative OS metadata for a provisioning job.
+ *
+ * Only ever a fallback: the guest agent's `get-osinfo` is what the automation
+ * layer treats as truth, and this just narrows the template choice when the
+ * agent answers with a generic id.
+ */
+function guestOsMetadataFor(template: any): Record<string, unknown> {
+  return {
+    osType: template?.osType ?? null,
+    osFamily: template?.osFamily ?? templateFamilySearch(template) ?? null,
+    osCategory: template?.osCategory ?? null,
+    osName: template?.name ?? null,
+    osVersion: template?.osVersion ?? null,
+    templateName: template?.proxmoxTemplateName ?? template?.name ?? null,
+  }
 }
 
 async function verifyProvisioningHardGate(input: ProvisioningHardGateInput) {
   const vm = await verifyVm(input.client, input.nodeName, input.vmid)
   if (!vm.exists) throw new Error("provisioning_gate_vm_missing")
   const config = (vm.config || {}) as Record<string, any>
-  const ipconfig0 = String(config.ipconfig0 || "")
-  const nameserver = String(config.nameserver || "")
-  const searchdomain = String(config.searchdomain || "")
-  const cipassword = String(config.cipassword || "")
   const net0 = String(config.net0 || "")
   const macAddress = macFromNet0(net0)
-  const expectedIpConfig = `ip=${input.expectedIp}/${input.expectedCidr},gw=${input.expectedGateway}`
   const qga = await checkGuestAgent(input.client, input.nodeName, input.vmid)
   const guestNetwork = qga.ok
     ? await input.client.getVMGuestNetworkInterfaces(input.nodeName, input.vmid).catch((error) => ({ error: sanitizeProvisioningError(error) }))
@@ -662,32 +750,38 @@ async function verifyProvisioningHardGate(input: ProvisioningHardGateInput) {
   const attachedDevices = Object.entries(config).filter(([key]) => /^(scsi|virtio|sata|ide)\d+$/i.test(key))
   const osDiskAttached = attachedDevices.some(([, value]) => {
     const text = String(value || "").toLowerCase()
-    return text && !text.includes("cloudinit") && !text.includes("media=cdrom")
+    return Boolean(text) && !text.includes("cloudinit") && !text.includes("media=cdrom")
   })
+
+  // Guest-side evidence. An absent agent means absent proof, which is a failure
+  // rather than a warning: without the agent the guest cannot be configured at
+  // all, so delivery would be a VM nobody can reach.
+  const guestEvidence = qga.ok
+    ? await readGuestNetworkEvidence(input.client, input.nodeName, input.vmid, input.isWindows)
+    : { reachable: false as const, gateway: null, dns: [] as string[], searchDomain: null, hostname: null, sshAuthorized: false }
+
   const checks = {
     vmExists: true,
     running: String(vm.status?.status || "").toLowerCase() === "running",
     osDiskAttached,
-    cloudInitDriveAttached: hasCloudInitDrive(config),
-    cloudInitUserConfigPresent: input.isWindows || Boolean(String(config.ciuser || "").trim()),
-    cloudInitNetworkConfigPresent: Boolean(net0.trim() && ipconfig0.trim()),
-    sshKeyInjected: input.isWindows || !input.sshKeyRequired || Boolean(String(config.sshkeys || "").trim()),
-    passwordApplied: Boolean(cipassword.trim()),
-    ipApplied: ipconfig0 === expectedIpConfig || (ipconfig0.includes(input.expectedIp) && ipconfig0.includes(input.expectedGateway)),
-    gatewayApplied: ipconfig0.includes(input.expectedGateway),
-    dnsApplied: Boolean(nameserver.trim()),
-    searchDomainApplied: input.expectedSearchDomain ? searchdomain === input.expectedSearchDomain : true,
+    guestAgentOnline: qga.ok,
+    guestIpApplied: guestIps.includes(input.expectedIp),
+    guestGatewayApplied: Boolean(guestEvidence.gateway) && String(guestEvidence.gateway) === input.expectedGateway,
+    guestDnsApplied: hasExpectedDns(guestEvidence.dns, input.expectedDns),
     bridgeApplied: input.expectedBridge ? net0.includes(`bridge=${input.expectedBridge}`) : true,
     macPresent: Boolean(macAddress),
     macFresh: Boolean(macAddress) && (!input.templateMac || macAddress !== normalizeMac(input.templateMac)),
     macExpected: input.expectedMac ? macAddress === normalizeMac(input.expectedMac) : true,
   }
+  // Guest metadata a customer may legitimately change: reported, never blocking.
   const warnings = {
-    guestAgentOnline: qga.ok,
-    guestIpReported: guestIps.length > 0,
-    guestIpMatches: guestIps.includes(input.expectedIp),
+    guestSearchDomainApplied: input.expectedSearchDomain ? String(guestEvidence.searchDomain || "") === input.expectedSearchDomain : true,
+    guestHostnameApplied: input.expectedHostname
+      ? String(guestEvidence.hostname || "").toLowerCase().includes(String(input.expectedHostname).toLowerCase())
+      : true,
     networkReachable: reachability.ok,
   }
+
   await logJob(input.jobId, {
     step: "VERIFYING_VM",
     event: "provisioning_hard_gate",
@@ -697,18 +791,15 @@ async function verifyProvisioningHardGate(input: ProvisioningHardGateInput) {
       checks,
       warnings,
       vmid: input.vmid,
-      ipconfig0,
-      nameserver,
-      searchdomain,
       net0,
       macAddress,
       expectedMac: input.expectedMac || null,
       templateMac: input.templateMac || null,
-      sshKeyRequired: Boolean(input.sshKeyRequired),
       qga: qga.ok ? { ok: true } : { ok: false, error: qga.error },
       guestNetwork: { ips: guestIps, raw: guestNetwork },
+      guestEvidence,
       reachability: { ...reachability, port: tcpPort },
-      cloudInitEvidence: input.cloudInitEvidence || null,
+      guestAutomationEvidence: input.guestAutomationEvidence || null,
     },
   })
   await (prisma as any).vmAuditLog.create({
@@ -724,38 +815,14 @@ async function verifyProvisioningHardGate(input: ProvisioningHardGateInput) {
       targetType: "vps_instance",
       targetId: input.vpsInstanceId,
       status: Object.values(checks).every(Boolean) ? "SUCCESS" : "FAILED",
+      // Proof, not secrets: no password and no injected config appears here.
       metadata: { checks, warnings, macAddress, expectedMac: input.expectedMac || null, templateMac: input.templateMac || null, reachability, guestIps },
     },
   }).catch(() => null)
   const failed = Object.entries(checks).filter(([, ok]) => !ok).map(([key]) => key)
   if (failed.length) throw new Error(`provisioning_hard_gate_failed: ${failed.join(", ")}`)
 
-  // Warning-only checks — do not block delivery but provide observability
-  if (qga.ok && input.expectedHostname) {
-    const hostnameCheckResult = await (async () => {
-      try {
-        const exec = await input.client.execVMGuestCommand(input.nodeName, input.vmid,
-          input.isWindows
-            ? ["powershell", "-NoProfile", "-Command", "(Get-ComputerInfo).CsName"]
-            : ["hostname"]
-        )
-        const st = exec?.pid ? await waitForGuestExec(input.client, input.nodeName, input.vmid, Number(exec.pid), 15_000) : null
-        const out = String(st?.result?.["out-data"] || "").trim().toLowerCase()
-        const expected = String(input.expectedHostname).toLowerCase()
-        return { ok: out.includes(expected), actual: out, expected }
-      } catch {
-        return { ok: false, actual: null, expected: input.expectedHostname }
-      }
-    })()
-    await logJob(input.jobId, {
-      step: "VERIFYING_VM",
-      event: "gate:hostname_check",
-      level: "info",
-      message: hostnameCheckResult.ok ? `Hostname observed: ${hostnameCheckResult.actual}` : `Hostname differs (informational only) — expected: ${hostnameCheckResult.expected}, got: ${hostnameCheckResult.actual}`,
-      response: { ...hostnameCheckResult, vmid: input.vmid, orderId: input.orderId || null, node: input.nodeName, blocking: false },
-    })
-  }
-
+  // Warning-only observability: internet egress is nice to have, not required.
   if (qga.ok) {
     const internetCheckResult = await (async () => {
       try {
@@ -782,6 +849,87 @@ async function verifyProvisioningHardGate(input: ProvisioningHardGateInput) {
   }
 
   return { ok: true, checks, macAddress }
+}
+
+type GuestNetworkEvidence = {
+  reachable: boolean
+  gateway: string | null
+  dns: string[]
+  searchDomain: string | null
+  hostname: string | null
+}
+
+/**
+ * Read the guest's own view of its network.
+ *
+ * `get-host-name` is a native verb and costs nothing. The default gateway, the
+ * resolver list and the search domain are only exposed by a guest-exec, so one
+ * OS-appropriate command covers all three — chosen from the engine, never
+ * guessed. A failure here yields empty values, which the gate then reports as an
+ * explicit failed check rather than silently passing.
+ */
+async function readGuestNetworkEvidence(
+  client: ProxmoxClient,
+  nodeName: string,
+  vmid: number,
+  isWindows: boolean,
+): Promise<GuestNetworkEvidence> {
+  const hostnameRaw = await client.guestCmd(nodeName, vmid, "get-host-name").catch(() => null)
+
+  let gateway: string | null = null
+  let dns: string[] = []
+  let searchDomain: string | null = null
+
+  try {
+    const started = isWindows
+      ? await client.execVMGuestCommand(nodeName, vmid, [
+          "powershell",
+          "-NoProfile",
+          "-Command",
+          "$c = Get-NetIPConfiguration | Where-Object { $_.IPv4Address } | Select-Object -First 1; Write-Output ('GW=' + $c.IPv4DefaultGateway.NextHop); Write-Output ('DNS=' + ($c.DNSServer.ServerAddresses -join ',')); Write-Output ('SEARCH=' + $c.DNSDomain)",
+        ])
+      : await client.execVMGuestCommand(nodeName, vmid, [
+          "sh",
+          "-c",
+          "ip route show default 2>/dev/null | head -1; echo ---; cat /etc/resolv.conf 2>/dev/null",
+        ])
+    const status = started?.pid ? await waitForGuestExec(client, nodeName, vmid, Number(started.pid), 20_000) : null
+    const raw = String(status?.result?.["out-data"] || "")
+    if (isWindows) {
+      gateway = raw.match(/GW=([^\r\n]*)/)?.[1]?.trim() || null
+      dns = splitList(raw.match(/DNS=([^\r\n]*)/)?.[1] || "")
+      searchDomain = raw.match(/SEARCH=([^\r\n]*)/)?.[1]?.trim() || null
+    } else {
+      const [route, resolver = ""] = raw.split(/^---$/m)
+      gateway = route?.match(/via\s+(\S+)/)?.[1]?.trim() || null
+      dns = splitList(resolver.replace(/#.*/g, "\n").replace(/^nameserver\s+/gim, ""))
+      searchDomain = resolver.replace(/#.*/g, "").match(/^search\s+(.+)$/im)?.[1]?.trim().split(/\s+/)[0] || null
+    }
+  } catch {
+    // Left empty on purpose: the gate turns missing evidence into a failed check.
+  }
+
+  return {
+    reachable: true,
+    gateway,
+    dns,
+    searchDomain,
+    hostname: hostnameRaw?.data ? String((hostnameRaw.data as any)?.name || "") || null : null,
+  }
+}
+
+function splitList(value: string): string[] {
+  return String(value || "")
+    .split(/[,\s]+/)
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+}
+
+function hasExpectedDns(observed: string[], expected?: string | null): boolean {
+  if (!expected) return true
+  const want = splitList(String(expected))
+  if (!want.length) return true
+  return want.every((value) => observed.includes(value))
 }
 
 async function verifyProvisioningHardGateWithConvergence(input: ProvisioningHardGateInput & {
@@ -821,7 +969,6 @@ async function verifyProvisioningHardGateWithConvergence(input: ProvisioningHard
         },
       })
 
-      await input.client.updateCloudInit(input.nodeName, input.vmid).catch(() => undefined)
       if (!vm.exists || status !== "running") {
         await input.client.startVM(input.nodeName, input.vmid).catch(() => undefined)
       } else if (shouldReboot) {
@@ -855,11 +1002,30 @@ async function canonicalNetworkForVps(vps: any) {
   return { ip: String(ip), gateway: String(gateway), cidr, dns: String(dns), bridge: String(bridge) }
 }
 
+/**
+ * Converge the guest's network until it reports the allocated address.
+ *
+ * The old version of this loop wrote `ipconfig0`/`nameserver` and ran
+ * `qm cloudinit update` on every attempt, then rebooted the VM hoping the
+ * cloud-init disk would apply itself. It also treated a missing cloud-init disk
+ * as a failure condition, which is now meaningless.
+ *
+ * The retry is now idempotent in the only way that helps: ask the guest what it
+ * currently has, and if it disagrees with the allocation, re-apply through its
+ * own OS profile. A second application is a no-op because the plan is
+ * change-driven, so a converging guest simply stops being corrected.
+ */
 async function retryLinuxNetworkVerification(input: {
   jobId: string
   client: ProxmoxClient
   nodeName: string
+  vpsInstanceId: string
+  node: { nodeName: string; host: string; tokenId: string; tokenSecret: string; allowInsecureTls?: boolean | null }
   vmid: number
+  metadata?: Record<string, unknown> | null
+  hostname: string
+  username: string
+  password: string
   expectedIp: string
   expectedCidr: number
   expectedGateway: string
@@ -869,111 +1035,119 @@ async function retryLinuxNetworkVerification(input: {
   attempts?: number
 }) {
   const maxAttempts = Math.max(1, Number(input.attempts || 5))
-  const expectedIpConfig = `ip=${input.expectedIp}/${input.expectedCidr},gw=${input.expectedGateway}`
-  let lastError = "linux_network_verify_unknown_failure"
+  const desiredDns = splitList(String(input.expectedDns || "1.1.1.1"))
+  let lastError = "guest_network_verify_unknown_failure"
   let rebootRequested = false
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     const vm = await verifyVm(input.client, input.nodeName, input.vmid).catch(() => ({ exists: false, status: null, config: null as any }))
     const vmConfig = (vm.config || {}) as Record<string, any>
-    const ipConfigValue = String(vmConfig.ipconfig0 || "")
     const bridgeValue = String(vmConfig.net0 || "")
-    const hasDrive = hasCloudInitDrive(vmConfig)
     const qga = await checkGuestAgent(input.client, input.nodeName, input.vmid)
     const guestNetwork = qga.ok
       ? await input.client.getVMGuestNetworkInterfaces(input.nodeName, input.vmid).catch((error) => ({ error: sanitizeProvisioningError(error) }))
       : null
     const guestIps = extractGuestIpv4Addresses(guestNetwork)
     const guestIpMatches = guestIps.includes(input.expectedIp)
-    const hasIp = ipConfigValue.includes(input.expectedIp)
-    const hasExpectedIpConfig = ipConfigValue === expectedIpConfig
     const hasBridge = input.expectedBridge ? bridgeValue.includes(`bridge=${input.expectedBridge}`) : true
 
     await logJob(input.jobId, {
       step: "VERIFYING_VM",
-      event: "linux_network_retry:status",
-      level: qga.ok && hasDrive && hasIp && hasBridge && guestIpMatches ? "info" : "warn",
-      message: `Linux network verification retry attempt ${attempt}/${maxAttempts}`,
+      event: "guest_network_retry:status",
+      level: qga.ok && hasBridge && guestIpMatches ? "info" : "warn",
+      message: `Guest network verification attempt ${attempt}/${maxAttempts}`,
       response: {
         vmExists: vm.exists,
-        hasCloudInitDrive: hasDrive,
         qgaOk: qga.ok,
         guestIps,
         guestIpMatches,
-        ipConfigValue,
-        hasIp,
-        hasExpectedIpConfig,
+        expectedIp: input.expectedIp,
         hasBridge,
         bridgeValue,
       },
     })
 
-    if (vm.exists && hasDrive && qga.ok && hasIp && hasBridge && guestIpMatches) {
-      if (!hasExpectedIpConfig || !String(vmConfig.nameserver || "").trim()) {
-        await input.client.updateVMConfig(input.nodeName, input.vmid, {
-          ipconfig0: expectedIpConfig,
-          nameserver: input.expectedDns || "1.1.1.1",
-          ...(input.expectedSearchDomain ? { searchdomain: input.expectedSearchDomain } : {}),
-        }).catch((error) => {
-          lastError = sanitizeProvisioningError(error)
-        })
-        await input.client.updateCloudInit(input.nodeName, input.vmid).catch(() => undefined)
-      }
-      return { ok: true, attempt }
-    }
+    if (vm.exists && qga.ok && hasBridge && guestIpMatches) return { ok: true, attempt }
 
-    const configNeedsRewrite = !hasIp || !hasExpectedIpConfig || !String(vmConfig.nameserver || "").trim()
-    if (!hasDrive) {
-      await input.client.updateCloudInit(input.nodeName, input.vmid).catch(() => undefined)
-    }
-    if (configNeedsRewrite) {
-      await input.client.updateVMConfig(input.nodeName, input.vmid, {
-        ipconfig0: expectedIpConfig,
-        nameserver: input.expectedDns || "1.1.1.1",
-        ...(input.expectedSearchDomain ? { searchdomain: input.expectedSearchDomain } : {}),
-      }).catch((error) => {
-        lastError = sanitizeProvisioningError(error)
-      })
-      await input.client.updateCloudInit(input.nodeName, input.vmid).catch(() => undefined)
-    }
+    if (!qga.ok) lastError = qga.error || "guest_agent_unreachable"
+    if (!guestIpMatches) lastError = `guest_ip_mismatch:${guestIps.join(",") || "none"}`
+
+    // The bridge is a host-side fact, so the host fixes it. Everything the guest
+    // owns is re-applied through the guest's own OS template.
     if (!hasBridge && input.expectedBridge) {
       const net0 = String(vmConfig.net0 || "")
       const modelPart = net0.includes(",") ? net0.split(",")[0] : net0 || "virtio"
-      const withBridge = `${modelPart},bridge=${input.expectedBridge}`
-      await input.client.updateVMConfig(input.nodeName, input.vmid, { net0: withBridge }).catch((error) => {
-        lastError = sanitizeProvisioningError(error)
-      })
+      await input.client
+        .updateVMConfig(input.nodeName, input.vmid, { net0: `${modelPart},bridge=${input.expectedBridge}` })
+        .catch((error) => {
+          lastError = sanitizeProvisioningError(error)
+        })
     }
 
+    if (qga.ok && !guestIpMatches) {
+      const service = new GuestAutomationService(
+        guestContextFor({ vpsInstanceId: input.vpsInstanceId, vmid: input.vmid, node: input.node }),
+      )
+      const result = await service.applyChange({
+        desired: {
+          ip: input.expectedIp,
+          prefix: Number(input.expectedCidr || 24),
+          gateway: input.expectedGateway,
+          dns: desiredDns,
+          searchDomain: input.expectedSearchDomain ?? undefined,
+          hostname: input.hostname,
+          username: input.username,
+          password: input.password,
+        },
+        metadata: input.metadata ?? null,
+        actor: { requestedBy: "system:provision-network-retry", role: "system" },
+      })
+      if (!("message" in result) && result.ok) {
+        const applied = result.steps.filter((step) => step.status === "success").map((step) => step.operation)
+        if (applied.length) {
+          await logJob(input.jobId, {
+            step: "VERIFYING_VM",
+            event: "guest_network_retry:reapplied",
+            message: "Re-applied network through guest automation",
+            response: { attempt, runId: result.runId, operations: applied, os: result.detected.osId, template: result.template?.name || null },
+          })
+        }
+      } else {
+        lastError = "message" in result ? `${result.errorCode}` : `guest_apply_failed:${result.errorCode}`
+        await logJob(input.jobId, {
+          step: "VERIFYING_VM",
+          event: "guest_network_retry:reapply_failed",
+          level: "warn",
+          message: "Guest automation could not re-apply the network",
+          response: { attempt, errorCode: "message" in result ? result.errorCode : result.errorCode },
+        })
+      }
+    }
+
+    // A guest that has the right config but not the right address usually has
+    // the change staged and unapplied. One reboot settles it; more than one does
+    // not, so it is requested at most once per job.
     let settleMs = 4000
-    if (vm.exists && qga.ok && hasDrive && hasIp && hasBridge && !guestIpMatches && !rebootRequested) {
+    if (vm.exists && qga.ok && guestIpMatches === false && !rebootRequested && attempt > 1) {
       rebootRequested = true
       settleMs = 20000
       await logJob(input.jobId, {
         step: "VERIFYING_VM",
-        event: "linux_network_retry:reboot_for_cloud_init",
+        event: "guest_network_retry:reboot",
         level: "warn",
-        message: "Guest IP does not match cloud-init config; rebooting VM to reapply network state",
-        response: { expectedIp: input.expectedIp, guestIps, ipConfigValue },
+        message: "Guest still reports a different address after re-applying network; rebooting once to settle it",
+        response: { expectedIp: input.expectedIp, guestIps },
       })
-      await input.client.updateCloudInit(input.nodeName, input.vmid).catch(() => undefined)
       await input.client.rebootVM(input.nodeName, input.vmid).catch(async () => {
         await input.client.resetVM(input.nodeName, input.vmid).catch(() => undefined)
       })
     }
 
-    if (!qga.ok) {
-      await input.client.startVM(input.nodeName, input.vmid).catch(() => undefined)
-    }
-
+    if (!qga.ok) await input.client.startVM(input.nodeName, input.vmid).catch(() => undefined)
     await new Promise((resolve) => setTimeout(resolve, settleMs))
-    if (!qga.ok) lastError = qga.error || "guest_agent_unreachable"
-    if (!hasDrive) lastError = "cloudinit_drive_missing"
-    if (!hasIp) lastError = "ip_discovery_missing"
-    if (!guestIpMatches) lastError = `guest_ip_mismatch:${guestIps.join(",") || "none"}`
   }
 
-  throw new Error(`cloudinit_network_retry_exhausted: ${lastError}`)
+  throw new Error(`guest_network_retry_exhausted: ${lastError}`)
 }
 
 async function runTaskOperation(
@@ -1014,146 +1188,29 @@ function templateFamilySearch(template: any) {
   ].filter(Boolean).join(" ")
 }
 
-function hasCloudInitDrive(config: Record<string, any> | null | undefined) {
-  const keys = Object.keys(config || {})
-  for (const key of keys) {
-    if (!/^(ide\d+|scsi\d+|sata\d+)$/i.test(key)) continue
-    if (String((config as any)?.[key] || "").toLowerCase().includes("cloudinit")) return true
-  }
-  return false
-}
-
-function cloudInitDiskKey(config: Record<string, any> | null | undefined) {
-  const keys = Object.keys(config || {})
-  for (const key of keys) {
-    if (!/^(ide\d+|scsi\d+|sata\d+)$/i.test(key)) continue
-    if (String((config as any)?.[key] || "").toLowerCase().includes("cloudinit")) return key.toLowerCase()
-  }
-  return null
-}
-
-function slotOccupied(config: Record<string, any> | null | undefined, slot: string) {
-  return Boolean(String((config as any)?.[slot] || "").trim())
-}
-
-function nextFreeSataSlot(config: Record<string, any> | null | undefined) {
-  for (let index = 0; index <= 5; index += 1) {
-    const key = `sata${index}`
-    if (!slotOccupied(config, key)) return key
-  }
-  return null
-}
-
-function uniqueValues(values: Array<string | null | undefined>) {
-  const out: string[] = []
-  const seen = new Set<string>()
-  for (const value of values) {
-    const next = String(value || "").trim()
-    if (!next) continue
-    if (seen.has(next)) continue
-    seen.add(next)
-    out.push(next)
-  }
-  return out
-}
-
-type LinuxCloudInitPreflight = {
-  storages: string[]
-  fallbackOrder: string[]
-  existingCloudInitBus: string | null
-}
-
-function buildStructuredLinuxCloudInitError(code: string, message: string, details?: Record<string, unknown>) {
-  const error = new Error(`${code}: ${message}`)
-  ;(error as any).code = code
-  ;(error as any).details = details || null
-  return error
-}
-
-async function validateLinuxCloudInitPreflight(input: {
-  client: ProxmoxClient
-  nodeName: string
-  vmid: number
-  template: any
-  cloudInitStorage?: string | null
-}) : Promise<LinuxCloudInitPreflight> {
-  if (!input.template) throw buildStructuredLinuxCloudInitError("cloudinit_template_missing", "Linux template is missing.")
-  if (input.template?.isActive === false) {
-    throw buildStructuredLinuxCloudInitError("cloudinit_template_inactive", "Selected Linux template is inactive.", { templateId: input.template?.id || null })
-  }
-  if (isWindowsOsTemplate(input.template)) {
-    throw buildStructuredLinuxCloudInitError("cloudinit_template_not_linux", "Linux cloud-init flow cannot run for Windows templates.")
-  }
-  if (input.template?.cloudInitSupported === false) {
-    throw buildStructuredLinuxCloudInitError("cloudinit_template_not_supported", "Template does not report cloud-init support.", { templateId: input.template?.id || null })
-  }
-  if (input.template?.qemuGuestAgentInstalled === false || input.template?.qemuGuestAgent === false) {
-    throw buildStructuredLinuxCloudInitError("cloudinit_qga_missing", "Template is missing qemu-guest-agent.", { templateId: input.template?.id || null })
-  }
-
-  const vmConfig = await input.client.getVMConfig(input.nodeName, input.vmid).catch(() => ({}))
-  const existingBus = cloudInitDiskKey(vmConfig)
-  const freeSata = nextFreeSataSlot(vmConfig)
-  if (!existingBus && slotOccupied(vmConfig, "ide2") && slotOccupied(vmConfig, "scsi1") && !freeSata) {
-    throw buildStructuredLinuxCloudInitError(
-      "cloudinit_no_free_slot",
-      "No free cloud-init disk slot available (ide2, scsi1, sata0-5).",
-      { vmid: input.vmid },
-    )
-  }
-
-  const nodeStorages = await input.client.getNodeStorage(input.nodeName).catch(() => [])
-  const activeStorages = Array.isArray(nodeStorages)
-    ? nodeStorages.filter((row: any) => Number(row?.enabled ?? 1) !== 0 && Number(row?.active ?? 1) !== 0).map((row: any) => String(row?.storage || "").trim()).filter(Boolean)
-    : []
-  const storageCandidates = uniqueValues([
-    input.cloudInitStorage,
-    input.template?.proxmoxStorage,
-    input.template?.storage,
-    ...activeStorages,
-  ])
-  if (!storageCandidates.length) {
-    throw buildStructuredLinuxCloudInitError("cloudinit_storage_invalid", "No compatible storage available for cloud-init disk.")
-  }
-  const unknownStorage = storageCandidates[0] && activeStorages.length ? !activeStorages.includes(storageCandidates[0]) : false
-  if (unknownStorage) {
-    throw buildStructuredLinuxCloudInitError(
-      "cloudinit_storage_invalid",
-      `Storage "${storageCandidates[0]}" is not active on node ${input.nodeName}.`,
-      { storage: storageCandidates[0], nodeName: input.nodeName },
-    )
-  }
-
-  const fallbackOrder = uniqueValues([
-    existingBus ? null : "ide2",
-    existingBus ? null : "scsi1",
-    existingBus ? null : freeSata,
-  ])
-  return {
-    storages: storageCandidates,
-    fallbackOrder: existingBus ? [existingBus] : fallbackOrder,
-    existingCloudInitBus: existingBus,
-  }
-}
-
-function linuxCloudInitError(error: unknown) {
-  const rawCode = String((error as any)?.code || "").trim()
-  const code = rawCode && rawCode !== "LINUX_CLOUD_INIT_VERIFY_FAILED" ? rawCode : "linux_cloud_init_failed"
-  const reason = sanitizeProvisioningError(error)
-  const details = (error as any)?.details || null
-  return Object.assign(new Error(`LINUX_CLOUD_INIT_VERIFY_FAILED:${code}: ${reason}`), {
-    code: "LINUX_CLOUD_INIT_VERIFY_FAILED",
-    linuxCode: code,
-    details,
-    manualReview: true,
-  })
-}
-
-function isLinuxCloudInitProvisioningError(error: unknown, template: any) {
+/**
+ * Failure classes that need an admin rather than a retry.
+ *
+ * The Cloud-Init equivalent keyed off `LINUX_CLOUD_INIT_VERIFY_FAILED`. The
+ * guest-automation equivalents are the states where automation could not finish
+ * and repeating it would only repeat the same failure: the OS is unknown, the OS
+ * has no enabled profile, the guest agent never answered, or a rollback left the
+ * guest's network in a state an admin must look at.
+ */
+function isGuestAutomationManualReviewError(error: unknown, template: any) {
   if (isWindowsOsTemplate(template)) return false
   const code = String((error as any)?.code || "")
   const message = error instanceof Error ? error.message : String(error || "")
-  return code === "LINUX_CLOUD_INIT_VERIFY_FAILED" || message.includes("LINUX_CLOUD_INIT_VERIFY_FAILED")
+  const blocked = [
+    "guest_verify_os_detection_failed",
+    "guest_verify_template_failed",
+    "NETWORK_RECOVERY_REQUIRED",
+    "os_detection_unavailable",
+    "os_template_missing",
+    "os_template_disabled",
+    "os_unsupported",
+  ]
+  return blocked.some((signal) => code.includes(signal) || message.toLowerCase().includes(signal.toLowerCase()))
 }
 
 function isProvisioningValidationFailure(reason: string) {
@@ -1170,314 +1227,56 @@ function isProvisioningValidationFailure(reason: string) {
   ].some((signal) => value.includes(signal))
 }
 
-async function applyCloudInitConfig(input: {
+/**
+ * Replace the Cloud-Init apply path with the guest-automation split.
+ *
+ * Before: one function wrote `ciuser`/`cipassword`/`ipconfig0`/`nameserver`/
+ * `searchdomain` plus a cloud-init drive, ran `qm cloudinit update`, then read
+ * back `qm cloudinit dump` to prove it had worked.
+ *
+ * After: the host writes only what the host owns (label, notes, MAC/bridge),
+ * and the guest configures itself through the OS template for the guest that
+ * actually answers. There is no dump to read back because there is no injected
+ * config to read back; the proof is the guest's own reported state.
+ */
+async function applyPreBootVmConfig(input: {
   jobId: string
   client: ProxmoxClient
   nodeName: string
   vmid: number
   template: any
-  username: string
-  password: string
-  hostname: string
-  ip: string
-  cidr: number
-  gateway: string
-  dns?: string | null
-  searchDomain?: string | null
-  cloudInitStorage?: string | null
-  sshPublicKey?: string | null
-  netBridge?: string | null
   macAddress?: string | null
+  netBridge?: string | null
   description?: string | null
   displayStatus?: string
 }) {
-  const built = buildCloudInitConfig({
-    vmid: input.vmid,
-    osFamily: templateFamilySearch(input.template),
-    username: input.username,
-    password: input.password,
-    hostname: input.hostname,
-    ip: input.ip,
-    cidr: input.cidr,
-    gateway: input.gateway,
-    dns: input.dns,
-    searchDomain: input.searchDomain,
-    cloudInitStorage: input.cloudInitStorage || input.template?.proxmoxStorage || input.template?.storage || null,
-    sshPublicKey: input.sshPublicKey,
-  })
   const config: Record<string, any> = {
     net0: net0Value(input.macAddress || null, input.netBridge || "vmbr0"),
-    ...built.config,
-    ...(input.description ? { description: input.description } : {}),
+    ...buildPreBootVmConfig({
+      vmid: input.vmid,
+      hostname: input.template?.name || `vm-${input.vmid}`,
+      description: input.description ?? null,
+      macAddress: input.macAddress || null,
+      netBridge: input.netBridge || null,
+    }),
   }
+  // The generated name from buildPreBootVmConfig is a host label. Keep whatever
+  // description the caller asked for and never let a ci*/ipconfig key in.
+  delete config.name
 
   await logJob(input.jobId, {
     step: "APPLYING_CLOUD_INIT",
-    event: "cloud_init:build",
-    message: `${built.family === "windows" ? "Windows Cloudbase-Init" : "Linux cloud-init"} configuration built`,
+    event: "vm_config:preboot",
+    message: "Applying host-side VM configuration",
     request: {
-      osTemplateId: input.template?.id || null,
-      osTemplateName: input.template?.name || null,
-      osFamily: built.family,
       vmid: input.vmid,
       nodeName: input.nodeName,
-      ip: input.ip,
-      cidr: input.cidr,
-      gateway: input.gateway,
-      dns: built.verification.expectedNameservers,
-      searchDomain: config.searchdomain,
-      username: built.username,
-      maskedCommands: built.maskedCommands,
-    },
-  })
-
-  if (built.family === "linux") {
-    try {
-      const preflight = await validateLinuxCloudInitPreflight({
-        client: input.client,
-        nodeName: input.nodeName,
-        vmid: input.vmid,
-        template: input.template,
-        cloudInitStorage: input.cloudInitStorage || input.template?.proxmoxStorage || input.template?.storage || null,
-      })
-      await logJob(input.jobId, {
-        step: "APPLYING_CLOUD_INIT",
-        event: "cloudinit_linux_preflight",
-        message: "Linux cloud-init preflight passed",
-        response: {
-          vmid: input.vmid,
-          storages: preflight.storages,
-          fallbackOrder: preflight.fallbackOrder,
-          existingCloudInitBus: preflight.existingCloudInitBus,
-        },
-      })
-      const attachRetryCount = 3
-      const attachRetryDelayMs = 5000
-      const attachFallbackOrder = preflight.fallbackOrder.length ? preflight.fallbackOrder : ["ide2", "scsi1"]
-      const expectedCloudInit = (storage: string) => `${storage}:cloudinit`
-      const attemptAttach = async () => {
-        const latestConfig = await input.client.getVMConfig(input.nodeName, input.vmid).catch(() => ({}))
-        if (hasCloudInitDrive(latestConfig)) return { attached: true, bus: cloudInitDiskKey(latestConfig) || preflight.existingCloudInitBus || "unknown" }
-
-        let lastAttachError: unknown = null
-        for (const storage of preflight.storages) {
-          for (const bus of attachFallbackOrder) {
-            for (let attempt = 1; attempt <= attachRetryCount; attempt += 1) {
-              const disk = expectedCloudInit(storage)
-              const qmCommand = `qm set ${input.vmid} --${bus} ${disk}`
-              try {
-                await logJob(input.jobId, {
-                  step: "APPLYING_CLOUD_INIT",
-                  event: "cloudinit_drive_attach:request",
-                  message: "Attaching Linux cloud-init disk",
-                  request: {
-                    vmid: input.vmid,
-                    selectedStorage: storage,
-                    selectedBus: bus,
-                    attachAttempt: attempt,
-                    attachFallbackOrder,
-                    command: qmCommand,
-                  },
-                })
-                const response = await input.client.updateVMConfig(input.nodeName, input.vmid, { [bus]: disk })
-                const refreshed = await input.client.getVMConfig(input.nodeName, input.vmid).catch(() => ({}))
-                const attached = hasCloudInitDrive(refreshed)
-                await logJob(input.jobId, {
-                  step: "APPLYING_CLOUD_INIT",
-                  event: "cloudinit_drive_attach:response",
-                  level: attached ? "info" : "warn",
-                  message: attached ? "Linux cloud-init disk attach accepted" : "Linux cloud-init attach accepted but not visible yet",
-                  response: {
-                    selectedStorage: storage,
-                    selectedBus: bus,
-                    attachAttempt: attempt,
-                    attached,
-                    proxmoxResponse: response,
-                    vmConfigCloudInitBus: cloudInitDiskKey(refreshed),
-                  },
-                })
-                if (attached) return { attached: true, bus }
-                throw buildStructuredLinuxCloudInitError("cloudinit_attach_verify_failed", "Cloud-init disk did not appear after attach.", { bus, storage, attempt })
-              } catch (error) {
-                lastAttachError = error
-                await logJob(input.jobId, {
-                  step: "APPLYING_CLOUD_INIT",
-                  event: "cloudinit_drive_attach:error",
-                  level: "warn",
-                  message: sanitizeProvisioningError(error),
-                  request: {
-                    vmid: input.vmid,
-                    selectedStorage: storage,
-                    selectedBus: bus,
-                    attachAttempt: attempt,
-                    attachFallbackOrder,
-                    command: qmCommand,
-                  },
-                  response: { code: (error as any)?.code || null },
-                })
-                if (attempt < attachRetryCount) await new Promise((resolve) => setTimeout(resolve, attachRetryDelayMs))
-              }
-            }
-          }
-        }
-        throw buildStructuredLinuxCloudInitError(
-          "cloudinit_attach_failed_all_buses",
-          "Unable to attach cloud-init disk using ide2/scsi1/sata fallback.",
-          {
-            vmid: input.vmid,
-            storagesTried: preflight.storages,
-            attachFallbackOrder,
-            reason: sanitizeProvisioningError(lastAttachError),
-          },
-        )
-      }
-      const attachResult = await attemptAttach()
-
-      const baseConfig: Record<string, any> = {
-        net0: config.net0,
-        citype: built.config.citype,
-        name: built.config.name,
-        ...(built.config.sshkeys ? { sshkeys: built.config.sshkeys } : {}),
-        ...(input.description ? { description: input.description } : {}),
-      }
-      await runTaskOperation(
-        input.jobId,
-        input.client,
-        input.nodeName,
-        "APPLYING_CLOUD_INIT",
-        "linux_base_config",
-        { vmid: input.vmid, osFamily: built.family, netBridge: input.netBridge || "vmbr0", citype: built.config.citype },
-        () => input.client.updateVMConfig(input.nodeName, input.vmid, baseConfig),
-        async () => (await verifyVm(input.client, input.nodeName, input.vmid)).exists,
-        input.displayStatus || "Applying server settings",
-      )
-
-      const orderedSetCommands: Array<{
-        event: string
-        command: string
-        body: Record<string, any>
-        verify: (vmConfig: Record<string, any>) => boolean
-      }> = [
-        {
-          event: "linux_ciuser",
-          command: `qm set ${input.vmid} --ciuser ${built.username}`,
-          body: { ciuser: built.username },
-          verify: (vmConfig) => String(vmConfig.ciuser || "") === built.username,
-        },
-        {
-          event: "linux_cipassword",
-          command: `qm set ${input.vmid} --cipassword [redacted]`,
-          body: { cipassword: input.password },
-          verify: (vmConfig) => Boolean(vmConfig),
-        },
-        {
-          event: "linux_ipconfig0",
-          command: `qm set ${input.vmid} --ipconfig0 "${built.config.ipconfig0}"`,
-          body: { ipconfig0: built.config.ipconfig0 },
-          verify: (vmConfig) => String(vmConfig.ipconfig0 || "") === built.config.ipconfig0,
-        },
-        {
-          event: "linux_nameserver",
-          command: `qm set ${input.vmid} --nameserver "${built.config.nameserver}"`,
-          body: { nameserver: built.config.nameserver },
-          verify: (vmConfig) => String(vmConfig.nameserver || "") === built.config.nameserver,
-        },
-        {
-          event: "linux_searchdomain",
-          command: `qm set ${input.vmid} --searchdomain ${built.config.searchdomain}`,
-          body: { searchdomain: built.config.searchdomain },
-          verify: (vmConfig) => String(vmConfig.searchdomain || "") === built.config.searchdomain,
-        },
-      ]
-
-      for (const command of orderedSetCommands) {
-        await runTaskOperation(
-          input.jobId,
-          input.client,
-          input.nodeName,
-          "APPLYING_CLOUD_INIT",
-          command.event,
-          { vmid: input.vmid, command: command.command },
-          () => input.client.updateVMConfig(input.nodeName, input.vmid, command.body),
-          async () => command.verify(await input.client.getVMConfig(input.nodeName, input.vmid).catch(() => ({}))),
-          input.displayStatus || "Applying server settings",
-        )
-      }
-
-      await runTaskOperation(
-        input.jobId,
-        input.client,
-        input.nodeName,
-        "APPLYING_CLOUD_INIT",
-        "cloudinit_update",
-        { vmid: input.vmid, command: `qm cloudinit update ${input.vmid}` },
-        () => input.client.updateCloudInit(input.nodeName, input.vmid),
-        async () => true,
-        input.displayStatus || "Applying server settings",
-      )
-
-      const [userDump, networkDump, vmConfig] = await Promise.all([
-        input.client.dumpCloudInit(input.nodeName, input.vmid, "user"),
-        input.client.dumpCloudInit(input.nodeName, input.vmid, "network"),
-        input.client.getVMConfig(input.nodeName, input.vmid),
-      ])
-      const validation = validateCloudInitDump({ built, userDump, networkDump, vmConfig })
-      await logJob(input.jobId, {
-        step: "APPLYING_CLOUD_INIT",
-        event: "cloud_init:dump_validation",
-        message: validation.ok ? "Cloud-init dump validation passed" : "Cloud-init dump validation failed",
-        level: validation.ok ? "info" : "error",
-        response: {
-          osFamily: built.family,
-          ok: validation.ok,
-          missing: validation.missing,
-          userDumpLength: validation.userDumpLength,
-          networkDumpLength: validation.networkDumpLength,
-          vmConfig: {
-            ciuser: vmConfig.ciuser || null,
-            ipconfig0: vmConfig.ipconfig0 || null,
-            nameserver: vmConfig.nameserver || null,
-            searchdomain: vmConfig.searchdomain || null,
-            ide2: vmConfig.ide2 || null,
-            cloudInitBus: cloudInitDiskKey(vmConfig),
-            attachBus: attachResult.bus,
-          },
-        },
-      })
-      if (!validation.ok) {
-        const firstMissing = String(validation.missing[0] || "unknown")
-        throw buildStructuredLinuxCloudInitError(
-          firstMissing.startsWith("config:ipconfig0") || firstMissing === "ipconfig0"
-            ? "cloudinit_verify_missing_ipconfig"
-            : firstMissing.startsWith("config:nameserver") || firstMissing.startsWith("nameserver")
-              ? "cloudinit_verify_missing_nameserver"
-              : firstMissing.startsWith("config:ciuser") || firstMissing === "user"
-                ? "cloudinit_verify_missing_ciuser"
-                : "cloudinit_verify_failed",
-          `Cloud-init verification failed: ${validation.missing.join(", ")}`,
-          { missing: validation.missing },
-        )
-      }
-
-      return { built, validation }
-    } catch (error) {
-      throw linuxCloudInitError(error)
-    }
-  }
-
-  const windowsExistingConfig = await input.client.getVMConfig(input.nodeName, input.vmid).catch(() => ({}))
-  const windowsHasCloudInitDrive = hasCloudInitDrive(windowsExistingConfig as Record<string, any>)
-  const windowsConfig = windowsHasCloudInitDrive ? { ...config } : config
-  if (windowsHasCloudInitDrive) delete windowsConfig.ide2
-
-  await logJob(input.jobId, {
-    step: "APPLYING_CLOUD_INIT",
-    event: "cloudinit_windows_preflight",
-    message: windowsHasCloudInitDrive ? "Windows cloud-init disk already attached" : "Windows cloud-init disk will be attached",
-    response: {
-      vmid: input.vmid,
-      existingCloudInitBus: cloudInitDiskKey(windowsExistingConfig as Record<string, any>),
-      ide2: (windowsExistingConfig as Record<string, any>)?.ide2 || null,
+      osTemplateId: input.template?.id || null,
+      osTemplateName: input.template?.name || null,
+      net0: config.net0,
+      // Recorded so the removal is auditable rather than silent.
+      guestAutomationApplied: false,
+      guestAgentRequired: true,
     },
   })
 
@@ -1486,58 +1285,111 @@ async function applyCloudInitConfig(input: {
     input.client,
     input.nodeName,
     "APPLYING_CLOUD_INIT",
-    "config",
-    {
-      vmid: input.vmid,
-      osFamily: built.family,
-      ipAddress: input.ip,
-      gateway: input.gateway,
-      dns: built.verification.expectedNameservers,
-      maskedCommands: built.maskedCommands.filter((command) => !command.includes("cloudinit update")),
-    },
-    () => input.client.updateVMConfig(input.nodeName, input.vmid, windowsConfig),
+    "preboot_config",
+    { vmid: input.vmid, keys: Object.keys(config) },
+    () => input.client.updateVMConfig(input.nodeName, input.vmid, config),
     async () => {
       const vm = await verifyVm(input.client, input.nodeName, input.vmid)
-      return vm.exists && String(vm.config?.ipconfig0 || "").includes(input.ip)
+      return vm.exists && String(vm.config?.net0 || "").includes(String(input.macAddress || ""))
     },
     input.displayStatus || "Applying server settings",
   )
 
-  await runTaskOperation(
-    input.jobId,
-    input.client,
-    input.nodeName,
-    "APPLYING_CLOUD_INIT",
-    "cloudinit_update",
-    { vmid: input.vmid, command: `qm cloudinit update ${input.vmid}` },
-    () => input.client.updateCloudInit(input.nodeName, input.vmid),
-    async () => true,
-    input.displayStatus || "Applying server settings",
-  )
+  return { config }
+}
 
-  const [userDump, networkDump] = await Promise.all([
-    input.client.dumpCloudInit(input.nodeName, input.vmid, "user"),
-    input.client.dumpCloudInit(input.nodeName, input.vmid, "network"),
-  ])
-  const validation = validateCloudInitDump({ built, userDump, networkDump })
+/**
+ * Configure the running guest through its own OS profile.
+ *
+ * This is the step that replaces `qm cloudinit update` plus every dump
+ * verification. It runs after the VM is up, because the guest agent is the only
+ * channel that can say what OS this actually is.
+ */
+async function configureGuestAfterBoot(input: {
+  jobId: string
+  vpsInstanceId: string
+  vmid: number
+  node: { nodeName: string; host: string; tokenId: string; tokenSecret: string; allowInsecureTls?: boolean | null }
+  metadata?: Record<string, unknown> | null
+  desired: {
+    ip: string
+    prefix: number
+    gateway: string
+    dns: string[]
+    searchDomain?: string | null
+    hostname: string
+    username: string
+    password: string
+    timezone?: string | null
+  }
+  displayStatus?: string
+  waitForAgentMs?: number
+}) {
+  const step: ProvisioningStep = "VERIFYING_VM"
+  await upsertStep(input.jobId, step, { status: "running", startedAt: new Date(), error: null })
   await logJob(input.jobId, {
-    step: "APPLYING_CLOUD_INIT",
-    event: "cloud_init:dump_validation",
-    message: validation.ok ? "Cloud-init dump validation passed" : "Cloud-init dump validation failed",
-    level: validation.ok ? "info" : "error",
-    response: {
-      osFamily: built.family,
-      ok: validation.ok,
-      missing: validation.missing,
-      userDumpLength: validation.userDumpLength,
-      networkDumpLength: validation.networkDumpLength,
+    step,
+    event: "guest_automation:start",
+    message: "Configuring server through guest automation",
+    request: {
+      vmid: input.vmid,
+      ip: input.desired.ip,
+      gateway: input.desired.gateway,
+      dns: input.desired.dns,
+      hostname: input.desired.hostname,
+      username: input.desired.username,
     },
   })
-  if (!validation.ok) {
-    throw new Error("Cloud-init update failed. Admin can retry provisioning.")
+
+  const result = await runFirstBoot({
+    vms: {
+      vpsInstanceId: input.vpsInstanceId,
+      vmid: input.vmid,
+      nodeName: input.node.nodeName,
+      node: {
+        host: input.node.host,
+        tokenId: input.node.tokenId,
+        tokenSecret: input.node.tokenSecret,
+        nodeName: input.node.nodeName,
+        allowInsecureTls: Boolean(input.node.allowInsecureTls),
+      },
+    },
+    desired: input.desired,
+    metadata: input.metadata ?? null,
+    waitForAgentMs: input.waitForAgentMs,
+  })
+
+  if (!result.ok) {
+    await logJob(input.jobId, {
+      step,
+      event: "guest_automation:failed",
+      level: "error",
+      message: result.message,
+      response: { vmid: input.vmid, errorCode: result.errorCode, runId: result.runId, os: result.detected?.osId ?? null },
+    })
+    throw new Error(`guest_automation_failed:${result.errorCode}`)
   }
 
-  return { built, validation }
+  await logJob(input.jobId, {
+    step,
+    event: "guest_automation:completed",
+    message: "Guest automation completed",
+    response: {
+      vmid: input.vmid,
+      runId: result.runId,
+      status: result.status,
+      noChange: result.noChange,
+      os: result.detected.osId,
+      osVersion: result.detected.version,
+      engine: result.detected.engine,
+      template: result.template.name,
+      templateVersion: result.template.version,
+      steps: result.steps.map((entry) => ({ operation: entry.operation, status: entry.status })),
+    },
+  })
+  await upsertStep(input.jobId, step, { status: "completed", completedAt: new Date(), exitStatus: "OK", error: null })
+
+  return result
 }
 
 async function startVmAndVerify(jobId: string, client: ProxmoxClient, nodeName: string, vmid: number, displayStatus?: string) {
@@ -2645,7 +2497,8 @@ async function processProvisionJob(jobId: string, leaseOwner: string) {
 
   let allocation: Awaited<ReturnType<typeof allocateIp>> | null = null
   const premiumAllocations: Array<Awaited<ReturnType<typeof allocateIp>>> = []
-  let cloudInitApplied = false
+  let guestAutomationApplied = false
+  let guestAutomationEvidence: Record<string, unknown> | null = null
   let generatedMacAddress: string | null = null
   const templateConfig = template.proxmoxVmid
     ? await client.getVMConfig(nodeName, template.proxmoxVmid).catch(() => null)
@@ -2868,22 +2721,12 @@ async function processProvisionJob(jobId: string, leaseOwner: string) {
       status: "APPLYING_CLOUD_INIT",
     })
     await logJob(job.id, { step: "APPLYING_CLOUD_INIT", event: "cloud_init:start", message: "Configuring server settings" })
-    await applyCloudInitConfig({
+    await applyPreBootVmConfig({
       jobId: job.id,
       client,
       nodeName,
       vmid,
       template,
-      username: configuredUser,
-      password: rootPassword,
-      hostname: internalHostname,
-      ip: allocation.ipAddress,
-      cidr: Number(pool.cidr || 24),
-      gateway: pool.gateway,
-      dns: pool.dns,
-      searchDomain: pool.searchDomain,
-      cloudInitStorage: storagePool?.storageId || template.proxmoxStorage || template.storage || null,
-      sshPublicKey,
       netBridge,
       macAddress: generatedMacAddress,
       description: buildVmNotes({
@@ -2906,7 +2749,7 @@ async function processProvisionJob(jobId: string, leaseOwner: string) {
       }),
       displayStatus: "Configuring server settings",
     })
-    cloudInitApplied = true
+    guestAutomationApplied = true
     await ensureProvisioningIdentity({ orderId: order.id, vpsInstanceId: initialService.id, vmUuid: initialService.id, proxmoxNodeId: node.id, vmid, publicIp: allocation.ipAddress, macAddress: generatedMacAddress })
 
     await prisma.order.update({ where: { id: order.id }, data: { provisioningStatus: "STARTING_VM" } })
@@ -2938,7 +2781,11 @@ async function processProvisionJob(jobId: string, leaseOwner: string) {
       include: { order: true, operatingSystem: true },
     })
     if (!startGuardVps) throw new Error("start_guard_vps_missing")
-    await ensureCloudInitBeforeStart({ vps: startGuardVps, client, nodeName, actor: "system:provision" })
+    await ensureGuestBeforeStartAction({
+      vps: startGuardVps,
+      ctx: guestContextFor({ vpsInstanceId: startGuardVps.id, vmid, node }),
+      actor: "system:provision",
+    })
     await startVmAndVerify(job.id, client, nodeName, vmid)
     await prisma.provisioningJob.update({ where: { id: job.id }, data: { progress: 85 } })
     await prisma.auditLog.create({
@@ -2959,8 +2806,11 @@ async function processProvisionJob(jobId: string, leaseOwner: string) {
     if (!vm.exists) throw new Error("Provisioned VM does not exist")
     const discoveredIp = await discoverVmIpAddress({ client, nodeName, vmid, config: vm.config, allocatedIp: allocation.ipAddress, hostname })
     const finalIpAddress = discoveredIp.ipAddress || allocation.ipAddress
-    if (!discoveredIp.ipAddress && !String(vm.config?.ipconfig0 || "").includes(allocation.ipAddress)) {
-      throw new Error("Provisioned VM IP config is missing")
+    // `ipconfig0` is gone as a source of truth: nothing writes it any more. If
+    // the guest agent did not report an address, that is a real problem and the
+    // gate below will say so precisely.
+    if (!discoveredIp.ipAddress) {
+      throw new Error("guest_ip_not_reported: the guest agent did not report an IP address for this server")
     }
     if (discoveredIp.ipAddress && discoveredIp.ipAddress !== allocation.ipAddress) {
       await logJob(job.id, {
@@ -2979,56 +2829,79 @@ async function processProvisionJob(jobId: string, leaseOwner: string) {
       })
     }
     await verifyProvisionedDiskSize(job.id, client, nodeName, vmid, diskGb, "VERIFYING_VM")
-    const expectedCiUser = isWindowsProvision ? "Administrator" : configuredUser
-    if (String(vm.config?.ciuser || "").trim() !== expectedCiUser) {
-      throw new Error(`cloudinit_verify_wrong_ciuser: expected ${expectedCiUser}, found ${String(vm.config?.ciuser || "missing")}`)
-    }
-    if (isWindowsProvision) {
-      if (String(vm.config?.citype || "").trim().toLowerCase() !== "configdrive2") throw new Error("cloudbase_verify_missing_configdrive2: Windows VM citype must be configdrive2")
-      if (!/^win/i.test(String(vm.config?.ostype || "")) && !String(template.osType || template.name || "").toLowerCase().includes("windows")) {
-        throw new Error("cloudbase_verify_missing_windows_ostype: Windows VM ostype is not Windows")
-      }
-    }
-    if (!isWindowsProvision) {
-      try {
-        if (!hasCloudInitDrive(vm.config || {})) throw new Error("cloudinit_verify_missing_drive: Provisioned VM cloud-init disk is missing")
-        if (!String(vm.config?.ciuser || "").trim()) throw new Error("cloudinit_verify_missing_ciuser: Provisioned VM ciuser is missing")
-        if (!String(vm.config?.nameserver || "").trim()) throw new Error("cloudinit_verify_missing_nameserver: Provisioned VM nameserver is missing")
-        const userDumpVerify = await client.dumpCloudInit(nodeName, vmid, "user").catch(() => "")
-        const userDumpText = typeof userDumpVerify === "string" ? userDumpVerify : JSON.stringify(userDumpVerify || "")
-        if (!userDumpText.trim()) throw new Error("cloudinit_verify_empty_user_dump: Cloud-init user dump is empty")
 
-        const qga = await checkGuestAgent(client, nodeName, vmid)
-        await logJob(job.id, {
-          step: "VERIFYING_VM",
-          event: "guest_agent:check",
-          level: qga.ok ? "info" : "warn",
-          message: qga.ok ? "QEMU guest agent check passed" : "QEMU guest agent check failed",
-          response: qga.ok ? { ok: true } : { ok: false, error: qga.error },
-        })
-        if (!qga.ok) throw new Error(`cloudinit_verify_guest_agent: ${qga.error || "guest agent unavailable"}`)
-      } catch (verifyError: any) {
-        await logJob(job.id, {
-          step: "VERIFYING_VM",
-          event: "linux_network_verify:retry_start",
-          level: "warn",
-          message: sanitizeProvisioningError(verifyError),
-          response: { vmid, nodeName, ip: allocation.ipAddress, gateway: pool.gateway, cidr: Number(pool.cidr || 24) },
-        })
-        await retryLinuxNetworkVerification({
-          jobId: job.id,
-          client,
-          nodeName,
-          vmid,
-          expectedIp: allocation.ipAddress,
-          expectedCidr: Number(pool.cidr || 24),
-          expectedGateway: pool.gateway,
-          expectedDns: pool.dns,
-          expectedSearchDomain: pool.searchDomain,
-          expectedBridge: netBridge,
-          attempts: 5,
-        })
+    // The guest configures itself. This is the step that replaced
+    // `qm cloudinit update`: it waits for the agent, detects the OS, resolves the
+    // template for that OS, and applies the first-boot sequence through it.
+    await configureGuestAfterBoot({
+      jobId: job.id,
+      vpsInstanceId: startingService.id,
+      vmid,
+      node,
+      metadata: guestOsMetadataFor(template),
+      desired: {
+        ip: allocation.ipAddress,
+        prefix: Number(pool.cidr || 24),
+        gateway: pool.gateway,
+        dns: splitList(String(pool.dns || "1.1.1.1")),
+        searchDomain: pool.searchDomain,
+        hostname: internalHostname,
+        username: configuredUser,
+        password: rootPassword,
+      },
+      displayStatus: "Configuring server",
+    })
+
+    const expectedGuestUser = isWindowsProvision ? "Administrator" : configuredUser
+    if (isWindowsProvision && !/^win/i.test(String(vm.config?.ostype || "")) && !String(template.osType || template.name || "").toLowerCase().includes("windows")) {
+      throw new Error("windows_ostype_mismatch: Windows VM ostype is not Windows")
+    }
+    try {
+      const verifiedGuest = await verifyGuestConfigured({
+        jobId: job.id,
+        client,
+        nodeName,
+        vmid,
+        vpsInstanceId: startingService.id,
+        node,
+        metadata: guestOsMetadataFor(template),
+        expectedUser: expectedGuestUser,
+        expectedIp: allocation.ipAddress,
+        isWindows: isWindowsProvision,
+      })
+      guestAutomationEvidence = {
+        runId: verifiedGuest.runId ?? null,
+        os: verifiedGuest.detected.osId,
+        template: verifiedGuest.template.name,
+        templateVersion: verifiedGuest.template.version,
       }
+    } catch (verifyError: any) {
+      await logJob(job.id, {
+        step: "VERIFYING_VM",
+        event: "guest_verify:retry_start",
+        level: "warn",
+        message: sanitizeProvisioningError(verifyError),
+        response: { vmid, nodeName, ip: allocation.ipAddress, gateway: pool.gateway, cidr: Number(pool.cidr || 24) },
+      })
+      await retryLinuxNetworkVerification({
+        jobId: job.id,
+        client,
+        nodeName,
+        vmid,
+        vpsInstanceId: startingService.id,
+        node,
+        metadata: guestOsMetadataFor(template),
+        hostname: internalHostname,
+        username: configuredUser,
+        password: rootPassword,
+        expectedIp: allocation.ipAddress,
+        expectedCidr: Number(pool.cidr || 24),
+        expectedGateway: pool.gateway,
+        expectedDns: pool.dns,
+        expectedSearchDomain: pool.searchDomain,
+        expectedBridge: netBridge,
+        attempts: 5,
+      })
     }
 
     let runtimeStatus = String(vm.status?.status || "").toLowerCase()
@@ -3044,7 +2917,11 @@ async function processProvisionJob(jobId: string, leaseOwner: string) {
         include: { order: true, operatingSystem: true },
       })
       if (!retryGuardVps) throw new Error("retry_start_guard_vps_missing")
-      await ensureCloudInitBeforeStart({ vps: retryGuardVps, client, nodeName, actor: "system:provision-retry" })
+      await ensureGuestBeforeStartAction({
+        vps: retryGuardVps,
+        ctx: guestContextFor({ vpsInstanceId: retryGuardVps.id, vmid, node }),
+        actor: "system:provision-retry",
+      })
       await startVmAndVerify(job.id, client, nodeName, vmid, "Starting server services")
       vm = await verifyVm(client, nodeName, vmid)
       runtimeStatus = String(vm.status?.status || "").toLowerCase()
@@ -3081,7 +2958,7 @@ async function processProvisionJob(jobId: string, leaseOwner: string) {
       templateMac: templateMacAddress,
       sshKeyRequired: Boolean(order.sshPublicKey || order.sshKeyId),
       isWindows: isWindowsProvision,
-      cloudInitEvidence: { applied: cloudInitApplied },
+      guestAutomationEvidence,
       attempts: isWindowsProvision ? 8 : 4,
       settleMs: isWindowsProvision ? 60000 : 20000,
     })
@@ -3266,7 +3143,7 @@ async function processProvisionJob(jobId: string, leaseOwner: string) {
     })
 
     if (vmMatchesThisJob) {
-      if (isLinuxCloudInitProvisioningError(error, template)) {
+      if (isGuestAutomationManualReviewError(error, template)) {
         const service = await upsertServiceState({
           orderId: order.id,
           customerId: order.customerId,
@@ -3314,19 +3191,19 @@ async function processProvisionJob(jobId: string, leaseOwner: string) {
         await logJob(job.id, {
           level: "error",
           step: "APPLYING_CLOUD_INIT",
-          event: "linux_cloud_init:manual_review",
+          event: "guest_automation:manual_review",
           message: reason,
           response: { vmExists: true, vmid, ipPreserved: Boolean(allocation?.ipAddress) },
         })
         await createPanelLog({
           category: "Provisioning",
           level: "error",
-          message: "Linux cloud-init verification failed",
+          message: "Guest automation could not complete and needs admin review",
           customerId: order.customerId,
           orderId: order.id,
           vpsInstanceId: service.id,
           vmid,
-          metadata: { jobId: job.id, errorCode: "LINUX_CLOUD_INIT_VERIFY_FAILED", reason, ipPreserved: allocation?.ipAddress || null },
+          metadata: { jobId: job.id, errorCode: "GUEST_AUTOMATION_MANUAL_REVIEW", reason, ipPreserved: allocation?.ipAddress || null },
         }).catch(() => null)
         await prisma.auditLog.create({
           data: {
@@ -3388,7 +3265,7 @@ async function processProvisionJob(jobId: string, leaseOwner: string) {
         },
       })
       await upsertStep(job.id, mappedStatus, { status: "failed", startedAt: new Date(), completedAt: new Date(), error: reason })
-      await logJob(job.id, { level: "error", step: mappedStatus, event: "job:failed_after_vm_create", message: reason, response: { vmExists: true, vmid, validationFailed, cloudInitApplied } })
+      await logJob(job.id, { level: "error", step: mappedStatus, event: "job:failed_after_vm_create", message: reason, response: { vmExists: true, vmid, validationFailed, guestAutomationApplied } })
       return { vmid, node: nodeName, serviceId: service.id, reconciled: true }
     }
 
@@ -3745,7 +3622,11 @@ async function processUpgradeJob(jobId: string) {
     if (wasRunning) {
       await prisma.vpsInstance.update({ where: { id: vps.id }, data: { status: "STARTING_VM" } })
       await logJob(job.id, { step: "STARTING_VM", event: "upgrade:start", message: "Starting server services" })
-      await ensureCloudInitBeforeStart({ vps, client, nodeName: vps.proxmoxNode.nodeName, actor: "system:upgrade" })
+      await ensureGuestBeforeStartAction({
+        vps,
+        ctx: guestContextFor({ vpsInstanceId: vps.id, vmid: vps.vmid, node: vps.proxmoxNode }),
+        actor: "system:upgrade",
+      })
       await startVmAndVerify(job.id, client, vps.proxmoxNode.nodeName, vps.vmid)
     }
 
@@ -3902,7 +3783,11 @@ export async function retryStartVps(vpsId: string, actor = "system") {
   await logJob(job.id, { step: "STARTING_VM", event: "start_retry:start", message: "Starting server services" })
 
   try {
-    await ensureCloudInitBeforeStart({ vps, client, nodeName, actor })
+    await ensureGuestBeforeStartAction({
+      vps,
+      ctx: guestContextFor({ vpsInstanceId: vps.id, vmid: vps.vmid, node: vps.proxmoxNode }),
+      actor,
+    })
     await startVmAndVerify(job.id, client, nodeName, vps.vmid)
     await setJobDisplay(job.id, "VERIFYING_VM")
     await upsertStep(job.id, "VERIFYING_VM", { status: "running", startedAt: new Date(), error: null })
@@ -3929,7 +3814,7 @@ export async function retryStartVps(vpsId: string, actor = "system") {
       templateMac: null,
       sshKeyRequired: Boolean(vps.sshKeyId),
       isWindows: isWindowsOsTemplate(vps.operatingSystem),
-      cloudInitEvidence: { source: "retry_start" },
+      guestAutomationEvidence: { source: "retry_start" },
       attempts: isWindowsOsTemplate(vps.operatingSystem) ? 8 : 4,
       settleMs: isWindowsOsTemplate(vps.operatingSystem) ? 60000 : 20000,
     })
@@ -4077,34 +3962,34 @@ export async function processProvisioningJob(jobId: string) {
     const failReinstall = async (code: string, step: ProvisioningStep, error: any) => {
       await releaseReinstallLock(vps.id)
       const reason = sanitizeProvisioningError(error)
-      const linuxCloudInitManualReview = isLinuxCloudInitProvisioningError(error, targetTemplate)
+      const guestAutomationManualReview = isGuestAutomationManualReviewError(error, targetTemplate)
       const nextMetadata = { ...(meta || {}), reinstall: { ...(reinstall || {}), failureStep: code } }
       await prisma.provisioningJob.update({
         where: { id: running.id },
         data: {
-          status: linuxCloudInitManualReview ? "waiting_for_admin" : "failed",
+          status: guestAutomationManualReview ? "waiting_for_admin" : "failed",
           currentStep: step,
-          displayStatus: linuxCloudInitManualReview ? "Waiting for manual review" : "Reinstall failed",
-          errorCode: linuxCloudInitManualReview ? "LINUX_CLOUD_INIT_VERIFY_FAILED" : null,
+          displayStatus: guestAutomationManualReview ? "Waiting for manual review" : "Reinstall failed",
+          errorCode: guestAutomationManualReview ? "GUEST_AUTOMATION_MANUAL_REVIEW" : null,
           error: `${code}: ${reason}`,
           completedAt: new Date(),
-          dedupeKey: linuxCloudInitManualReview ? running.dedupeKey : null,
+          dedupeKey: guestAutomationManualReview ? running.dedupeKey : null,
           metadata: nextMetadata,
         },
       })
       await upsertStep(running.id, step, { status: "failed", completedAt: new Date(), error: `${code}: ${reason}` })
-      await prisma.order.update({ where: { id: vps.orderId }, data: { provisioningStatus: linuxCloudInitManualReview ? "WAITING_FOR_ADMIN" : "FAILED", provisioningError: `${code}: ${reason}` } })
+      await prisma.order.update({ where: { id: vps.orderId }, data: { provisioningStatus: guestAutomationManualReview ? "WAITING_FOR_ADMIN" : "FAILED", provisioningError: `${code}: ${reason}` } })
       await prisma.vpsInstance.update({ where: { id: vps.id }, data: { status: "REPAIR_NEEDED" } })
       await logJob(running.id, { level: "error", step, event: `reinstall:${code}`, message: `${code}: ${reason}` })
       await createPanelLog({
         category: "Provisioning",
         level: "error",
-        message: linuxCloudInitManualReview ? "linux_reinstall_cloud_init_manual_review" : "reinstall_failed",
+        message: guestAutomationManualReview ? "linux_reinstall_cloud_init_manual_review" : "reinstall_failed",
         customerId: vps.customerId,
         orderId: vps.orderId,
         vpsInstanceId: vps.id,
         vmid,
-        metadata: { code, reason, errorCode: linuxCloudInitManualReview ? "LINUX_CLOUD_INIT_VERIFY_FAILED" : null },
+        metadata: { code, reason, errorCode: guestAutomationManualReview ? "GUEST_AUTOMATION_MANUAL_REVIEW" : null },
       }).catch(() => null)
       if (reinstallCustomer?.email || reinstallCustomer?.phone) {
         await sendServiceStatusNotification({
@@ -4193,7 +4078,7 @@ export async function processProvisioningJob(jobId: string) {
       await reinstallMilestone("REINSTALL_STOPPING", "Stopping VM", "completed")
     }
 
-    await reinstallMilestone("REINSTALL_REMOVE_CLOUD_INIT", "Removing old cloud-init")
+    await reinstallMilestone("REINSTALL_REMOVE_CLOUD_INIT", "Removing the old server")
     await professionalStep("CLONING_TEMPLATE", "Installing operating system")
     if (!nodeChanged) {
       await logJob(running.id, { step: "CLONING_TEMPLATE", event: "reinstall:destroy", message: "Installing operating system" })
@@ -4226,7 +4111,7 @@ export async function processProvisioningJob(jobId: string) {
         }
         await logJob(running.id, { step: "CLONING_TEMPLATE", event: "reinstall:destroy_verified", message: "VM deletion confirmed", level: "info" })
       })
-      await reinstallMilestone("REINSTALL_REMOVE_CLOUD_INIT", "Removing old cloud-init", "completed")
+      await reinstallMilestone("REINSTALL_REMOVE_CLOUD_INIT", "Removing the old server", "completed")
     }
     await reinstallMilestone("REINSTALL_APPLY_TEMPLATE", "Applying template")
     await logJob(running.id, { step: "CLONING_TEMPLATE", event: "reinstall:clone", message: "Installing operating system" })
@@ -4296,7 +4181,7 @@ export async function processProvisioningJob(jobId: string) {
     const reinstallTemplateMac = macFromNet0((reinstallTemplateConfig as any)?.net0)
     const reinstallBridge = allocation!.pool.bridgeOverride || allocation!.pool.bridge || "vmbr0"
 
-    // Phase 9: pre-flight network validation before MAC/cloud-init application
+    // Phase 9: pre-flight network validation before MAC/host configuration is applied
     const networkPreflight = await validateReinstallNetwork({
       bridge: reinstallBridge,
       mac: reinstallTemplateMac,
@@ -4362,22 +4247,12 @@ export async function processProvisioningJob(jobId: string) {
       ),
     )
     await runReinstallOperation("config_failed", "APPLYING_CLOUD_INIT", () =>
-      applyCloudInitConfig({
+      applyPreBootVmConfig({
         jobId: running.id,
         client,
         nodeName,
         vmid,
         template: targetTemplate,
-        username: requestedUsername,
-        password,
-        hostname: String(reinstallEffectiveHostname),
-        ip: allocation!.ipAddress,
-        cidr: Number(allocation!.pool.cidr || 24),
-        gateway: allocation!.pool.gateway,
-        dns: allocation!.pool.dns,
-        searchDomain: allocation!.pool.searchDomain,
-        cloudInitStorage: targetTemplate.proxmoxStorage || targetTemplate.storage || null,
-        sshPublicKey: isWindowsReinstall ? null : reinstall.sshPublicKey || null,
         netBridge: reinstallBridge,
         macAddress: reinstallMac,
         description: buildVmNotes({
@@ -4398,7 +4273,7 @@ export async function processProvisioningJob(jobId: string) {
       }),
     )
     await reinstallMilestone("REINSTALL_SET_HOSTNAME", "Setting hostname", "completed")
-    await reinstallMilestone("REINSTALL_CLOUD_INIT", "Cloud-init", "completed")
+    await reinstallMilestone("REINSTALL_CLOUD_INIT", "Server settings", "completed")
 
     await reinstallMilestone("REINSTALL_RESIZE_DISK", "Resizing disk")
     await professionalStep("RESIZING_DISK", "Applying access settings")
@@ -4429,31 +4304,38 @@ export async function processProvisioningJob(jobId: string) {
     await runReinstallOperation("resize_verify_failed", "RESIZING_DISK", () => verifyProvisionedDiskSize(running.id, client, nodeName, vmid, desiredDiskGb))
     await reinstallMilestone("REINSTALL_RESIZE_DISK", "Resizing disk", "completed")
 
-    // Pre-boot cloud-init validation — ensure all required fields are present before starting
-    await runReinstallOperation("cloud_init_preflight_failed", "APPLYING_CLOUD_INIT", async () => {
+    // Pre-boot readiness: the guest agent channel is the only thing that must be
+    // in place before start. Whether the image has the agent installed cannot be
+    // known from the host, so it is asserted here and proven after boot by the
+    // first-boot run — not assumed from a template flag.
+    await runReinstallOperation("guest_agent_preflight_failed", "APPLYING_CLOUD_INIT", async () => {
       const vmConfigForPreflight = await client.getVMConfig(nodeName, vmid).catch(() => null)
-      if (vmConfigForPreflight) {
-        const preflight = validateCloudInitPreBoot(vmConfigForPreflight as Record<string, any>)
-        if (!preflight.ok) {
-          await logJob(running.id, { level: "warn", step: "APPLYING_CLOUD_INIT", event: "reinstall:cloud_init_preflight", message: `Cloud-init preflight missing fields: ${preflight.missing.join(", ")} — forcing regeneration` })
-          await client.updateCloudInit(nodeName, vmid).catch(() => null)
-          const recheck = await client.getVMConfig(nodeName, vmid).catch(() => null)
-          const revalidate = recheck ? validateCloudInitPreBoot(recheck as Record<string, any>) : { ok: false, missing: preflight.missing }
-          if (!revalidate.ok) {
-            throw new Error(`cloud_init_preflight_failed: required fields still missing after regeneration: ${revalidate.missing.join(", ")}`)
-          }
-          await logJob(running.id, { step: "APPLYING_CLOUD_INIT", event: "reinstall:cloud_init_preflight_repaired", message: "Cloud-init regenerated successfully" })
-        } else {
-          await logJob(running.id, { step: "APPLYING_CLOUD_INIT", event: "reinstall:cloud_init_preflight_ok", message: "Cloud-init preflight passed" })
-        }
+      const agentChannel = vmConfigForPreflight
+        ? Object.entries(vmConfigForPreflight).some(([key, value]) => /^agent(\d+)?$/i.test(key) && Number(value) === 1)
+        : false
+      if (!agentChannel) {
+        await logJob(running.id, {
+          level: "warn",
+          step: "APPLYING_CLOUD_INIT",
+          event: "reinstall:guest_agent_channel_missing",
+          message: "Guest agent channel is not enabled on this VM; first-boot configuration will need the agent to answer",
+          response: { vmid },
+        })
+        await client.updateVMConfig(nodeName, vmid, { agent: "1" }).catch(() => null)
       }
+      await logJob(running.id, {
+        step: "APPLYING_CLOUD_INIT",
+        event: "reinstall:guest_agent_preflight",
+        message: agentChannel ? "Guest agent channel enabled" : "Guest agent channel enabled by this run",
+        response: { vmid, agentChannelBefore: agentChannel, os: targetTemplate?.osType ?? null },
+      })
     })
 
     await reinstallMilestone("REINSTALL_BOOT", "Booting VM")
     await professionalStep("STARTING_VM", "Starting server")
     await logJob(running.id, { step: "STARTING_VM", event: "reinstall:start", message: "Starting server" })
     await runReinstallOperation("start_failed", "STARTING_VM", async () => {
-      await ensureCloudInitBeforeStart({
+      await ensureGuestBeforeStartAction({
         vps: {
           ...vps,
           vmid,
@@ -4462,8 +4344,7 @@ export async function processProvisioningJob(jobId: string) {
           username: requestedUsername,
           adminUsername: requestedUsername,
         },
-        client,
-        nodeName,
+        ctx: guestContextFor({ vpsInstanceId: vps.id, vmid, node: targetNode }),
         actor: "system:reinstall",
       })
       return startVmAndVerify(running.id, client, nodeName, vmid, "Starting server")
@@ -4498,21 +4379,30 @@ export async function processProvisioningJob(jobId: string) {
       })
     }
 
-    // Cloud-init completion check (Linux only) — non-fatal; lets us detect misconfigured cloud-init early
-    if (!isWindowsReinstall && guestAgentWait.ok) {
-      const ciExec = await client.execVMGuestCommand(nodeName, vmid, ["cloud-init", "status", "--wait", "--long"]).catch(() => null)
-      if (ciExec?.pid) {
-        const ciResult = await waitForGuestExec(client, nodeName, vmid, Number(ciExec.pid), 120_000).catch(() => null)
-        const ciOut = String(ciResult?.result?.["out-data"] || "").trim().slice(0, 1000)
-        const hasError = /error|failed/i.test(ciOut)
-        await logJob(running.id, {
-          step: "VERIFYING_VM",
-          event: "reinstall:cloud_init_status",
-          level: hasError ? "warn" : "info",
-          message: hasError ? `cloud-init reported error — checking network at verification` : "cloud-init completed successfully",
-          response: { output: ciOut.slice(0, 500) },
-        })
-      }
+    // Configure the guest through its own OS profile. This is the reinstall
+    // equivalent of the first-boot run: the VM is up, the agent answered, so the
+    // OS is known and the right template is applied.
+    if (guestAgentWait.ok) {
+      await reinstallMilestone("REINSTALL_GUEST_AUTOMATION", "Configuring server")
+      await configureGuestAfterBoot({
+        jobId: running.id,
+        vpsInstanceId: vps.id,
+        vmid,
+        node: targetNode,
+        metadata: guestOsMetadataFor(targetTemplate),
+        desired: {
+          ip: allocation!.ipAddress,
+          prefix: Number(allocation!.pool.cidr || 24),
+          gateway: allocation!.pool.gateway,
+          dns: splitList(String(allocation!.pool.dns || "1.1.1.1")),
+          searchDomain: allocation!.pool.searchDomain,
+          hostname: String(reinstallEffectiveHostname),
+          username: requestedUsername,
+          password,
+        },
+        displayStatus: "Configuring server",
+      })
+      await reinstallMilestone("REINSTALL_GUEST_AUTOMATION", "Configuring server", "completed")
     }
 
     await reinstallMilestone("REINSTALL_HEALTH_CHECKS", "Health checks")
@@ -4540,7 +4430,7 @@ export async function processProvisioningJob(jobId: string) {
         sshKeyRequired: Boolean(vps.sshKeyId),
         expectedHostname: String(reinstallEffectiveHostname),
         isWindows: isWindowsReinstall,
-        cloudInitEvidence: { source: "reinstall" },
+        guestAutomationEvidence: { source: "reinstall" },
         attempts: isWindowsReinstall ? 8 : 4,
         settleMs: isWindowsReinstall ? 60000 : 20000,
       })

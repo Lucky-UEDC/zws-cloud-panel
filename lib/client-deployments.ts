@@ -73,7 +73,7 @@ function clientSafeRuntimeHealth(health: any) {
     completionEligible: Boolean(health.completionEligible),
     pingOk: Boolean(health.pingOk),
     sshOk: Boolean(health.sshOk),
-    cloudInitOk: Boolean(health.cloudInitOk),
+    guestConfiguredOk: Boolean(health.guestConfiguredOk),
     checkedAt: health.checkedAt || null,
   }
 }

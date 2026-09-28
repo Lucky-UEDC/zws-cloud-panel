@@ -189,26 +189,42 @@ test("additional IPv4 is recurring and addon notifications are separated", () =>
   assert.match(templates, /Additional IP Activated/)
   assert.match(adminEdit, /cpuCores/)
   assert.match(adminEdit, /macAddress/)
-  assert.match(adminEdit, /updateCloudInit/)
+  // Guest-owned fields are applied by guest automation, not by writing
+  // ci*/ipconfig0 into the VM config.
+  assert.match(adminEdit, /GuestAutomationService/)
+  // No Cloud-Init key is ever written. `cipassword` may still appear in the
+  // config-diff redaction below, which is a read, not a write.
+  assert.doesNotMatch(adminEdit, /proxmoxPatch\.ciuser/)
+  assert.doesNotMatch(adminEdit, /proxmoxPatch\.cipassword/)
+  assert.doesNotMatch(adminEdit, /proxmoxPatch\.ipconfig0/)
+  assert.doesNotMatch(adminEdit, /proxmoxPatch\.nameserver/)
+  assert.doesNotMatch(adminEdit, /updateCloudInit/)
 })
 
-test("provisioning hard gate validates MAC, cloud-init, guest agent, and reachability before ACTIVE", () => {
+test("provisioning hard gate validates MAC, guest agent, guest-reported network and reachability before ACTIVE", () => {
   const source = read("lib/provision.ts")
   const control = read("lib/vps-control.ts")
   assert.match(source, /generateFreshMacAddress/)
   assert.match(source, /applyFreshMacBeforeFirstBoot/)
   assert.match(source, /verifyProvisioningHardGate/)
-  assert.match(source, /passwordApplied/)
   assert.match(source, /macFresh/)
+  // The gate is now built on what the guest reports, not on what was injected
+  // into the Proxmox config.
   assert.match(source, /guestAgentOnline/)
+  assert.match(source, /guestIpApplied/)
+  assert.match(source, /guestGatewayApplied/)
+  assert.match(source, /guestDnsApplied/)
   assert.match(source, /networkReachable/)
   assert.match(source, /isProvisioningValidationFailure/)
   assert.match(source, /provisioning_hard_gate_failed/)
   assert.match(source, /const mappedStatus: "START_FAILED" \| "FAILED"/)
   assert.match(source, /status: "failed"/)
   assert.doesNotMatch(source, /mappedStatus === "ACTIVE" \|\| mappedStatus === "STOPPED"/)
-  assert.doesNotMatch(source, /runtimeStatus === "running" \? "ACTIVE" : cloudInitApplied \? "START_FAILED" : "STOPPED"/)
   assert.ok(source.indexOf("verifyProvisioningHardGate({") < source.indexOf("status: mappedStatus"), "hard gate must run before ACTIVE service update")
-  assert.match(control, /cloud_init_verify_missing_cipassword/)
-  assert.match(control, /cloud_init_verify_wrong_ipconfig0/)
+  // The pre-start guard no longer rewrites anything; it checks and records.
+  assert.match(control, /ensureGuestCredentials/)
+  assert.match(control, /ensureGuestBeforeStartAction/)
+  assert.doesNotMatch(control, /updateCloudInit/)
+  assert.doesNotMatch(control, /ipconfig0\s*=/)
+  assert.doesNotMatch(control, /cipassword\s*=/)
 })

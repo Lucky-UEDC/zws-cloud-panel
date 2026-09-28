@@ -108,12 +108,13 @@ type VpsStatus = {
   metricsFreshness?: Record<string, { state?: "CURRENT" | "STALE" | "UNAVAILABLE"; lastUpdatedAt?: string | null; source?: string | null }>
   monitoringStatus?: string | null
   guestAgentStatus?: string | null
-  nodeName?: string | null
-  node?: { id?: string; name?: string | null; nodeName?: string | null; location?: string | null } | null
-  template?: { id?: string; name?: string | null; family?: string | null; version?: string | null; cloudInitSupported?: boolean } | null
+  // Deliberately absent: the Proxmox node name, the VMID, and the internal
+  // infrastructure ids. The customer's page shows the server tag, the address,
+  // the region, the status, uptime, days to expiry, the OS and the MAC — nothing
+  // about how or where it is hosted internally.
+  template?: { id?: string; name?: string | null; family?: string | null; version?: string | null } | null
   macAddress?: string | null
   network?: { gateway?: string | null; cidr?: number | null; dns?: string | null; bridge?: string | null; macAddress?: string | null; vlanTag?: number | null; model?: string | null; lastSyncedAt?: string | null; source?: string | null }
-  cloudInit?: { supported?: boolean; configuredIp?: string | null; status?: string | null }
   firewall?: { available?: boolean; rules?: Array<Record<string, unknown>>; status?: string | null }
   snapshots?: { count?: number; items?: Array<{ id?: string; name?: string | null; snapname?: string | null; description?: string | null; status?: string | null; createdAt?: string | null }> }
   backups?: { count?: number; items?: Array<{ id?: string; status?: string | null; schedule?: string | null; fileName?: string | null; sizeBytes?: number | null; startedAt?: string | null; finishedAt?: string | null; completedAt?: string | null; createdAt?: string | null; durationMs?: number | null; error?: string | null }> }

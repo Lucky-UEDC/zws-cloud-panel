@@ -4,6 +4,8 @@ import { prisma } from "@/lib/db"
 import { reserveIpFromPool } from "@/lib/ip-pool"
 import { createPanelLog } from "@/lib/panel-log"
 import { createProxmoxClient, PROXMOX_LONG_TIMEOUT_MS } from "@/lib/proxmox"
+import { GuestAutomationService, osMetadataForVps } from "@/lib/guest-automation/service"
+import { guestContextFor } from "@/lib/guest-automation/first-boot"
 import { withRedisLock } from "@/lib/redis"
 import { getAdminFromCookies } from "@/lib/server-auth"
 import { canAccessAdminApi } from "@/lib/admin-rbac"
@@ -141,16 +143,36 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
 
         try {
           if (!vps.proxmoxNode) throw new Error("VPS has no Proxmox node configured")
-          const client = createProxmoxClient(vps.proxmoxNode.host, vps.proxmoxNode.tokenId, vps.proxmoxNode.tokenSecret, {
-            allowInsecureTls: vps.proxmoxNode.allowInsecureTls,
-            timeoutMs: PROXMOX_LONG_TIMEOUT_MS,
+          // The bridge is a host-side fact, so the host writes it. The address,
+          // gateway and resolvers belong to the guest and are applied there,
+          // through the OS profile that matches the guest that answers.
+          const guestService = new GuestAutomationService(
+            guestContextFor({ vpsInstanceId: vps.id, vmid: vps.vmid, node: vps.proxmoxNode }),
+          )
+          const networkChange = await guestService.setIP({
+            ip: reserved.ipAddress,
+            prefix: Number(reserved.pool.cidr || 24),
+            gateway: String(reserved.pool.gateway || ""),
+            dns: String(reserved.pool.dns || "1.1.1.1").split(/[,\s]+/).map((value) => value.trim()).filter(Boolean),
+            searchDomain: reserved.pool.searchDomain || undefined,
+            metadata: osMetadataForVps(vps),
+            actor: { requestedBy: String(admin.email), role: "admin" },
           })
-          await client.updateVMConfig(vps.proxmoxNode.nodeName, vps.vmid, {
-            net0: `virtio,bridge=${reserved.pool.bridge || "vmbr0"}`,
-            ipconfig0: `ip=${reserved.ipAddress}/${reserved.pool.cidr},gw=${reserved.pool.gateway}`,
-            nameserver: reserved.pool.dns,
-            ...(reserved.pool.searchDomain ? { searchdomain: reserved.pool.searchDomain } : {}),
-          })
+          if (!networkChange.ok) {
+            throw new Error(`guest automation could not move this server: ${networkChange.errorCode}`)
+          }
+          if (vps.proxmoxNode.nodeName && reserved.pool.bridge) {
+            const hostClient = createProxmoxClient(vps.proxmoxNode.host, vps.proxmoxNode.tokenId, vps.proxmoxNode.tokenSecret, {
+              allowInsecureTls: vps.proxmoxNode.allowInsecureTls,
+              timeoutMs: PROXMOX_LONG_TIMEOUT_MS,
+            })
+            const current = await hostClient.getVMConfig(vps.proxmoxNode.nodeName, vps.vmid).catch(() => ({} as Record<string, any>))
+            const net0 = String(current?.net0 || "virtio,bridge=vmbr0")
+            const modelPart = net0.includes(",") ? net0.split(",")[0] : net0
+            await hostClient.updateVMConfig(vps.proxmoxNode.nodeName, vps.vmid, {
+              net0: `${modelPart},bridge=${reserved.pool.bridge || "vmbr0"}`,
+            })
+          }
           await logMigration("Network configuration updated", {
             adminEmail: String(admin.email),
             poolId: id,

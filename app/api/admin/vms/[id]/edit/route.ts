@@ -9,6 +9,8 @@ import { createProxmoxClient, PROXMOX_LONG_TIMEOUT_MS } from "@/lib/proxmox"
 import { encryptSecretValue } from "@/lib/secret-crypto"
 import { lifecycleDates } from "@/lib/renewals"
 import { publishLiveVmSnapshot } from "@/lib/proxmox-live"
+import { GuestAutomationService, osMetadataForVps } from "@/lib/guest-automation/service"
+import { guestContextFor } from "@/lib/guest-automation/first-boot"
 
 function text(value: unknown) {
   return String(value ?? "").trim()
@@ -141,14 +143,17 @@ export async function PATCH(request: NextRequest, { params }: { params: Promise<
       : null
     if (client) currentConfig = await client.getVMConfig(targetNode!.nodeName, vps.vmid).catch(() => null)
 
+    // Host-owned fields go to the VM config. Guest-owned fields (password, IP,
+    // DNS) are NOT written here any more: they are applied inside the guest by
+    // its OS template and verified there. `ciuser`/`cipassword`/`ipconfig0`/
+    // `nameserver` are no longer part of any write path.
+    let guestChange: { kind: "password" | "network"; payload: Record<string, unknown> } | null = null
     if (cpuCores) {
       proxmoxPatch.sockets = 1
       proxmoxPatch.cores = cpuCores
     }
     if (ramGb) proxmoxPatch.memory = ramGb * 1024
     if (hostname) proxmoxPatch.name = hostname
-    if (username) proxmoxPatch.ciuser = username
-    if (password) proxmoxPatch.cipassword = password
     if (macAddress) {
       const cachedNet0 = jsonRecord(vps.vmNetworkInterfaces[0]?.metadata).net0
       proxmoxPatch.net0 = buildNet0(currentConfig?.net0 || cachedNet0 || "", macAddress)
@@ -160,15 +165,49 @@ export async function PATCH(request: NextRequest, { params }: { params: Promise<
       const cidr = Number(body.cidr || pool?.cidr || currentIp.cidr || 24)
       const gateway = text(body.gateway || pool?.gateway || currentIp.gateway)
       if (!gateway) throw new Error("Gateway is required when editing IP")
-      proxmoxPatch.ipconfig0 = `ip=${ipAddress}/${cidr},gw=${gateway}`
-      if (body.dns || pool?.dns) proxmoxPatch.nameserver = text(body.dns || pool?.dns)
+      guestChange = {
+        kind: "network",
+        payload: {
+          ip: ipAddress,
+          prefix: cidr,
+          gateway,
+          dns: text(body.dns || pool?.dns) || "1.1.1.1",
+          hostname: text(hostname || vps.hostname || vps.name || ""),
+          username: text(username || vps.adminUsername || vps.username || "root"),
+        },
+      }
+    }
+    if (password) {
+      guestChange = {
+        kind: "password",
+        payload: { username: text(username || vps.adminUsername || vps.username || "root"), password },
+      }
     }
 
     try {
       if (client && Object.keys(proxmoxPatch).length) {
         await client.updateVMConfig(targetNode!.nodeName, vps.vmid, proxmoxPatch)
-        if (proxmoxPatch.cipassword || proxmoxPatch.ipconfig0 || proxmoxPatch.nameserver || proxmoxPatch.ciuser) {
-          await client.updateCloudInit(targetNode!.nodeName, vps.vmid)
+      }
+      if (guestChange && targetNode) {
+        const service = new GuestAutomationService(
+          guestContextFor({ vpsInstanceId: vps.id, vmid: vps.vmid, node: targetNode }),
+        )
+        const actor = { requestedBy: String(admin.email), role: "admin" as const }
+        const metadata = osMetadataForVps(vps)
+        if (guestChange.kind === "password") {
+          const result = await service.setPassword({ ...(guestChange.payload as any), metadata, actor })
+          if (!result.ok) throw new Error(`guest_automation_failed:${result.errorCode}`)
+        } else {
+          const payload = guestChange.payload as any
+          const changed = await service.setIP({
+            ip: payload.ip,
+            prefix: payload.prefix,
+            gateway: payload.gateway,
+            dns: String(payload.dns || "").split(/[,\s]+/).map((value: string) => value.trim()).filter(Boolean),
+            metadata,
+            actor,
+          })
+          if (!changed.ok) throw new Error(`guest_automation_failed:${changed.errorCode}`)
         }
       }
       if (client && diskGb && diskGb > Number(vps.diskGb || 0)) {

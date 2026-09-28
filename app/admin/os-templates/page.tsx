@@ -42,7 +42,7 @@ type OsTemplate = {
   proxmoxVmid: number | null
   proxmoxStatus: string | null
   proxmoxTemplateName?: string | null
-  cloudInitSupported: boolean
+  guestAgentChannel?: boolean
   reinstallEnabled: boolean
   consoleType: ConsoleType
   resolvedConsoleType?: "novnc" | "xtermjs"
@@ -758,7 +758,7 @@ export default function OsTemplatesPage() {
                   <TableHead>Template Name</TableHead>
                   <TableHead>Storage Node</TableHead>
                   <TableHead>Disk Size</TableHead>
-                  <TableHead>Cloud-init</TableHead>
+                  <TableHead>Guest agent</TableHead>
                   <TableHead>Console Access</TableHead>
                   <TableHead>Status</TableHead>
                   <TableHead>Last synced</TableHead>
@@ -789,7 +789,7 @@ export default function OsTemplatesPage() {
                     </TableCell>
                     <TableCell className="min-w-52 text-xs">{storageNode(template)}</TableCell>
                     <TableCell className="whitespace-nowrap">{formatDisk(template.diskGb)}</TableCell>
-                    <TableCell><Badge variant={template.cloudInitSupported ? "default" : "secondary"}>{template.cloudInitSupported ? "Enabled" : "Disabled"}</Badge></TableCell>
+                    <TableCell><Badge variant={template.guestAgentChannel ? "default" : "destructive"}>{template.guestAgentChannel ? "Channel open" : "No channel"}</Badge></TableCell>
                     <TableCell className="min-w-40">
                       <select
                         value={template.consoleType || "auto"}

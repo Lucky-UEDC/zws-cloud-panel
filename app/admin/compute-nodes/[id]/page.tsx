@@ -186,13 +186,14 @@ type NodeTemplateRow = {
   size?: number | string | null
   cloudInitSupported?: boolean
   supportsCloudInit?: boolean
+  proxmoxConfig?: Record<string, unknown> | null
   lastSyncedAt?: string | null
 }
 
 type TemplateDialogState =
   | { action: "clone"; template: NodeTemplateRow; newVmid: string; name: string; storage: string }
   | { action: "edit_metadata"; template: NodeTemplateRow; name: string; osFamily: string; osVersion: string; osType: string; storage: string; diskGb: string; cloudInitSupported: boolean; reinstallEnabled: boolean; isActive: boolean }
-  | { action: "delete" | "rebuild_cloudinit" | "refresh_storage_mapping"; template: NodeTemplateRow; confirm: string }
+  | { action: "delete" | "verify_guest_agent" | "refresh_storage_mapping"; template: NodeTemplateRow; confirm: string }
 
 type NodeBandwidthVm = {
   vpsInstanceId: string
@@ -330,6 +331,36 @@ function templateDiskSize(template: Pick<NodeTemplateRow, "diskGb" | "size">) {
 function templateStatus(template: Pick<NodeTemplateRow, "isActive" | "isDefault">) {
   if (template.isDefault) return "Default"
   return template.isActive === false ? "Disabled" : "Enabled"
+}
+
+/**
+ * Guest-agent readiness for a template.
+ *
+ * Only one of these is a fact and one is a claim. `agentChannelEnabled` is what
+ * the Proxmox config actually says. `cloudInitSupported` is the legacy column,
+ * which recorded that the image shipped with Cloud-Init — useful history, but not
+ * evidence that a guest agent is installed. The badge is deliberately split so an
+ * admin is never told a template is ready to automate when the host can only
+ * prove the channel is open.
+ */
+function templateGuestAgentBadge(template: Pick<NodeTemplateRow, "cloudInitSupported" | "supportsCloudInit" | "proxmoxConfig">) {
+  const config = (template.proxmoxConfig || {}) as Record<string, unknown>
+  const channelEnabled = Object.entries(config).some(([key, value]) => /^agent(\d+)?$/i.test(key) && Number(value) === 1)
+  const verified = Boolean(template.cloudInitSupported ?? template.supportsCloudInit)
+
+  if (channelEnabled && verified) return <Badge variant="default">Verified</Badge>
+  if (channelEnabled) {
+    return (
+      <Badge variant="secondary" title="The guest agent channel is enabled on this template, but the image has not been verified to carry a working QEMU Guest Agent.">
+        Unverified
+      </Badge>
+    )
+  }
+  return (
+    <Badge variant="destructive" title="No guest agent channel is enabled on this template. Guest automation cannot configure servers cloned from it.">
+      Missing
+    </Badge>
+  )
 }
 
 function formatDate(value: string | null) {
@@ -540,7 +571,7 @@ export default function ComputeNodeDetailPage() {
     if (res.ok && data.success) setNodeTemplates(data.templates || [])
   }
 
-  async function templateAction(template: NodeTemplateRow, action: "enable" | "disable" | "set_default" | "delete" | "sync" | "clone" | "edit_metadata" | "rebuild_cloudinit" | "refresh_storage_mapping" | "open_proxmox", payload: Record<string, unknown> = {}) {
+  async function templateAction(template: NodeTemplateRow, action: "enable" | "disable" | "set_default" | "delete" | "sync" | "clone" | "edit_metadata" | "verify_guest_agent" | "refresh_storage_mapping" | "open_proxmox", payload: Record<string, unknown> = {}) {
     if (!id) return
     setTemplateActionId(`${template.id}:${action}`)
     try {
@@ -588,7 +619,7 @@ export default function ComputeNodeDetailPage() {
       })
       return
     }
-    const expected = dialog.action === "delete" ? "delete" : dialog.action === "rebuild_cloudinit" ? "rebuild" : "refresh"
+    const expected = dialog.action === "delete" ? "delete" : dialog.action === "verify_guest_agent" ? "verify" : "refresh"
     if (dialog.confirm.trim().toLowerCase() !== expected) return toast.error(`Type ${expected} to confirm`)
     setTemplateDialog(null)
     await templateAction(dialog.template, dialog.action, { confirm: expected })
@@ -1265,7 +1296,7 @@ export default function ComputeNodeDetailPage() {
                   <TableHead>Template Name</TableHead>
                   <TableHead>Storage Node</TableHead>
                   <TableHead>Disk Size</TableHead>
-                  <TableHead>Cloud-init</TableHead>
+                  <TableHead>Guest agent</TableHead>
                   <TableHead>Status</TableHead>
                   <TableHead>Last synced</TableHead>
                   <TableHead className="text-right">Actions</TableHead>
@@ -1280,7 +1311,7 @@ export default function ComputeNodeDetailPage() {
                     <TableCell className="min-w-48"><div className="truncate font-medium">{template.name}</div></TableCell>
                     <TableCell className="whitespace-nowrap">{template.proxmoxStorage || template.storage || "-"}</TableCell>
                     <TableCell className="whitespace-nowrap">{templateDiskSize(template)}</TableCell>
-                    <TableCell><Badge variant={(template.cloudInitSupported ?? template.supportsCloudInit) ? "default" : "secondary"}>{(template.cloudInitSupported ?? template.supportsCloudInit) ? "Enabled" : "Disabled"}</Badge></TableCell>
+                    <TableCell>{templateGuestAgentBadge(template)}</TableCell>
                     <TableCell><Badge variant={template.isActive === false ? "secondary" : template.isDefault ? "default" : "outline"}>{templateStatus(template)}</Badge></TableCell>
                     <TableCell className="whitespace-nowrap text-xs text-muted-foreground">{formatDate(template.lastSyncedAt || null)}</TableCell>
                     <TableCell className="text-right">
@@ -1288,7 +1319,7 @@ export default function ComputeNodeDetailPage() {
                         <TemplateOptions
                           template={template}
                           busyPrefix={templateActionId}
-                          onAction={(action) => action === "clone" || action === "edit_metadata" || action === "delete" || action === "rebuild_cloudinit" || action === "refresh_storage_mapping"
+                          onAction={(action) => action === "clone" || action === "edit_metadata" || action === "delete" || action === "verify_guest_agent" || action === "refresh_storage_mapping"
                             ? openTemplateDialog(template, action)
                             : templateAction(template, action)}
                         />
@@ -1481,7 +1512,7 @@ export default function ComputeNodeDetailPage() {
         <DialogContent className="max-w-xl">
           <DialogHeader>
             <DialogTitle>
-              {templateDialog?.action === "clone" ? "Clone Template" : templateDialog?.action === "edit_metadata" ? "Edit Template Metadata" : templateDialog?.action === "delete" ? "Delete Template" : templateDialog?.action === "rebuild_cloudinit" ? "Rebuild Cloud-init" : "Refresh Storage Mapping"}
+              {templateDialog?.action === "clone" ? "Clone Template" : templateDialog?.action === "edit_metadata" ? "Edit Template Metadata" : templateDialog?.action === "delete" ? "Delete Template" : templateDialog?.action === "verify_guest_agent" ? "Verify Guest Agent" : "Refresh Storage Mapping"}
             </DialogTitle>
             <DialogDescription>{templateDialog?.template.name}</DialogDescription>
           </DialogHeader>
@@ -1501,7 +1532,7 @@ export default function ComputeNodeDetailPage() {
               <DraftField label="Storage node" value={templateDialog.storage} onChange={(value) => setTemplateDialog((current) => current?.action === "edit_metadata" ? { ...current, storage: value } : current)} />
               <DraftField label="Disk size GB" type="number" value={templateDialog.diskGb} onChange={(value) => setTemplateDialog((current) => current?.action === "edit_metadata" ? { ...current, diskGb: value } : current)} />
               <div className="space-y-2 md:col-span-2">
-                <ToggleRow label="Cloud-init enabled" description="Marks the template as ready for cloud-init or Cloudbase-init provisioning." checked={templateDialog.cloudInitSupported} onChange={(checked) => setTemplateDialog((current) => current?.action === "edit_metadata" ? { ...current, cloudInitSupported: checked } : current)} />
+                <ToggleRow label="Guest agent verified" description="Marks the template as verified to carry a working QEMU Guest Agent. Guest automation configures servers through the agent only, so a template without one cannot be provisioned." checked={templateDialog.cloudInitSupported} onChange={(checked) => setTemplateDialog((current) => current?.action === "edit_metadata" ? { ...current, cloudInitSupported: checked } : current)} />
                 <ToggleRow label="Reinstall enabled" description="Allows this template to appear in reinstall workflows." checked={templateDialog.reinstallEnabled} onChange={(checked) => setTemplateDialog((current) => current?.action === "edit_metadata" ? { ...current, reinstallEnabled: checked } : current)} />
                 <ToggleRow label="Template enabled" description="Enabled templates can be selected for provisioning." checked={templateDialog.isActive} onChange={(checked) => setTemplateDialog((current) => current?.action === "edit_metadata" ? { ...current, isActive: checked } : current)} />
               </div>
@@ -1510,7 +1541,7 @@ export default function ComputeNodeDetailPage() {
           {templateDialog && templateDialog.action !== "clone" && templateDialog.action !== "edit_metadata" ? (
             <div className="space-y-3">
               <p className="text-sm text-muted-foreground">
-                Type <span className="font-mono text-foreground">{templateDialog.action === "delete" ? "delete" : templateDialog.action === "rebuild_cloudinit" ? "rebuild" : "refresh"}</span> to confirm this action.
+                Type <span className="font-mono text-foreground">{templateDialog.action === "delete" ? "delete" : templateDialog.action === "verify_guest_agent" ? "verify" : "refresh"}</span> to confirm this action.
               </p>
               <DraftField label="Confirmation" value={templateDialog.confirm} onChange={(value) => setTemplateDialog((current) => current && current.action !== "clone" && current.action !== "edit_metadata" ? { ...current, confirm: value } : current)} />
             </div>
@@ -1626,7 +1657,7 @@ function TemplateOptions({
 }: {
   template: NodeTemplateRow
   busyPrefix: string | null
-  onAction: (action: "enable" | "disable" | "set_default" | "sync" | "clone" | "edit_metadata" | "delete" | "open_proxmox" | "rebuild_cloudinit" | "refresh_storage_mapping") => void | Promise<void>
+  onAction: (action: "enable" | "disable" | "set_default" | "sync" | "clone" | "edit_metadata" | "delete" | "open_proxmox" | "verify_guest_agent" | "refresh_storage_mapping") => void | Promise<void>
 }) {
   const busy = Boolean(busyPrefix?.startsWith(`${template.id}:`))
   return (
@@ -1647,7 +1678,7 @@ function TemplateOptions({
         <DropdownMenuItem onClick={() => onAction("edit_metadata")}><Edit className="mr-2 h-4 w-4" />Edit metadata</DropdownMenuItem>
         <DropdownMenuSeparator />
         <DropdownMenuItem onClick={() => onAction("open_proxmox")}><ExternalLink className="mr-2 h-4 w-4" />Open in Proxmox</DropdownMenuItem>
-        <DropdownMenuItem onClick={() => onAction("rebuild_cloudinit")}>Rebuild cloud-init</DropdownMenuItem>
+        <DropdownMenuItem onClick={() => onAction("verify_guest_agent")}>Verify guest agent</DropdownMenuItem>
         <DropdownMenuItem onClick={() => onAction("refresh_storage_mapping")}>Refresh storage mapping</DropdownMenuItem>
         <DropdownMenuSeparator />
         <DropdownMenuItem className="text-destructive focus:text-destructive" onClick={() => onAction("delete")}><Trash2 className="mr-2 h-4 w-4" />Delete template</DropdownMenuItem>

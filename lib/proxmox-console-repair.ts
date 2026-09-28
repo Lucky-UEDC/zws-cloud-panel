@@ -512,39 +512,23 @@ function nextCicustomValue(existing: unknown, userSnippet: string) {
   return [`user=${userSnippet}`, ...parts].join(",")
 }
 
-async function repairLinuxGuestViaCloudInit(
-  node: NonNullable<ProxmoxNodeRow>,
-  vps: VpsRow,
-  client: ReturnType<typeof createProxmoxClient>,
-  vmConfig: Record<string, any>,
-  checks: ConsoleCheck[],
-  timeoutMs: number,
-) {
-  const storageRows = await client.getNodeStorage(node.nodeName).catch(() => [])
-  const storage = storageRows.find((row: any) => String(row?.content || "").split(",").includes("snippets"))?.storage || "local"
-  const filename = `zws-console-${vps.vmid}.yaml`
-  const userSnippet = `${storage}:snippets/${filename}`
-  try {
-    await uploadSnippet({
-      host: node.host,
-      node: node.nodeName,
-      storage,
-      filename,
-      content: buildSerialCloudInit(),
-      tokenId: node.tokenId,
-      tokenSecret: node.tokenSecret,
-      allowInsecureTls: node.allowInsecureTls,
-      timeoutMs,
-    })
-    const cicustom = nextCicustomValue(vmConfig.cicustom, userSnippet)
-    await client.updateVMConfig(node.nodeName, vps.vmid, { cicustom })
-    await client.updateCloudInit(node.nodeName, vps.vmid).catch(() => undefined)
-    addCheck(checks, "linux_guest_cloudinit", true, "Uploaded serial repair cloud-init snippet", { evidence: { storage, filename, cicustom: `user=${userSnippet}` } })
-    return { ok: true, rebootNeeded: true, cicustom }
-  } catch (error) {
-    addCheck(checks, "linux_guest_cloudinit", false, safeError(error), { evidence: { storage, filename } })
-    return { ok: false, rebootNeeded: false, cicustom: null }
-  }
+/**
+ * The cloud-init snippet path is gone.
+ *
+ * It uploaded a `#cloud-config` snippet, attached it via `cicustom` and ran
+ * `qm cloudinit update`. That made console repair depend on Cloud-Init being
+ * present and working, which is exactly the dependency this change removes — and
+ * it ran only when both SSH and the guest agent had already failed, so it was
+ * repairing a guest the platform could otherwise not reach at all.
+ *
+ * There is now nothing to do here beyond recording why the path is unavailable.
+ * A guest with no agent cannot be repaired by guest automation, and the seed ISO
+ * fallback below is the last remaining option.
+ */
+function reportCloudInitPathUnavailable(checks: ConsoleCheck[]) {
+  addCheck(checks, "linux_guest_cloudinit", false, "Console repair via cloud-init has been removed: guest automation uses the QEMU guest agent only", {
+    evidence: { removedAt: "guest-automation-v2", replacement: "linux_guest_agent" },
+  })
 }
 
 async function buildSeedIso(vps: VpsRow) {
@@ -1141,23 +1125,14 @@ async function auditVm(node: NonNullable<ProxmoxNodeRow>, vps: VpsRow, options: 
         if (agent.ok) {
           repairs.push("repair linux serial console through QEMU guest agent")
         } else {
-          const cloudInit = await repairLinuxGuestViaCloudInit(node, vps, client, vmConfig, checks, timeoutMs)
-          guestReboot = guestReboot || cloudInit.rebootNeeded
-          if (cloudInit.ok) {
-            repairs.push("install linux serial repair cloud-init snippet")
+          reportCloudInitPathUnavailable(checks)
+          const seedIso = await repairLinuxGuestViaSeedIso(node, vps, client, vmConfig, checks, timeoutMs)
+          guestReboot = guestReboot || seedIso.rebootNeeded
+          if (seedIso.ok) {
+            repairs.push("attach linux serial repair seed ISO")
             vmConfig = {
               ...vmConfig,
-              cicustom: cloudInit.cicustom || vmConfig.cicustom,
-            }
-          } else {
-            const seedIso = await repairLinuxGuestViaSeedIso(node, vps, client, vmConfig, checks, timeoutMs)
-            guestReboot = guestReboot || seedIso.rebootNeeded
-            if (seedIso.ok) {
-              repairs.push("attach linux serial repair seed ISO")
-              vmConfig = {
-                ...vmConfig,
-                [seedIso.drive]: seedIso.value || vmConfig[seedIso.drive],
-              }
+              [seedIso.drive]: seedIso.value || vmConfig[seedIso.drive],
             }
           }
         }
