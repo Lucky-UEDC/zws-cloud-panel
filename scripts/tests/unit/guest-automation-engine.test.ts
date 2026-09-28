@@ -1,4 +1,6 @@
 import { describe, it } from "node:test"
+import { readFileSync } from "node:fs"
+import { join } from "node:path"
 import assert from "node:assert/strict"
 
 import {
@@ -738,6 +740,37 @@ describe("native guest payload parsing", () => {
     ])
     assert.deepEqual(parsed.primary?.ipv4, ["10.0.0.5"])
     assert.deepEqual(parsed.primary?.ipv6, ["fe80::1"])
+  })
+})
+
+describe("a stopped guest is reported as stopped", () => {
+  /**
+   * Found by running the layer against VMID 465543, a real stopped server.
+   *
+   * A stopped guest has no agent, so OS detection legitimately fails. Reporting
+   * that as "OS detection unavailable" tells a customer their server is broken
+   * when the answer they can act on is that they stopped it. The metric side was
+   * already right — last known value, with the freshness state carried
+   * separately — and the disk side has to agree with it.
+   */
+  it("a stopped server reports VM_STOPPED, not OS detection unavailable", () => {
+    const source = readFileSync(join(process.cwd(), "lib/guest-automation/service.ts"), "utf8")
+    const getDiskUsage = source.slice(source.indexOf("async getDiskUsage("), source.indexOf("private async executeCollector("))
+    // Power state is checked before detection, and names itself.
+    assert.ok(
+      getDiskUsage.indexOf("this.isRunning()") < getDiskUsage.indexOf("this.detectOs()"),
+      "getDiskUsage must check the power state before it tries to detect the OS",
+    )
+    assert.match(getDiskUsage, /errorCode: "VM_STOPPED" as GuestErrorCode, message: GUEST_ERROR_MESSAGES\.VM_STOPPED/)
+  })
+
+  it("a context without a usable node fails with a sentence, not a TypeError", () => {
+    const source = readFileSync(join(process.cwd(), "lib/guest-automation/first-boot.ts"), "utf8")
+    // A TypeError about `nodeName` sends whoever hit it looking for a VM problem
+    // instead of the caller mistake it is.
+    assert.match(source, /guest_automation_no_node/)
+    assert.match(source, /guest_automation_no_credentials/)
+    assert.match(source, /guest_automation_no_vmid/)
   })
 })
 

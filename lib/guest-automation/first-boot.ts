@@ -80,6 +80,17 @@ export function guestContextFor(input: {
   node: { nodeName: string; host: string; tokenId: string; tokenSecret: string; allowInsecureTls?: boolean | null }
   clientOptions?: VmContext["clientOptions"]
 }): VmContext {
+  // A missing node is a caller mistake, and a `TypeError` about `nodeName` sends
+  // whoever hit it looking for a VM problem instead. Say what is actually wrong.
+  if (!input.node || !input.node.nodeName) {
+    throw new Error("guest_automation_no_node: this server is not assigned to a compute node, so it cannot be configured")
+  }
+  if (!input.node.host || !input.node.tokenId || !input.node.tokenSecret) {
+    throw new Error("guest_automation_no_credentials: the assigned compute node has no usable API credentials")
+  }
+  if (!Number.isInteger(Number(input.vmid)) || Number(input.vmid) <= 0) {
+    throw new Error(`guest_automation_no_vmid: this server has no valid VMID (got ${JSON.stringify(input.vmid)})`)
+  }
   return {
     vpsInstanceId: input.vpsInstanceId,
     vmid: Number(input.vmid),

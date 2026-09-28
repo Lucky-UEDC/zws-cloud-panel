@@ -10,6 +10,7 @@
 
 import { test } from "node:test"
 import assert from "node:assert/strict"
+import { readFileSync } from "node:fs"
 import {
   measureGuestCapabilities,
   summariseCapabilities,
@@ -24,6 +25,12 @@ import {
   type GuestProbeClient,
   type NodeCapability,
 } from "@/lib/guest-automation/node-capabilities"
+
+// Read from the repository root as cwd, matching the other unit suites.
+const read = (path: string) => readFileSync(path, "utf8")
+const SOURCE = read("lib/guest-automation/node-capabilities.ts")
+/** Comments are stripped so a note about a removed endpoint is not read as one. */
+const CODE = SOURCE.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "")
 
 function check(key: NodeCapability, state: CapabilityCheck["state"], detail = ""): CapabilityCheck {
   return { key, label: capabilityLabel(key), state, detail, durationMs: 1, measured: true }
@@ -199,6 +206,40 @@ test("guest-exec that accepts a start request but never reports an exit fails", 
   const checks = await measure(client, "pve1", 300)
   assert.equal(stateOf(checks, "guest_exec"), "fail")
   assert.match(checks.find((entry) => entry.key === "guest_exec")!.detail, /never reported an exit within 300ms/)
+})
+
+test("the node-status probe matches the endpoint the diagnostic actually emits", () => {
+  // Found by running the model against a live node that was reported as
+  // "failed" while being entirely healthy.
+  //
+  // The diagnostic step's endpoint is the full API path
+  // (`/api2/json/nodes/<name>/status`), and the name half is only emitted on
+  // failure — so matching on the bare relative form found nothing on a healthy
+  // node. The required capability was recorded as never probed, and a
+  // never-probed required capability is a blocker.
+  assert.ok(CODE.includes('/nodes/'), 'the node-status probe matches on the endpoint path')
+  assert.ok(!CODE.includes('step.endpoint === `/nodes/${encodeURIComponent(input.nodeName)}/status`'))
+  // And a node that answered everything else is evidence enough on its own.
+  assert.match(CODE, /else if \(connection\.ok\) \{/)
+  assert.match(CODE, /answered the node and VM endpoints/)
+})
+
+test("the console probe uses an endpoint that exists and an endpoint that does not fake a failure", () => {
+  // `vncwebsocket` is not a Proxmox endpoint; it answers "not implemented" on
+  // every node, which reported working consoles as broken. `vncproxy` is what
+  // noVNC uses.
+  assert.ok(!CODE.includes("vncwebsocket"), "the console probe uses an endpoint Proxmox does not have")
+  assert.match(CODE, /\/vncproxy`/)
+  // A 404 or "not implemented" is a missing endpoint, not a broken console.
+  assert.match(CODE, /not implemented/)
+  assert.match(CODE, /this Proxmox does not expose it/)
+})
+
+test("the console probe targets a VM this node actually has", () => {
+  // The shared feature diagnostic probes a hard-coded VMID that may not exist.
+  // Probing nothing tells us nothing about the node and produced a false
+  // negative on a healthy node.
+  assert.match(CODE, /No running VM on this node to probe a console against/)
 })
 
 test("the guest-exec exit timeout is bounded rather than indefinite", () => {
