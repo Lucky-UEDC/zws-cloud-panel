@@ -1288,12 +1288,57 @@ class ProxmoxClient {
     return this.request(`/nodes/${encodeURIComponent(node)}/qemu/${vmid}/agent/network-get-interfaces`)
   }
 
+  /**
+   * Native `qm guest cmd` verbs. Native-first is a hard requirement for guest
+   * automation: a shell is only spawned when no native verb exists for the job,
+   * which keeps the guest-agent attack surface minimal.
+   */
+  async getVMGuestHostName(node: string, vmid: number): Promise<any> {
+    return this.request(`/nodes/${encodeURIComponent(node)}/qemu/${vmid}/agent/get-host-name`)
+  }
+
+  async getVMGuestUsers(node: string, vmid: number): Promise<any> {
+    return this.request(`/nodes/${encodeURIComponent(node)}/qemu/${vmid}/agent/get-users`)
+  }
+
+  async getVMGuestTime(node: string, vmid: number): Promise<any> {
+    return this.request(`/nodes/${encodeURIComponent(node)}/qemu/${vmid}/agent/get-time`)
+  }
+
+  async getVMGuestTimeZone(node: string, vmid: number): Promise<any> {
+    return this.request(`/nodes/${encodeURIComponent(node)}/qemu/${vmid}/agent/get-timezone`)
+  }
+
+  async getVMGuestVcpus(node: string, vmid: number): Promise<any> {
+    return this.request(`/nodes/${encodeURIComponent(node)}/qemu/${vmid}/agent/get-vcpus`)
+  }
+
+  async getVMGuestMemoryBlocks(node: string, vmid: number): Promise<any> {
+    return this.request(`/nodes/${encodeURIComponent(node)}/qemu/${vmid}/agent/get-memory-blocks`)
+  }
+
+  async getVMGuestFsInfo(node: string, vmid: number): Promise<any> {
+    return this.request(`/nodes/${encodeURIComponent(node)}/qemu/${vmid}/agent/get-fsinfo`)
+  }
+
+  async trimVMGuestFilesystems(node: string, vmid: number): Promise<any> {
+    return this.request(`/nodes/${encodeURIComponent(node)}/qemu/${vmid}/agent/fstrim`, "POST", {}, PROXMOX_LONG_TIMEOUT_MS)
+  }
+
+  /** Generic native guest verb dispatch, used by the guest automation engine. */
+  async guestCmd(node: string, vmid: number, verb: string, body?: Record<string, any>, timeoutMs?: number): Promise<any> {
+    const path = `/nodes/${encodeURIComponent(node)}/qemu/${vmid}/agent/${verb}`
+    return body && Object.keys(body).length
+      ? this.request(path, "POST", body, timeoutMs)
+      : this.request(path, "GET", undefined, timeoutMs)
+  }
+
   async getVMGuestInfo(node: string, vmid: number): Promise<any> {
     return this.request(`/nodes/${encodeURIComponent(node)}/qemu/${vmid}/agent/get-osinfo`)
   }
 
-  async pingVMGuestAgent(node: string, vmid: number): Promise<any> {
-    return this.request(`/nodes/${encodeURIComponent(node)}/qemu/${vmid}/agent/ping`, "POST", undefined, PROXMOX_VM_TIMEOUT_MS)
+  async pingVMGuestAgent(node: string, vmid: number, timeoutMs: number = PROXMOX_VM_TIMEOUT_MS): Promise<any> {
+    return this.request(`/nodes/${encodeURIComponent(node)}/qemu/${vmid}/agent/ping`, "POST", undefined, timeoutMs)
   }
 
   async setVMGuestPassword(node: string, vmid: number, username: string, password: string, crypted = false): Promise<any> {
@@ -1308,7 +1353,7 @@ class ProxmoxClient {
     return this.execVMGuestCommandWithInput(node, vmid, command, undefined)
   }
 
-  async execVMGuestCommandWithInput(node: string, vmid: number, command: string[], inputData?: string): Promise<{ pid: number }> {
+  async execVMGuestCommandWithInput(node: string, vmid: number, command: string[], inputData?: string, timeoutMs: number = PROXMOX_LONG_TIMEOUT_MS): Promise<{ pid: number }> {
     const endpoint = `/nodes/${encodeURIComponent(node)}/qemu/${vmid}/agent/exec`
     const build = (arrayStyle: boolean, capture: boolean, includeInput: boolean) => {
       const params = new URLSearchParams()
@@ -1328,7 +1373,7 @@ class ProxmoxClient {
     let lastError: any = null
     for (const candidate of candidates) {
       try {
-        return await this.request(endpoint, "POST", candidate)
+        return await this.request(endpoint, "POST", candidate, timeoutMs)
       } catch (error: any) {
         lastError = error
         const detail = proxmoxDetailText(error?.proxmoxResponse || error?.proxmoxMessage || error?.message)
@@ -1339,8 +1384,8 @@ class ProxmoxClient {
     throw lastError
   }
 
-  async getVMGuestExecStatus(node: string, vmid: number, pid: number): Promise<any> {
-    return this.request(`/nodes/${encodeURIComponent(node)}/qemu/${vmid}/agent/exec-status?pid=${encodeURIComponent(String(pid))}`)
+  async getVMGuestExecStatus(node: string, vmid: number, pid: number, timeoutMs: number = PROXMOX_VM_TIMEOUT_MS): Promise<any> {
+    return this.request(`/nodes/${encodeURIComponent(node)}/qemu/${vmid}/agent/exec-status?pid=${encodeURIComponent(String(pid))}`, "GET", undefined, timeoutMs)
   }
 
   // VM power operations
