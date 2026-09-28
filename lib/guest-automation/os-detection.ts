@@ -19,11 +19,22 @@ import type { GuestEngine } from "./constants"
 export type GuestOsInfo = {
   id?: string
   "name"?: string
-  "version"?: string
+  /**
+   * The human-readable OS string.
+   *
+   * Not optional in practice: several real QEMU Guest Agent builds on this fleet
+   * return `pretty-name`, `version` and `kernel-version` and omit `id` and
+   * `name` entirely. A parser that only reads `id` therefore classifies every
+   * such guest as unknown, which is the same as saying no guest on the fleet can
+   * be configured.
+   */
+  "pretty-name"?: string
+  "variant-id"?: string
+  version?: string
   "version-id"?: string
   "kernel-release"?: string
   "kernel-version"?: string
-  "machine"?: string
+  machine?: string
 }
 
 export type DetectedOs = {
@@ -86,25 +97,103 @@ const RECOGNISED_LINUX_OS_IDS: ReadonlySet<string> = new Set([
  * Linux agent payloads are structurally different and guessing produces
  * cross-OS command mistakes.
  */
+/**
+ * Derive a template-matchable OS id from whatever the guest reported.
+ *
+ * The `id` field is preferred because it is stable across point releases. When it
+ * is absent, the human-readable name is matched against a table of known
+ * distributions — longest name first, so "rocky linux" wins over "linux".
+ *
+ * The trailing generic words are stripped before matching, because vendors put
+ * the release in the same field: "AlmaLinux 8.10 (Cerulean Leopard)",
+ * "Ubuntu 22.04.5 LTS" and "CentOS Linux release 7.9.2009" all reduce to a
+ * distribution name this way.
+ *
+ * Returns null rather than guessing when nothing matches. An unrecognised guest
+ * stays `unknown` and automation pauses, which is the safe direction: an
+ * unknown OS must not be configured with a guessed profile.
+ */
+export function deriveOsId(id: string, label: string): string | null {
+  const direct = id.trim().toLowerCase()
+  if (direct && RECOGNISED_LINUX_OS_IDS.has(direct)) return direct
+  if (direct) return null
+
+  const text = label.trim().toLowerCase()
+  if (!text) return null
+
+  // Earliest match wins, then the longest at that position.
+  //
+  // Order matters, and it is the opposite of "longest name first". Every Linux
+  // vendor puts "Linux" in the name — "Arch Linux", "Kali GNU/Linux Rolling" —
+  // so longest-first resolves all of them to the generic `linux` id, which no
+  // template claims. The distribution name comes first in the string, so
+  // position is the signal that actually distinguishes them.
+  const names = [...RECOGNISED_LINUX_OS_IDS]
+    .filter((candidate) => candidate.length > 3)
+    .sort((a, b) => b.length - a.length)
+
+  let best: { candidate: string; at: number } | null = null
+  for (const candidate of names) {
+    const at = text.indexOf(candidate)
+    if (at < 0) continue
+    // Reject a match that is only inside a longer word, so "arch" does not match
+    // "search" and "suse" does not match "abuse".
+    const before = at > 0 ? text[at - 1] : " "
+    const after = text[at + candidate.length] ?? " "
+    if (!/[^a-z0-9]/.test(before) || !/[^a-z0-9]/.test(after)) continue
+    if (!best || at < best.at || (at === best.at && candidate.length > best.candidate.length)) {
+      best = { candidate, at }
+    }
+    if (at === 0 && candidate.length === Math.max(...names.map((name) => name.length))) break
+  }
+  if (!best) return null
+  // Collapse to the canonical id the templates claim.
+  return CANONICAL_OS_IDS[best.candidate] || best.candidate
+}
+
+/** Vendor spellings mapped onto the ids the templates use. */
+const CANONICAL_OS_IDS: Record<string, string> = {
+  "redhat-enterprise-server": "rhel",
+  "redhat": "rhel",
+  "almalinux-almalinux": "almalinux",
+  "oraclelinux": "oracle",
+  "oracle-linux-server": "oracle",
+  "rocky-linux": "rocky",
+  "linuxmint": "mint",
+  "kali-linux": "kali",
+  "opensuse-leap": "opensuse",
+  "opensuse-tumbleweed": "opensuse",
+  "archarm": "arch",
+  "manjaro-arm": "manjaro",
+  "ubuntu-server": "ubuntu",
+  "ubuntucore": "ubuntu",
+}
+
 export function classifyGuestOsInfo(raw: unknown): Pick<DetectedOs, "kind" | "engine" | "osId" | "name" | "version" | "kernelVersion"> {
   const empty = { kind: "unknown" as VmGuestOsKind, engine: "unknown" as const, osId: null, name: null, version: null, kernelVersion: null }
   if (!raw || typeof raw !== "object") return empty
   const info = raw as GuestOsInfo
   const id = String(info.id ?? "").trim()
   const name = String(info.name ?? "").trim()
-  if (!id && !name) return empty
+  const prettyName = String(info["pretty-name"] ?? "").trim()
+  const label = name || prettyName
+  if (!id && !label) return empty
 
   const version = info["version-id"] || info.version || null
-  const kernelVersion = info["kernel-release"] || null
+  const kernelVersion = info["kernel-release"] || info["kernel-version"] || null
 
-  if (WINDOWS_OS_ID.test(id) || WINDOWS_NAME.test(name)) {
-    return { kind: "windows", engine: "windows", osId: (id || "windows").toLowerCase(), name: name || "Windows", version, kernelVersion }
+  if (WINDOWS_OS_ID.test(id) || WINDOWS_NAME.test(label)) {
+    return { kind: "windows", engine: "windows", osId: (id || "windows").toLowerCase(), name: label || "Windows", version, kernelVersion }
   }
 
-  if (!id) return empty
-  const osId = id.toLowerCase()
+  // The id is the field we match templates on, so it is derived from whatever
+  // the agent did send rather than required. A guest that only reports
+  // `pretty-name` is still a guest we can identify — "AlmaLinux 8.10" is not
+  // ambiguous, and refusing it would leave the server unmanageable.
+  const osId = deriveOsId(id, label)
+  if (!osId) return empty
   if (!RECOGNISED_LINUX_OS_IDS.has(osId)) return empty
-  return { kind: "linux", engine: "linux", osId, name: name || id, version, kernelVersion }
+  return { kind: "linux", engine: "linux", osId, name: label || id, version, kernelVersion }
 }
 
 export function normalizeDetected(input: Pick<DetectedOs, "kind" | "engine" | "osId" | "name" | "version" | "kernelVersion">): DetectedOs {

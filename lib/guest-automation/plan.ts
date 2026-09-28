@@ -196,7 +196,12 @@ export function buildPlan(request: PlanRequest): OperationPlan {
     wanted.push(...FIRST_BOOT_SEQUENCE)
     if (desired.createUser) wanted.push("create_user")
   } else {
-    if (desired.ip !== undefined) wanted.push("set_ip", "set_gateway")
+    if (desired.ip !== undefined) wanted.push("set_ip")
+    // The gateway is planned only when one was actually asked for. Requesting an
+    // address without a gateway means "leave the gateway alone" — planning
+    // `set_gateway` with no gateway value renders a command with an empty
+    // substitution and either fails or, worse, applies an unintended default.
+    if (desired.gateway !== undefined) wanted.push("set_gateway")
     if (desired.dns !== undefined) wanted.push("set_dns")
     if (desired.hostname !== undefined) wanted.push("set_hostname")
     if (desired.password !== undefined) wanted.push("set_password")

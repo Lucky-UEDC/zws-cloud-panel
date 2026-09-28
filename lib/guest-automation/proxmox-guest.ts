@@ -193,7 +193,15 @@ export async function guestNative<T = any>(
               timeoutMs,
             )
           : await (target.client as any)[`getVMGuest${verb}`]?.(target.node, target.vmid)
-    const payload = (raw as any)?.data ?? raw
+    // Unwrap both layers the agent API uses. Every `agent/<verb>` response is
+    // `{ data: { result: <payload> } }`, so unwrapping only `data` hands every
+    // parser a `{ result: ... }` wrapper instead of the payload — which is how
+    // `get-osinfo` reading `id` at the top level sees nothing and every guest
+    // classifies as unknown.
+    const data = (raw as any)?.data ?? raw
+    const payload = (data && typeof data === "object" && !Array.isArray(data) && "result" in (data as any))
+      ? (data as any).result
+      : data
     const reported = agentErrorText(payload)
     if (reported) {
       return failure(/not running|not available/i.test(reported) ? "GUEST_AGENT_UNREACHABLE" : "GUEST_EXEC_FAILED", reported)
