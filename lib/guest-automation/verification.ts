@@ -53,7 +53,7 @@ export type Observation =
   | { kind: "osinfo"; ok: true; osId: string | null; version: string | null }
   | { kind: "users"; ok: true; names: string[] }
   | { kind: "fsinfo"; ok: true; entries: Array<{ name: string; mountpoint: string | null; totalBytes: number }> }
-  | { kind: "generic"; ok: true; text: string }
+  | { kind: "generic"; ok: true; text: string; data?: unknown }
   | { kind: "failed"; ok: false; errorCode: GuestErrorCode; error: string }
 
 /** Turn raw command output into a typed observation for the given parser. */
@@ -98,6 +98,11 @@ export function observeFromOutput(parser: string | null, output: string, engine:
         filesystem: parsed.selected!.name,
       }
     }
+    case "exit-code": {
+      // exit-code verification: the command already succeeded (exit code 0),
+      // so we just return a generic observation that will pass verification.
+      return { kind: "generic", ok: true, text: String(output || "") }
+    }
     default:
       break
   }
@@ -117,6 +122,12 @@ export function observeFromOutput(parser: string | null, output: string, engine:
         filesystem: parsed.selected!.name,
       }
     }
+  }
+
+   {
+    // exit-code verification: the command already succeeded (exit code 0),
+    // so we just return a generic observation that will pass verification.
+    return { kind: "generic", ok: true, text: String(output || "") }
   }
 
   return { kind: "generic", ok: true, text: String(output || "") }
@@ -168,6 +179,52 @@ export function assertExpectation(observation: Observation, expectation: Verific
       return fail(observation.error, observation.errorCode)
 
     case "generic": {
+      // Handle native-json parser output which includes parsed JSON data
+      if (observation.data && typeof observation.data === "object") {
+        const data = observation.data as Record<string, unknown>
+        // Handle array responses (e.g., from ConvertTo-Json which outputs arrays)
+        const dataArray = Array.isArray(data) ? data : [data]
+        // Handle set_ip verification (Get-NetIPAddress output)
+        if (expected.ip) {
+          for (const item of dataArray) {
+            if (item.IPAddress) {
+              const ips = Array.isArray(item.IPAddress) ? item.IPAddress : [item.IPAddress]
+              const wantIp = String(expected.ip)
+              if (ips.includes(wantIp)) {
+                return ok(`Address ${wantIp} confirmed.`, data)
+              }
+            }
+          }
+          return fail(`Expected address ${expected.ip} was not reported by the guest.`, "VERIFICATION_FAILED", data)
+        }
+        // Handle set_gateway verification (Get-NetRoute output)
+        if (expected.gateway) {
+          for (const item of dataArray) {
+            if (item.NextHop) {
+              const wantGateway = String(expected.gateway)
+              const gotGateway = String(item.NextHop)
+              if (gotGateway === wantGateway) {
+                return ok(`Gateway ${wantGateway} confirmed.`, data)
+              }
+            }
+          }
+          return fail(`Expected gateway ${expected.gateway} was not reported by the guest.`, "VERIFICATION_FAILED", data)
+        }
+        // Handle set_dns verification (Get-DnsClientServerAddress output)
+        if (expected.dns) {
+          for (const item of dataArray) {
+            if (item.ServerAddresses) {
+              const wantDns = Array.isArray(expected.dns) ? expected.dns : [expected.dns]
+              const gotDns = Array.isArray(item.ServerAddresses) ? item.ServerAddresses : [item.ServerAddresses]
+              const allMatch = wantDns.every(w => gotDns.includes(w))
+              if (allMatch) {
+                return ok(`DNS ${wantDns.join(", ")} confirmed.`, data)
+              }
+            }
+          }
+          return fail(`Expected DNS ${expected.dns} was not reported by the guest.`, "VERIFICATION_FAILED", data)
+        }
+      }
       const needle = String(expected.contains ?? expected.equals ?? "").trim()
       if (!needle) return ok("Command completed with the expected exit code.")
       return observation.text.includes(needle)

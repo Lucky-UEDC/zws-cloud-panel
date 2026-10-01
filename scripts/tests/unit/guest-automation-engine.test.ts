@@ -14,7 +14,9 @@ import {
 } from "@/lib/guest-automation/constants"
 import { buildGuestCommand, shellArgv, guestNative, execGuestCommand } from "@/lib/guest-automation/proxmox-guest"
 import { classifyGuestOsInfo, deriveOsId } from "@/lib/guest-automation/os-detection"
+import { crossOsCommandViolations } from "@/lib/guest-automation/constants"
 import { scoreTemplate } from "@/lib/guest-automation/template-resolver"
+import { guestAgentChannelOpen, readAgentFlag } from "@/lib/proxmox-agent-flag"
 import { validateTemplateDraft } from "@/lib/guest-automation/validation"
 import { DEFAULT_GUEST_TEMPLATES } from "@/lib/guest-automation/default-templates"
 import {
@@ -22,6 +24,7 @@ import {
   parseWindowsLogicalDiskJson,
   parseWindowsWmicList,
   parseWindowsFsutil,
+  hypervisorMacsFromConfig,
   parseNativeInterfaces,
   parseNativeOsInfo,
   parseHostname,
@@ -183,6 +186,50 @@ describe("OS detection from the guest agent", () => {
   })
 })
 
+describe("guest agent channel flag", () => {
+  /**
+   * Proxmox does not store the agent flag as `1`.
+   *
+   * It stores the whole QGA option string, so a template with fstrim-on-clone
+   * enabled reads `agent=1,fstrim_cloned_disks=1`. A check written as
+   * `Number(value) === 1` gets `NaN` and reports the channel closed — for every
+   * VM that has any other agent option set, which is most of them. Since this
+   * flag gates whether provisioning treats a template as configurable, the bug
+   * decided that working, agent-enabled images were unusable.
+   *
+   * Found by the production QA script, whose catalogue listing contradicted what
+   * the hypervisor said about the same VM.
+   */
+  it("reads the agent flag out of a full Proxmox option string", () => {
+    assert.equal(guestAgentChannelOpen({ agent: "1,fstrim_cloned_disks=1" }), true)
+    assert.equal(guestAgentChannelOpen({ agent: "1" }), true)
+    assert.equal(guestAgentChannelOpen({ agent: "1,freeze-fs-on-backup=1,fsfreeze-style=quiesce" }), true)
+    assert.equal(guestAgentChannelOpen({ agent: 1 }), true)
+    assert.equal(guestAgentChannelOpen({ agent: "1" }), true)
+  })
+
+  it("reads a per-NIC agent flag too", () => {
+    assert.equal(guestAgentChannelOpen({ agent1: "1", net0: "virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr0" }), true)
+    assert.equal(guestAgentChannelOpen({ agent2: "1" }), true)
+  })
+
+  it("reports the channel closed when it is closed, absent or nonsense", () => {
+    assert.equal(guestAgentChannelOpen({ agent: "0,fstrim_cloned_disks=1" }), false)
+    assert.equal(guestAgentChannelOpen({ agent: "0" }), false)
+    assert.equal(guestAgentChannelOpen({}), false)
+    assert.equal(guestAgentChannelOpen(null), false)
+    assert.equal(guestAgentChannelOpen(undefined), false)
+    assert.equal(guestAgentChannelOpen({ agent: "yes" }), false)
+    // Not the same key: `agents` is a different setting entirely.
+    assert.equal(guestAgentChannelOpen({ agents: "1" }), false)
+  })
+
+  it("hands back the flag verbatim so other options are not lost when writing", () => {
+    assert.equal(readAgentFlag({ agent: "1,fstrim_cloned_disks=1" }), "1,fstrim_cloned_disks=1")
+    assert.equal(readAgentFlag({ net0: "virtio=AA" }), null)
+  })
+})
+
 describe("template matching", () => {
   it("prefers a version-specific template over a family-wide one", () => {
     const versioned = { engine: "linux", osIds: ["ubuntu"], versionPattern: "^24(\\D|$)", priority: 340 }
@@ -193,13 +240,68 @@ describe("template matching", () => {
     assert.ok(specific!.score > generic!.score)
   })
 
-  it("scores a non-matching version below a matching one on the same os id", () => {
+  /**
+   * A version pattern is the row's own statement of which versions it handles, so
+   * a guest outside that scope is not a candidate — not a weaker one.
+   *
+   * Found against a real guest: a CentOS 7 clone resolved to the *RHEL 9*
+   * profile and would have been configured with RHEL 9 commands. Scoring instead
+   * of rejecting let `rhel-9` (declared `^9`, priority 310 → 200+310 = 510)
+   * outvote `centos-7` (declared `^7`, exactly right → 300+200 = 500).
+   */
+  it("rejects a version outside a profile's declared scope rather than scoring it low", () => {
     const row = { engine: "linux", osIds: ["debian"], versionPattern: "^11(\\D|$)", priority: 300 }
-    const match = scoreTemplate(row, { ...LINUX_DETECTED, osId: "debian", version: "11.9" })
-    const miss = scoreTemplate(row, { ...LINUX_DETECTED, osId: "debian", version: "12.4" })
-    assert.ok(match)
-    assert.ok(miss)
-    assert.ok(match!.score > miss!.score)
+    assert.ok(scoreTemplate(row, { ...LINUX_DETECTED, osId: "debian", version: "11.9" }))
+    assert.equal(scoreTemplate(row, { ...LINUX_DETECTED, osId: "debian", version: "12.4" }), null)
+  })
+
+  it("never lets a high-priority profile claim a version outside its own scope", () => {
+    // The exact shape of the shipped defaults, and the exact failure.
+    const rhel9 = { engine: "linux", osIds: ["rhel", "almalinux", "centos"], versionPattern: "^9(\\D|$)", priority: 310 }
+    const rhel8 = { engine: "linux", osIds: ["rhel", "almalinux", "centos"], versionPattern: "^8(\\D|$)", priority: 300 }
+    const centos7 = { engine: "linux", osIds: ["centos"], versionPattern: "^7(\\D|$)", priority: 200, family: "centos" }
+    const guest = { ...LINUX_DETECTED, osId: "centos", version: "7", name: "CentOS Linux" }
+
+    const scored = [rhel9, rhel8, centos7]
+      .map((row) => ({ row, scored: scoreTemplate(row, guest) }))
+      .filter((entry) => entry.scored)
+    assert.equal(scored.length, 1, "only the profile whose declared scope contains the guest may be a candidate")
+    assert.equal(scored[0].row, centos7)
+  })
+
+  it("still picks the right RHEL profile for an AlmaLinux guest", () => {
+    const rhel8 = { engine: "linux", osIds: ["rhel", "almalinux", "centos"], versionPattern: "^8(\\D|$)", priority: 300 }
+    const rhel9 = { engine: "linux", osIds: ["rhel", "almalinux", "centos"], versionPattern: "^9(\\D|$)", priority: 310 }
+    const rhel10 = { engine: "linux", osIds: ["rhel", "almalinux"], versionPattern: "^10(\\D|$)", priority: 320 }
+    const guest = { ...LINUX_DETECTED, osId: "almalinux", version: "8.10 (Cerulean Leopard)" }
+    const scored = [rhel8, rhel9, rhel10]
+      .map((row) => ({ row, scored: scoreTemplate(row, guest) }))
+      .filter((entry) => entry.scored)
+      .sort((a, b) => b.scored!.score - a.scored!.score)
+    assert.equal(scored[0].row, rhel8)
+  })
+
+  it("breaks a versionless guest's tie on family, not on priority alone", () => {
+    // A guest that reports no usable version must not land on whichever
+    // profile happens to carry the highest priority when several claim its os
+    // id as an alias.
+    const centos7 = { engine: "linux", osIds: ["centos"], versionPattern: null, priority: 200, family: "centos" }
+    const rhel10 = { engine: "linux", osIds: ["rhel", "centos"], versionPattern: null, priority: 900, family: "rhel" }
+    const guest = { ...LINUX_DETECTED, osId: "centos", version: null, name: "CentOS Linux" }
+    const scored = [centos7, rhel10]
+      .map((row) => ({ row, scored: scoreTemplate(row, guest) }))
+      .filter((entry) => entry.scored)
+      .sort((a, b) => b.scored!.score - a.scored!.score)
+    assert.equal(scored[0].row, centos7)
+  })
+
+  it("keeps matching a profile whose declared version cannot be checked", () => {
+    // An unreadable version must not disqualify the one profile that obviously
+    // applies, or an unreadable version would read as "unsupported OS".
+    const row = { engine: "linux", osIds: ["debian"], versionPattern: "^11(\\D|$)", priority: 300, family: "debian" }
+    const scored = scoreTemplate(row, { ...LINUX_DETECTED, osId: "debian", version: "" })
+    assert.ok(scored, "a missing version must not make a profile vanish")
+    assert.ok((scored!.score as number) > 0)
   })
 
   it("never matches a Linux template to a Windows guest", () => {
@@ -399,11 +501,26 @@ describe("built-in templates are internally consistent", () => {
     }
   })
 
-  it("never inlines a password into a command", () => {
+  it("never inlines a literal password value into a command template", () => {
     for (const template of DEFAULT_GUEST_TEMPLATES) {
       for (const operation of template.operations) {
-        const used = extractPlaceholders(String(operation.command || ""))
-        assert.ok(!used.includes("PASSWORD"), `${template.slug}/${operation.operation} inlines a password`)
+        const command = String(operation.command || "")
+        // Password operations must not inline literal password values.
+        // Windows uses {{PASSWORD}} placeholder or $env:ZWS_SECRET env var; Linux reads from stdin via `read -r SECRET`.
+        // Both approaches keep the literal password out of argv and Proxmox task logs.
+        if (operation.operation === "set_password" || operation.operation === "create_user") {
+          const hasPasswordPlaceholder = command.includes("{{PASSWORD}}")
+          const readsFromStdin = command.includes("read -r SECRET") || command.includes("read -r PASSWORD")
+          const usesEnvVar = command.includes("$env:ZWS_SECRET")
+          assert.ok(
+            hasPasswordPlaceholder || readsFromStdin || usesEnvVar,
+            `${template.slug}/${operation.operation} must use {{PASSWORD}} placeholder, read password from stdin, or use $env:ZWS_SECRET`
+          )
+        } else {
+          // Non-password operations must not contain the PASSWORD placeholder
+          const used = extractPlaceholders(command)
+          assert.ok(!used.includes("PASSWORD"), `${template.slug}/${operation.operation} must not use {{PASSWORD}} placeholder`)
+        }
       }
     }
   })
@@ -609,6 +726,55 @@ describe("native guest payload parsing", () => {
     const result = parseNativeInterfaces(payload)
     assert.equal(result.primary!.name, "ens18")
     assert.deepEqual(result.primary!.ipv4, ["10.0.0.20"])
+  })
+
+  /**
+   * Found by the production QA script against real guests.
+   *
+   * Both running Linux guests turned out to be running containers, so the guest
+   * agent reported `br-ae8945c50794` and `docker0` alongside the real NIC — and
+   * both were selected as primary, because a bridge's address is tidier than a
+   * NAT'd address. A customer IP configured onto `docker0` takes the container
+   * network down with it.
+   */
+  it("never picks a container bridge as the primary interface", () => {
+    const payload = [
+      { name: "docker0", "hardware-address": "02:42:aa:bb:cc:dd", "ip-addresses": [{ "ip-address-type": "ipv4", "ip-address": "172.17.0.1" }] },
+      { name: "br-ae8945c50794", "hardware-address": "02:42:11:22:33:44", "ip-addresses": [{ "ip-address-type": "ipv4", "ip-address": "172.18.0.1" }] },
+      { name: "veth9f2a1c", "hardware-address": "02:42:55:66:77:88", "ip-addresses": [{ "ip-address-type": "ipv4", "ip-address": "172.18.0.2" }] },
+      { name: "ens18", "hardware-address": "52:54:00:ab:cd:ef", "ip-addresses": [{ "ip-address-type": "ipv4", "ip-address": "10.0.0.20" }] },
+    ]
+    assert.equal(parseNativeInterfaces(payload).primary!.name, "ens18")
+  })
+
+  it("prefers the MAC the hypervisor assigned, even with no address yet", () => {
+    // A guest that has not brought its NIC up still has a NIC, and the address
+    // belongs on it. The MAC is the one fact the hypervisor and the guest agree
+    // on, so it outranks a name-based guess.
+    const payload = [
+      { name: "ens18", "hardware-address": "52:54:00:ab:cd:ef", "ip-addresses": [] },
+      { name: "docker0", "hardware-address": "02:42:aa:bb:cc:dd", "ip-addresses": [{ "ip-address-type": "ipv4", "ip-address": "172.17.0.1" }] },
+    ]
+    const result = parseNativeInterfaces(payload, { hypervisorMacs: ["52:54:00:ab:cd:ef"] })
+    assert.equal(result.primary!.name, "ens18")
+  })
+
+  it("still finds the real NIC when the guest's bridge has a rounder address", () => {
+    const payload = [
+      { name: "virbr0", "hardware-address": "52:54:00:99:99:99", "ip-addresses": [{ "ip-address-type": "ipv4", "ip-address": "192.168.122.1" }] },
+      { name: "ens18", "hardware-address": "52:54:00:ab:cd:ef", "ip-addresses": [{ "ip-address-type": "ipv4", "ip-address": "203.0.113.9" }] },
+    ]
+    assert.equal(parseNativeInterfaces(payload, { hypervisorMacs: ["52:54:00:ab:cd:ef"] }).primary!.name, "ens18")
+    // And without the hypervisor MACs, the name filter alone still gets it right.
+    assert.equal(parseNativeInterfaces(payload).primary!.name, "ens18")
+  })
+
+  it("reads the MACs Proxmox assigned out of net0..netN", () => {
+    assert.deepEqual(
+      hypervisorMacsFromConfig({ net0: "virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr0", net1: "e1000=11:22:33:44:55:66", scsi0: "local-lvm:vm-100-disk-0" }),
+      ["aa:bb:cc:dd:ee:ff", "11:22:33:44:55:66"],
+    )
+    assert.deepEqual(hypervisorMacsFromConfig(null), [])
   })
 
   it("never selects loopback as the primary interface", () => {
@@ -837,6 +1003,65 @@ describe("payload shapes taken from real guests", () => {
     // Real Windows payload: { "login-time": ..., "user": "Administrator", "domain": "LUCKY" }
     assert.deepEqual(parseNativeUsers([{ "user": "Administrator", domain: "LUCKY" }]).map((user) => user.name), ["Administrator"])
     assert.deepEqual(parseNativeUsers([{ name: "root" }]).map((user) => user.name), ["root"])
+  })
+})
+
+describe("cross-OS token coverage", () => {
+  /**
+   * Found by the production QA script, not by a unit test: `ip` (iproute2) was
+   * absent from the Linux token list, so a Windows template carrying
+   * `ip route show` was accepted. It would then fail silently in PowerShell — a
+   * template that looks configured and is not.
+   */
+  it("refuses iproute2 on a Windows guest", () => {
+    for (const command of ["ip route show", "ip addr show eth0", "ip link set eth0 up", "ip -4 a", "/sbin/ip addr"]) {
+      assert.ok(crossOsCommandViolations(command, "windows").length > 0, `Windows accepted: ${command}`)
+    }
+  })
+
+  it("refuses the rest of the Linux-only configuration surface on Windows", () => {
+    for (const command of [
+      "resolvectl dns eth0 1.1.1.1",
+      "hostnamectl set-hostname web1",
+      "findmnt /",
+      "blkid /dev/sda1",
+      "resize2fs /dev/sda1",
+      "xfs_growfs /",
+      "mount /dev/sda1 /mnt",
+      "swapon -a",
+      "dpkg -l qemu-guest-agent",
+      "chkconfig --list",
+      "cloud-init status --wait",
+      "ifconfig eth0 up",
+      "journalctl -u systemd-networkd",
+    ]) {
+      assert.ok(crossOsCommandViolations(command, "windows").length > 0, `Windows accepted: ${command}`)
+    }
+  })
+
+  it("does not mistake a Windows command for a Linux one", () => {
+    for (const command of [
+      "New-NetIPAddress -InterfaceAlias 'Ethernet' -IPAddress '10.0.0.5' -PrefixLength 24",
+      "ipconfig /renew",
+      "Get-NetIPAddress -AddressFamily IPv4",
+      "Get-Volume -DriveLetter C",
+      "Set-DnsClientServerAddress -InterfaceAlias 'Ethernet' -ServerAddresses ('1.1.1.1')",
+      "Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3'",
+    ]) {
+      assert.equal(crossOsCommandViolations(command, "windows").length, 0, `Windows command wrongly refused: ${command}`)
+    }
+  })
+
+  it("a placeholder is not a command", () => {
+    // `{{IP}}` in a Windows command is the address the platform substitutes, not
+    // iproute2's `ip`. Without masking, a correct `-IPAddress '{{IP}}'` matches
+    // the `ip` token and the template is refused for containing a command it does
+    // not contain.
+    assert.equal(crossOsCommandViolations("New-NetIPAddress -IPAddress '{{IP}}' -PrefixLength {{PREFIX}}", "windows").length, 0)
+    assert.equal(crossOsCommandViolations("New-NetIPAddress -IPAddress '{{IP}}' -PrefixLength {{PREFIX}}", "windows").length, 0)
+    // And masking cannot smuggle a command through a placeholder: a username
+    // cannot contain a space or a shell metacharacter.
+    assert.equal(crossOsCommandViolations("ip route show {{IP}}", "windows").length > 0, true)
   })
 })
 

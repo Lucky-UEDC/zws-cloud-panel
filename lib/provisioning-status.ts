@@ -16,7 +16,12 @@ export type ProvisioningStep =
   // the QEMU guest agent and the OS profile that matches the OS it reports.
   | "WAITING_GUEST_AGENT"
   | "DETECTING_OS"
+  | "LOADING_OS_TEMPLATE"
+  | "CONFIGURING_NETWORK"
+  | "CONFIGURING_ACCESS"
   | "CONFIGURING_GUEST"
+  | "VERIFYING_NETWORK"
+  | "COLLECTING_METRICS"
   | "VERIFYING_GUEST"
   | "SERVICE_ACTIVE"
   | "SERVICE_FAILED"
@@ -46,7 +51,12 @@ export const STEP_LABELS: Record<ProvisioningStep, string> = {
   STARTING_VM: "Starting server services",
   WAITING_GUEST_AGENT: "Waiting for your server to respond",
   DETECTING_OS: "Checking your server's operating system",
+  LOADING_OS_TEMPLATE: "Loading OS profile",
+  CONFIGURING_NETWORK: "Configuring network",
+  CONFIGURING_ACCESS: "Configuring access",
   CONFIGURING_GUEST: "Configuring your server",
+  VERIFYING_NETWORK: "Verifying network",
+  COLLECTING_METRICS: "Collecting resource usage",
   VERIFYING_GUEST: "Confirming your server is configured",
   SERVICE_ACTIVE: "Your cloud server is ready",
   SERVICE_FAILED: "Your server needs attention",
@@ -166,6 +176,26 @@ const CUSTOMER_STEP_MESSAGES: Record<ProvisioningStep, CustomerProvisioningStep>
   VERIFYING_GUEST: {
     title: "Confirming your server is configured",
     message: "We are reading your server back to confirm the settings took effect.",
+  },
+  LOADING_OS_TEMPLATE: {
+    title: "Loading OS profile",
+    message: "We are loading the operating system profile for your server.",
+  },
+  CONFIGURING_NETWORK: {
+    title: "Configuring network",
+    message: "Your network settings are being applied from inside the server.",
+  },
+  CONFIGURING_ACCESS: {
+    title: "Configuring access",
+    message: "Your credentials are being configured inside the server.",
+  },
+  VERIFYING_NETWORK: {
+    title: "Verifying network",
+    message: "We are confirming your network settings took effect.",
+  },
+  COLLECTING_METRICS: {
+    title: "Collecting resource usage",
+    message: "We are collecting initial resource usage from your server.",
   },
   SERVICE_ACTIVE: {
     title: "Your cloud server is ready",

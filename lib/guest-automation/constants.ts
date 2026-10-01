@@ -116,6 +116,7 @@ export type GuestVerificationParser =
   | "native-hostname"
   | "native-fsinfo"
   | "exit-code"
+  | "cmd-output-contains"
   | "none"
 
 export const GUEST_VERIFICATION_PARSERS: GuestVerificationParser[] = [
@@ -129,6 +130,7 @@ export const GUEST_VERIFICATION_PARSERS: GuestVerificationParser[] = [
   "native-hostname",
   "native-fsinfo",
   "exit-code",
+  "cmd-output-contains",
   "none",
 ]
 
@@ -393,22 +395,64 @@ const WINDOWS_COMMAND_TOKENS = [
   "reg add",
 ]
 
+/**
+ * Commands that belong to a Linux guest and must never appear in a Windows one.
+ *
+ * Matched on word boundaries, so `ip` catches `ip route show` and `ip addr` but
+ * not `ipconfig` or `Get-NetIPAddress`, and `mount` catches `mount /dev/sda1`
+ * without catching a Windows property name.
+ *
+ * This list is a backstop, not the primary defence — the shell/engine gate is,
+ * because a Windows command run through `linux-sh` fails immediately. What this
+ * catches is the subtler case: a misconfigured Windows template declaring
+ * `windows-powershell` and carrying an `ip route` line, which would be accepted
+ * and then silently do nothing. The failure mode that matters is a template that
+ * looks configured and is not.
+ */
 const LINUX_COMMAND_TOKENS = [
+  // disk
   "df ",
   "df -",
-  "/bin/",
-  "systemctl",
+  "lsblk",
+  "fstrim",
+  "findmnt",
+  "blkid",
+  "growpart",
+  "resize2fs",
+  "xfs_growfs",
+  "btrfs",
+  "parted",
+  // network — `ip` is iproute2 and is absent on Windows
+  "ip ",
+  "ip -",
+  "ip a",
+  "ip r",
+  "ip l",
+  "ip n",
+  "ip link",
+  "ip addr",
+  "ip route",
+  "/sbin/ip",
+  "ifconfig",
+  "route -n",
+  "resolvectl",
+  "networkctl",
+  "/etc/network",
+  "/etc/resolv",
+  "/etc/hosts",
   "nmcli",
   "netplan",
   "ifupdown",
   "ifup ",
   "ifdown",
-  "/etc/network",
-  "/etc/resolv",
-  "chpasswd",
-  "useradd",
-  "adduser",
-  "usermod",
+  // host
+  "/bin/",
+  "/usr/sbin/",
+  "systemctl",
+  "service ",
+  "journalctl",
+  "hostnamectl",
+  "dpkg",
   "apt-get",
   "apt install",
   "yum install",
@@ -416,8 +460,21 @@ const LINUX_COMMAND_TOKENS = [
   "zypper",
   "pacman",
   "apk add",
-  "fstrim",
-  "lsblk",
+  "insserv",
+  "chkconfig",
+  "update-rc.d",
+  "cloud-init",
+  "cloudinit",
+  "mount ",
+  "umount ",
+  "swapon",
+  "swapoff",
+  // accounts
+  "chpasswd",
+  "useradd",
+  "adduser",
+  "usermod",
+  "passwd ",
 ]
 
 function escapeRegExp(value: string) {
@@ -429,8 +486,24 @@ function escapeRegExp(value: string) {
  * Matching is token-boundary based, so `df` matches the `df -B1 -P` collector
  * but never a similarly named binary.
  */
+/**
+ * Placeholders are masked before the token scan.
+ *
+ * `{{IP}}` in a Windows command is the address the platform substitutes, not the
+ * `ip` command from iproute2 — and without this, a perfectly correct
+ * `-IPAddress '{{IP}}'` matches the `ip` token and the template is refused for
+ * containing a command it does not contain.
+ *
+ * This cannot be used to smuggle a command through a placeholder: the accepted
+ * placeholders are a fixed list whose values are all validated before they are
+ * substituted, and a username cannot contain a space or a shell metacharacter.
+ */
+function maskPlaceholders(command: string) {
+  return command.replace(/\{\{[A-Z_]+\}\}/g, " ")
+}
+
 export function crossOsCommandViolations(command: unknown, engine: GuestEngine): string[] {
-  const text = String(command || "").toLowerCase()
+  const text = maskPlaceholders(String(command || "")).toLowerCase()
   if (!text.trim()) return []
   // The point of the list is to catch a command belonging to the OTHER engine.
   const forbidden = engine === "linux" ? WINDOWS_COMMAND_TOKENS : LINUX_COMMAND_TOKENS

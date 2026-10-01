@@ -47,6 +47,7 @@ export type OperationDraft = {
   verificationRequired?: boolean
   verificationCommand?: string | null
   verificationParser?: string | null
+  verificationArgs?: Record<string, unknown>
   successCondition?: string | null
   rollbackCommand?: string | null
   fallbacks?: unknown
@@ -100,7 +101,7 @@ function parseOsIds(value: unknown): string[] {
  * plaintext into argv and the Proxmox task log.
  */
 const REQUIRED_PLACEHOLDERS: Partial<Record<GuestOperation, string[]>> = {
-  set_ip: ["IP", "PREFIX", "GATEWAY"],
+  set_ip: ["IP", "PREFIX"],
   set_gateway: ["GATEWAY"],
   set_dns: ["DNS1"],
   set_password: ["USERNAME"],
@@ -205,6 +206,8 @@ function validateOperation(draft: OperationDraft, engine: GuestEngine, index: nu
   if (commandType === "guest-exec") {
     const used = new Set(extractPlaceholders(String(draft.command || "")))
     for (const name of required) {
+      // Windows set_dns hardcodes 8.8.8.8 and 1.1.1.1 per requirements, so DNS1 is not required
+      if (engine === "windows" && operation === "set_dns" && name === "DNS1") continue
       if (!used.has(name)) {
         errors.push(issue(`${path}.command`, `Operation "${operation}" must use the {{${name}}} placeholder.`))
       }

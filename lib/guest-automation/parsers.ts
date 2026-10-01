@@ -387,7 +387,46 @@ export type ParsedNetwork = {
  * Normalise `agent/network-get-interfaces`. We never assume `eth0` / `ens18` /
  * `Ethernet`: the interface actually holding the guest address is selected.
  */
-export function parseNativeInterfaces(payload: unknown): ParsedNetwork {
+/**
+ * Names that are, by construction, not the interface the hypervisor gave a
+ * customer.
+ *
+ * A guest running Docker, Kubernetes or libvirt reports its bridges alongside
+ * its real NIC, and the bridge is frequently the one with the tidiest address —
+ * `docker0` at `172.17.0.1`, `br-<id>` at `172.18.0.1`. Sorting by "which
+ * interface looks most usable" picked the bridge, and a customer IP configured
+ * onto `docker0` takes the container network down with it.
+ *
+ * This is the fallback. The authoritative signal is the MAC the hypervisor
+ * assigned, passed in as `hypervisorMacs` — a bridge can be named anything, but
+ * it never carries the MAC Proxmox put in `net0`.
+ */
+const VIRTUAL_INTERFACE_PATTERNS = [
+  /^(docker|br-|veth|virbr|vmnet|tun|tap|utun|ppp|lo|lo\d)/i,
+  /^(kube|cni|flannel|cali|weave|cilium|antrea|docker0)/i,
+  /^(dummy|ifb|gre|gretap|ipip|wg)/i,
+  /^(lxc|veth|nbd)/i,
+  /[:.]$/,
+]
+
+export function isVirtualInterfaceName(name: string): boolean {
+  return VIRTUAL_INTERFACE_PATTERNS.some((pattern) => pattern.test(name))
+}
+
+/** MACs Proxmox assigned to this VM, from `net0`..`netN` in the VM config. */
+export function hypervisorMacsFromConfig(config: Record<string, any> | null | undefined): string[] {
+  if (!config) return []
+  const macs: string[] = []
+  for (const [key, value] of Object.entries(config)) {
+    if (!/^net\d+$/i.test(key)) continue
+    const match = String(value ?? "").match(/([0-9a-f]{2}(?::[0-9a-f]{2}){5})/i)
+    if (match) macs.push(match[1].toLowerCase())
+  }
+  return macs
+}
+
+export function parseNativeInterfaces(payload: unknown, options: { hypervisorMacs?: string[] } = {}): ParsedNetwork {
+  const hypervisorMacs = (options.hypervisorMacs || []).map((mac) => mac.toLowerCase())
   const raw = unwrapAgentPayload(payload)
   const interfaces: ParsedInterface[] = []
   for (const entry of raw) {
@@ -419,9 +458,28 @@ export function parseNativeInterfaces(payload: unknown): ParsedNetwork {
       up: ipv4.length > 0,
     })
   }
-  // Exactly one primary: the first interface with a routable IPv4, else the
-  // first up interface. Ties are broken by name for deterministic behaviour.
+  // Exactly one primary.
+  //
+  // Ranked, most authoritative first:
+  //   1. carries a MAC the hypervisor assigned to this VM — a fact, not a guess
+  //   2. is not a known virtual interface and has an IPv4 — the usual answer when
+  //      no config was passed
+  //   3. anything else with an address
+  //   4. anything else at all
+  //
+  // An interface matching (1) always wins, even with no address: it is the NIC the
+  // customer was sold, and it is the one the address belongs on even if the guest
+  // has not brought it up yet.
+  const rank = (entry: ParsedInterface) => {
+    const assigned = Boolean(entry.mac) && hypervisorMacs.includes(String(entry.mac).toLowerCase())
+    if (assigned) return 0
+    if (!isVirtualInterfaceName(entry.name) && entry.ipv4.length > 0) return 1
+    if (isVirtualInterfaceName(entry.name)) return 3
+    return 2
+  }
   const sorted = [...interfaces].sort((a, b) => {
+    const byRank = rank(a) - rank(b)
+    if (byRank !== 0) return byRank
     if (a.ipv4.length !== b.ipv4.length) return b.ipv4.length - a.ipv4.length
     if (a.up !== b.up) return a.up ? -1 : 1
     return a.name.localeCompare(b.name)

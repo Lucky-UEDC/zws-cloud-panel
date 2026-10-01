@@ -236,7 +236,9 @@ export function buildPlan(request: PlanRequest): OperationPlan {
     }
 
     const { matches, previous } = alreadyMatches(snapshot, operation, desired)
-    const step = base(operation, definition, matches ? "Guest already satisfies the requested value." : "Requested change differs from current guest state.", placeholderValues(operation, desired))
+    // The engine is either "linux" or "windows"; "unknown" is treated as linux for placeholder purposes
+    const placeholderEngine = detected.engine === "windows" ? "windows" : "linux"
+    const step = base(operation, definition, matches ? "Guest already satisfies the requested value." : "Requested change differs from current guest state.", placeholderValues(operation, desired, placeholderEngine, snapshot.primaryInterface))
     step.previous = previous
     step.stdinSecret = stdinSecretFor(operation, desired)
 
@@ -282,9 +284,9 @@ function userFor(operation: GuestOperation, desired: PlanRequest["desired"]): st
   return null
 }
 
-function placeholderValues(operation: GuestOperation, desired: PlanRequest["desired"]): Record<string, string> {
+function placeholderValues(operation: GuestOperation, desired: PlanRequest["desired"], engine: "linux" | "windows", primaryInterface?: string | null): Record<string, string> {
   const values: Record<string, string> = {}
-  const put = (key: string, value: string | number | undefined) => {
+  const put = (key: string, value: string | number | null | undefined) => {
     if (value !== undefined && value !== null && String(value) !== "") values[key] = String(value)
   }
   switch (operation) {
@@ -293,20 +295,24 @@ function placeholderValues(operation: GuestOperation, desired: PlanRequest["desi
       put("IP", desired.ip)
       put("PREFIX", desired.prefix)
       put("GATEWAY", desired.gateway)
+      put("NIC", primaryInterface)
       break
     case "set_dns":
       put("DNS1", desired.dns?.[0])
       put("DNS2", desired.dns?.[1])
       put("SEARCHDOMAIN", desired.searchDomain)
+      put("NIC", primaryInterface)
       break
     case "set_hostname":
       put("HOSTNAME", desired.hostname)
       break
     case "set_password":
       put("USERNAME", desired.username)
+      if (engine === "windows") put("PASSWORD", desired.password)
       break
     case "create_user":
       put("USERNAME", desired.createUser?.username)
+      if (engine === "windows") put("PASSWORD", desired.createUser?.password)
       break
     case "enable_user":
     case "disable_user":

@@ -1,29 +1,18 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-REPO_URL="${ZWS_REPO_URL:-https://github.com/samvpslio/myrdphub-platform.git}"
+# ZWS Cloud Panel - Production Installer
+# This is the main installer called by install-source.sh
+
+REPO_URL="${ZWS_REPO_URL:-https://github.com/Lucky-UEDC/zws-cloud-panel.git}"
 BRANCH="${ZWS_BRANCH:-main}"
-ROOT_DIR="${ROOT_DIR:-${APP_DIR:-/var/www/myrdphub}}"
+ROOT_DIR="${ROOT_DIR:-/var/www/myrdphub}"
 ENV_FILE="${ENV_FILE:-$ROOT_DIR/.env}"
-DOMAIN="${DOMAIN:-${SITE_DOMAIN:-aws.myrdphub.com}}"
-APP_URL="${APP_URL:-https://$DOMAIN}"
-DATABASE_MODE="${DATABASE_MODE:-external}"
-DATABASE_TUNNEL_HOSTNAME="${DATABASE_TUNNEL_HOSTNAME:-db.myrdphub.com}"
-DATABASE_TUNNEL_PORT="${DATABASE_TUNNEL_PORT:-15432}"
-DATABASE_NAME="${DATABASE_NAME:-zwscloud}"
-DATABASE_USER="${DATABASE_USER:-zwscloud_app}"
-POSTGRES_DB="${POSTGRES_DB:-$DATABASE_NAME}"
-POSTGRES_USER="${POSTGRES_USER:-$DATABASE_USER}"
-POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-$(openssl rand -hex 24 2>/dev/null || date +%s)}"
-DATABASE_PASSWORD="${DATABASE_PASSWORD:-$POSTGRES_PASSWORD}"
-EXTERNAL_DATABASE_URL="${EXTERNAL_DATABASE_URL:-${DATABASE_URL:-postgresql://${DATABASE_USER}:${DATABASE_PASSWORD}@db-tunnel:${DATABASE_TUNNEL_PORT}/${DATABASE_NAME}?schema=public&sslmode=require}}"
-DB_SSH_HOST="${DB_SSH_HOST:-151.243.146.253}"
-DB_SSH_USER="${DB_SSH_USER:-root}"
-DB_SSH_KEY="${DB_SSH_KEY:-}"
-DB_BOOTSTRAP="${DB_BOOTSTRAP:-1}"
 
 log() { printf '[zws-install] %s\n' "$*"; }
 fail() { printf '[zws-install] ERROR: %s\n' "$*" >&2; exit 1; }
+prompt() { printf '[zws-install] %s ' "$*" >&2; }
+prompt_secret() { printf '[zws-install] %s ' "$*" >&2; read -rs; printf '\n'; }
 
 require_root() {
   [[ "$(id -u)" -eq 0 ]] || fail "Run as root: sudo bash install.sh"
@@ -35,6 +24,64 @@ require_supported_os() {
   [[ "${ID:-}" == "ubuntu" ]] || fail "Fresh Ubuntu 22.04 or newer is required"
   local major="${VERSION_ID%%.*}"
   [[ "${major:-0}" -ge 22 ]] || fail "Ubuntu 22.04 or newer is required"
+}
+
+# Interactive prompts for required configuration
+prompt_configuration() {
+  log "Configuration required for production installation"
+  
+  # Domain
+  if [[ -z "${DOMAIN:-}" ]] || [[ "${DOMAIN}" == "zwscloud.com" ]]; then
+    prompt "Domain (e.g., apexnods.com): "
+    read -r DOMAIN
+    [[ -n "$DOMAIN" ]] || fail "Domain is required"
+  else
+    log "Using domain from environment: $DOMAIN"
+  fi
+  
+  # Admin email
+  if [[ -z "${ADMIN_EMAIL:-}" ]] || [[ "${ADMIN_EMAIL}" == "admin@zwscloud.com" ]]; then
+    prompt "Admin email (e.g., founder@apexnods.com): "
+    read -r ADMIN_EMAIL
+    [[ -n "$ADMIN_EMAIL" ]] || fail "Admin email is required"
+  else
+    log "Using admin email from environment: $ADMIN_EMAIL"
+  fi
+  
+  # Admin username
+  if [[ -z "${ADMIN_USERNAME:-}" ]]; then
+    prompt "Admin username [admin]: "
+    read -r ADMIN_USERNAME
+    ADMIN_USERNAME="${ADMIN_USERNAME:-admin}"
+  else
+    log "Using admin username from environment: $ADMIN_USERNAME"
+  fi
+  
+  # Admin password
+  if [[ -z "${ADMIN_PASSWORD:-}" ]]; then
+    while true; do
+      prompt_secret "Admin password (min 8 chars): "
+      ADMIN_PASSWORD="$REPLY"
+      if [[ ${#ADMIN_PASSWORD} -ge 8 ]]; then
+        break
+      fi
+      printf '[zws-install] Password must be at least 8 characters\n' >&2
+    done
+    prompt_secret "Confirm admin password: "
+    local confirm="$REPLY"
+    [[ "$ADMIN_PASSWORD" == "$confirm" ]] || fail "Passwords do not match"
+  else
+    log "Using admin password from environment"
+  fi
+  
+  export DOMAIN ADMIN_EMAIL ADMIN_USERNAME ADMIN_PASSWORD
+}
+
+detect_database_mode() {
+  # Default to external database mode (Cloudflare tunnel)
+  # Local mode uses postgres container
+  DATABASE_MODE="${DATABASE_MODE:-external}"
+  export DATABASE_MODE
 }
 
 install_packages() {
@@ -69,43 +116,6 @@ install_packages() {
   systemctl enable --now docker
 }
 
-detect_ssh_key() {
-  if [[ -n "$DB_SSH_KEY" ]]; then
-    printf '%s' "$DB_SSH_KEY"
-    return
-  fi
-  for candidate in "$PWD/sam-key-all" "$ROOT_DIR/sam-key-all" "$HOME/.ssh/id_ed25519" "$HOME/.ssh/id_rsa"; do
-    if [[ -f "$candidate" ]]; then
-      chmod 0600 "$candidate" 2>/dev/null || true
-      printf '%s' "$candidate"
-      return
-    fi
-  done
-}
-
-ssh_opts() {
-  local key
-  key="$(detect_ssh_key)"
-  printf '%s\n' "-o" "BatchMode=yes" "-o" "StrictHostKeyChecking=accept-new" "-o" "ConnectTimeout=15"
-  if [[ -n "$key" ]]; then
-    printf '%s\n' "-i" "$key"
-  fi
-}
-
-sync_repo() {
-  mkdir -p "$(dirname "$ROOT_DIR")"
-  if [[ -d "$ROOT_DIR/.git" ]]; then
-    log "Updating repository at $ROOT_DIR"
-    git -C "$ROOT_DIR" fetch origin "$BRANCH"
-    git -C "$ROOT_DIR" checkout "$BRANCH"
-    git -C "$ROOT_DIR" pull --ff-only origin "$BRANCH"
-  else
-    log "Cloning repository to $ROOT_DIR"
-    rm -rf "$ROOT_DIR"
-    git clone --branch "$BRANCH" "$REPO_URL" "$ROOT_DIR"
-  fi
-}
-
 secret_base64() { openssl rand -base64 48 | tr -d '\n'; }
 secret_hex32() { openssl rand -hex 32 | tr -d '\n'; }
 
@@ -114,8 +124,23 @@ write_env_if_missing() {
     log "Keeping existing env file: $ENV_FILE"
     return
   fi
+  
   log "Writing Docker env file: $ENV_FILE"
   umask 077
+  
+  local db_host db_port db_url docker_db_url
+  if [[ "$DATABASE_MODE" == "local" ]]; then
+    db_host="postgres"
+    db_port="5432"
+    db_url="postgresql://${DATABASE_USER}:${DATABASE_PASSWORD}@postgres:5432/${DATABASE_NAME}?schema=public"
+    docker_db_url="postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?schema=public"
+  else
+    db_host="db-tunnel"
+    db_port="${DATABASE_TUNEL_PORT:-15432}"
+    db_url="postgresql://${DATABASE_USER}:${DATABASE_PASSWORD}@db-tunnel:${DATABASE_TUNEL_PORT:-15432}/${DATABASE_NAME}?schema=public&sslmode=require"
+    docker_db_url="postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?schema=public"
+  fi
+  
   cat > "$ENV_FILE" <<EOF
 NODE_ENV=production
 ZWS_RUNTIME=docker
@@ -124,10 +149,10 @@ DATABASE_MODE=$DATABASE_MODE
 COMPOSE_PROFILES=$(if [[ "$DATABASE_MODE" == "local" ]]; then printf 'local-db'; else printf 'db-tunnel'; fi)
 DATABASE_URL=
 DOCKER_DATABASE_URL=
-DATABASE_TUNNEL_HOSTNAME=$DATABASE_TUNNEL_HOSTNAME
-DATABASE_TUNNEL_PORT=$DATABASE_TUNNEL_PORT
-DATABASE_HOST=$(if [[ "$DATABASE_MODE" == "local" ]]; then printf 'postgres'; else printf 'db-tunnel'; fi)
-DATABASE_PORT=$(if [[ "$DATABASE_MODE" == "local" ]]; then printf '5432'; else printf '%s' "$DATABASE_TUNNEL_PORT"; fi)
+DATABASE_TUNNEL_HOSTNAME=${DATABASE_TUNNEL_HOSTNAME:-db.zwscloud.com}
+DATABASE_TUNNEL_PORT=${DATABASE_TUNNEL_PORT:-15432}
+DATABASE_HOST=$db_host
+DATABASE_PORT=$db_port
 DATABASE_NAME=$DATABASE_NAME
 DATABASE_USER=$DATABASE_USER
 DATABASE_PASSWORD=$DATABASE_PASSWORD
@@ -138,16 +163,16 @@ TUNNEL_SERVICE_TOKEN_SECRET=${TUNNEL_SERVICE_TOKEN_SECRET:-}
 EXTERNAL_DATABASE_URL=
 DOCKER_EXTERNAL_DATABASE_URL=$EXTERNAL_DATABASE_URL
 LOCAL_DATABASE_URL=
-DOCKER_LOCAL_DATABASE_URL=postgresql://$POSTGRES_USER:$POSTGRES_PASSWORD@postgres:5432/$POSTGRES_DB?schema=public
-POSTGRES_DB=$POSTGRES_DB
-POSTGRES_USER=$POSTGRES_USER
+DOCKER_LOCAL_DATABASE_URL=$docker_db_url
+POSTGRES_DB=${POSTGRES_DB:-$DATABASE_NAME}
+POSTGRES_USER=${POSTGRES_USER:-$DATABASE_USER}
 POSTGRES_PASSWORD=$POSTGRES_PASSWORD
 REDIS_URL=
 DOCKER_REDIS_URL=redis://redis:6379/0
 SITE_DOMAIN=$DOMAIN
-APP_URL=$APP_URL
-NEXTAUTH_URL=$APP_URL
-NEXT_PUBLIC_APP_URL=$APP_URL
+APP_URL=https://$DOMAIN
+NEXTAUTH_URL=https://$DOMAIN
+NEXT_PUBLIC_APP_URL=https://$DOMAIN
 NEXTAUTH_SECRET=$(secret_base64)
 ENCRYPTION_KEY=$(secret_hex32)
 MFA_ENCRYPTION_KEY=$(secret_hex32)
@@ -189,17 +214,18 @@ prepare_origin_certs() {
   chmod 0600 "$cert_dir/privkey.pem"
 }
 
-bootstrap_database_server() {
-  if [[ "$DATABASE_MODE" != "external" || "$DB_BOOTSTRAP" != "1" ]]; then
-    log "Skipping remote database bootstrap"
-    return
+sync_repo() {
+  mkdir -p "$(dirname "$ROOT_DIR")"
+  if [[ -d "$ROOT_DIR/.git" ]]; then
+    log "Updating repository at $ROOT_DIR"
+    git -C "$ROOT_DIR" fetch origin "$BRANCH"
+    git -C "$ROOT_DIR" checkout "$BRANCH"
+    git -C "$ROOT_DIR" pull --ff-only origin "$BRANCH"
+  else
+    log "Cloning repository to $ROOT_DIR"
+    rm -rf "$ROOT_DIR"
+    git clone --branch "$BRANCH" "$REPO_URL" "$ROOT_DIR"
   fi
-  local script="$ROOT_DIR/ops/aws-db-server-setup.sh"
-  [[ -f "$script" ]] || fail "Database bootstrap script missing: $script"
-  log "Bootstrapping PostgreSQL server ${DB_SSH_USER}@${DB_SSH_HOST}"
-  mapfile -t opts < <(ssh_opts)
-  ssh "${opts[@]}" "${DB_SSH_USER}@${DB_SSH_HOST}" \
-    "ZWS_DB_USER='$DATABASE_USER' ZWS_DB_PASSWORD='$DATABASE_PASSWORD' ZWS_DB_NAMES='zwscloud zwscloud_staging zwscloud_test' ZWS_PRIMARY_DB='zwscloud' ZWS_DB_HOSTNAME='$DATABASE_TUNNEL_HOSTNAME' bash -s" < "$script"
 }
 
 compose_profiles() {
@@ -215,28 +241,6 @@ compose_profiles() {
   fi
 }
 
-configure_cloudflare_only_firewall() {
-  if [[ "${CLOUDFLARE_ONLY_MODE:-false}" != "true" ]]; then
-    log "Cloudflare-only firewall mode disabled. Recommended production mode: CLOUDFLARE_ONLY_MODE=true DIRECT_CLOUDFLARE_MODE=true."
-    return
-  fi
-  log "Applying Cloudflare-only firewall baseline: allow SSH, deny public app/database/cache/web ports"
-  if command -v ufw >/dev/null 2>&1; then
-    ufw allow 22/tcp || true
-    for port in 80 443 3000 8080 8000 5000 5432 6379; do
-      ufw deny "${port}/tcp" || true
-    done
-    ufw --force enable || true
-  elif command -v firewall-cmd >/dev/null 2>&1; then
-    systemctl enable --now firewalld || true
-    firewall-cmd --permanent --add-service=ssh || true
-    for port in 80 443 3000 8080 8000 5000 5432 6379; do
-      firewall-cmd --permanent --remove-port="${port}/tcp" || true
-    done
-    firewall-cmd --reload || true
-  fi
-}
-
 start_stack() {
   log "Building and starting Docker services"
   # shellcheck disable=SC2046
@@ -245,17 +249,143 @@ start_stack() {
   docker compose --env-file "$ENV_FILE" -f "$ROOT_DIR/docker-compose.yml" ps
 }
 
+run_migrations() {
+  log "Running database migrations"
+  docker compose --env-file "$ENV_FILE" -f "$ROOT_DIR/docker-compose.yml" run --rm migrate
+}
+
+seed_admin() {
+  log "Seeding admin user"
+  docker compose --env-file "$ENV_FILE" -f "$ROOT_DIR/docker-compose.yml" run --rm app node -e "
+    const { PrismaClient } = require('@prisma/client');
+    const bcrypt = require('bcryptjs');
+    const prisma = new PrismaClient();
+    async function main() {
+      const existing = await prisma.user.findUnique({ where: { email: '$ADMIN_EMAIL' } });
+      if (existing) {
+        console.log('Admin user already exists, updating password...');
+        const hash = await bcrypt.hash('$ADMIN_PASSWORD', 12);
+        await prisma.user.update({
+          where: { email: '$ADMIN_EMAIL' },
+          data: { passwordHash: hash, name: '$ADMIN_USERNAME', role: 'ADMIN', emailVerified: new Date() }
+        });
+        console.log('Admin user updated');
+      } else {
+        const hash = await bcrypt.hash('$ADMIN_PASSWORD', 12);
+        await prisma.user.create({
+          data: { email: '$ADMIN_EMAIL', name: '$ADMIN_USERNAME', passwordHash: hash, role: 'ADMIN', emailVerified: new Date() }
+        });
+        console.log('Admin user created');
+      }
+    }
+    main().catch(e => { console.error(e); process.exit(1); }).finally(() => prisma.\$disconnect());
+  "
+}
+
+health_check() {
+  log "Performing health checks..."
+  local max_wait=180
+  local waited=0
+  local interval=5
+  
+  # Wait for app to be healthy
+  while [[ $waited -lt $max_wait ]]; do
+    if curl -fsS "http://localhost:3000/api/health" >/dev/null 2>&1; then
+      log "Application health check: PASS"
+      break
+    fi
+    sleep $interval
+    waited=$((waited + interval))
+    log "Waiting for application... ($waited/${max_wait}s)"
+  done
+  
+  if [[ $waited -ge $max_wait ]]; then
+    fail "Application health check timed out after ${max_wait}s"
+  fi
+  
+  # Check database
+  if ! docker compose --env-file "$ENV_FILE" -f "$ROOT_DIR/docker-compose.yml" exec -T postgres pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB" >/dev/null 2>&1; then
+    if [[ "$DATABASE_MODE" == "external" ]]; then
+      log "External database mode - skipping local postgres check"
+    else
+      fail "Database health check failed"
+    fi
+  else
+    log "Database health check: PASS"
+  fi
+  
+  # Check Redis
+  if ! docker compose --env-file "$ENV_FILE" -f "$ROOT_DIR/docker-compose.yml" exec -T redis redis-cli ping >/dev/null 2>&1; then
+    fail "Redis health check failed"
+  fi
+  log "Redis health check: PASS"
+  
+  # Check worker
+  if ! curl -fsS "http://localhost:3100/health" >/dev/null 2>&1; then
+    log "Worker health check: WARNING (may still be starting)"
+  else
+    log "Worker health check: PASS"
+  fi
+  
+  # Check scheduler
+  if ! curl -fsS "http://localhost:3101/health" >/dev/null 2>&1; then
+    log "Scheduler health check: WARNING (may still be starting)"
+  else
+    log "Scheduler health check: PASS"
+  fi
+}
+
+verify_https() {
+  log "Verifying HTTPS..."
+  local max_wait=60
+  local waited=0
+  local interval=5
+  
+  while [[ $waited -lt $max_wait ]]; do
+    if curl -fsS -I "https://$DOMAIN" 2>/dev/null | grep -q "200\|301\|302"; then
+      log "HTTPS verification: PASS (https://$DOMAIN)"
+      break
+    fi
+    sleep $interval
+    waited=$((waited + interval))
+  done
+  
+  if [[ $waited -ge $max_wait ]]; then
+    log "HTTPS verification: WARNING - domain may not be pointing to this server yet"
+    log "Check DNS: dig +short $DOMAIN"
+  fi
+}
+
 main() {
+  log "=== ZWS Cloud Panel Production Installer ==="
+  
   require_root
   require_supported_os
+  
+  prompt_configuration
+  detect_database_mode
+  
   install_packages
   sync_repo
   write_env_if_missing
   prepare_origin_certs
-  configure_cloudflare_only_firewall
-  bootstrap_database_server
   start_stack
-  log "Install complete. Update $ENV_FILE with Proxmox and Evolution API settings, then run: docker compose --env-file $ENV_FILE -f $ROOT_DIR/docker-compose.yml up -d --build"
+  run_migrations
+  seed_admin
+  health_check
+  verify_https
+  
+  log "=== Installation Complete ==="
+  log "Admin URL: https://$DOMAIN"
+  log "Admin Email: $ADMIN_EMAIL"
+  log "Admin Username: $ADMIN_USERNAME"
+  log ""
+  log "Next steps:"
+  log "1. Update $ENV_FILE with Proxmox node credentials"
+  log "2. Update $ENV_FILE with Evolution API settings for WhatsApp"
+  log "3. Restart services: docker compose --env-file $ENV_FILE -f $ROOT_DIR/docker-compose.yml up -d"
+  log ""
+  log "To update in the future, run the installer again."
 }
 
 main "$@"

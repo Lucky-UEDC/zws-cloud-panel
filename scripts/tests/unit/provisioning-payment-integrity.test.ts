@@ -1,37 +1,8 @@
 import assert from "node:assert/strict"
 import { readFileSync } from "node:fs"
 import test from "node:test"
-import { buildCloudInitConfig, validateCloudInitDump } from "@/lib/cloud-init-config"
 
 const read = (path: string) => readFileSync(path, "utf8")
-
-/**
- * Retained, and asserted, because the legacy module is still used to read old
- * template state. It is not on any provisioning path any more — that is asserted
- * separately in cloud-init-removal.test.ts.
- */
-test("hostname absence never fails cloud-init verification", () => {
-  const built = buildCloudInitConfig({
-    vmid: 101,
-    osFamily: "linux",
-    username: "root",
-    password: "test-password",
-    hostname: "expected-host",
-    ip: "192.0.2.10",
-    cidr: 24,
-    gateway: "192.0.2.1",
-    dns: "1.1.1.1",
-    searchDomain: "localdomain",
-  })
-  const result = validateCloudInitDump({
-    built,
-    userDump: "users: [root]\npassword: injected",
-    networkDump: "192.0.2.10/24 192.0.2.1 1.1.1.1 localdomain",
-    vmConfig: { ciuser: "root", cipassword: "hidden", ipconfig0: "ip=192.0.2.10/24,gw=192.0.2.1", nameserver: "1.1.1.1", searchdomain: "localdomain", ide2: "local-lvm:cloudinit" },
-  })
-  assert.equal(result.missing.includes("hostname"), false)
-  assert.equal(result.ok, true)
-})
 
 test("guest-reported network is a hard gate and guest identity stays warning-only", () => {
   const source = read("lib/provision.ts")

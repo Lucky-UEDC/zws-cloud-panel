@@ -40,7 +40,7 @@ import {
   type GuestTarget,
   type ProxmoxGuestClient,
 } from "./proxmox-guest"
-import { parseHostname, parseNativeFsInfo, parseNativeInterfaces, parseNativeOsInfo, parseNativeUsers, parseTimezone } from "./parsers"
+import { hypervisorMacsFromConfig, parseHostname, parseNativeFsInfo, parseNativeInterfaces, parseNativeOsInfo, parseNativeUsers, parseTimezone } from "./parsers"
 import { buildPlan, deriveRunStatus, serializePlan, type GuestStateSnapshot, type OperationPlan, type PlanRequest, EMPTY_SNAPSHOT } from "./plan"
 import { extractPlaceholders, maskCommandSecrets, renderTemplate, unknownPlaceholders } from "./placeholders"
 import { enabledOperations, resolveTemplate, type ResolvedOperation, type ResolvedTemplate } from "./template-resolver"
@@ -58,6 +58,17 @@ export type VmContext = {
     allowInsecureTls: boolean
   }
   clientOptions?: ProxmoxClientOptions
+  /**
+   * This guest is not a panel service, so nothing may be written against it.
+   *
+   * Used by the production QA script and by the admin "Test on VM" action when
+   * an admin points it at a VM the panel does not manage. Without it every call
+   * attempts an adoption or run insert against a `vpsInstanceId` that does not
+   * exist, and the resulting foreign-key error fills an operator's log with
+   * noise about a test. Detection and execution still work; only the record is
+   * skipped.
+   */
+  ephemeral?: boolean
 }
 
 export type Actor = {
@@ -178,13 +189,13 @@ export class GuestAutomationService {
    * costs a round trip each time and can fail intermittently under that load —
    * which presents as a guest that is sometimes "unsupported" for no reason.
    */
-  async detectOs(metadata?: Record<string, unknown> | null): Promise<DetectedOs> {
+  async detectOs(metadata?: Record<string, unknown> | null, options: { persist?: boolean } = {}): Promise<DetectedOs> {
     const cacheKey = JSON.stringify(metadata ?? null)
     const cached = this.detectionCache
     if (cached && cached.key === cacheKey && Date.now() - cached.at < GuestAutomationService.DETECTION_TTL_MS) {
       return cached.detected
     }
-    const detected = await this.detectOsUncached(metadata)
+    const detected = await this.detectOsUncached(metadata, options)
     this.detectionCache = { at: Date.now(), key: cacheKey, detected }
     return detected
   }
@@ -194,7 +205,24 @@ export class GuestAutomationService {
     this.detectionCache = null
   }
 
-  private async detectOsUncached(metadata?: Record<string, unknown> | null): Promise<DetectedOs> {
+  /**
+   * A run id for a guest that is not a panel service.
+   *
+   * `GuestAutomationRun` has a foreign key to a real service, so an external VM
+   * has nowhere to record a run. A synthetic id is returned instead: the run is
+   * still executed and verified, and only the record is skipped, which is the
+   * whole difference between "this guest cannot be tested" and "this guest is not
+   * ours".
+   */
+  private syntheticRunId() {
+    return `ephemeral:${this.ctx.vpsInstanceId}:${this.ctx.vmid}:${Date.now().toString(36)}`
+  }
+
+  private get persists() {
+    return this.ctx.ephemeral !== true
+  }
+
+  private async detectOsUncached(metadata?: Record<string, unknown> | null, options: { persist?: boolean } = {}): Promise<DetectedOs> {
     const running = await this.isRunning()
     const detected = await detectGuestOs({
       client: this.client,
@@ -203,21 +231,31 @@ export class GuestAutomationService {
       running,
       metadata: (metadata ?? null) as any,
     })
-    // Recorded on both outcomes. The adoption row is the cached view admin
-    // pages and later operations share, so a successful detection that is not
-    // recorded leaves every admin page re-probing Proxmox and shows the server as
+    // Recorded on both outcomes. The adoption row is the cached view admin pages
+    // and later operations share, so a successful detection that is not recorded
+    // leaves every admin page re-probing Proxmox and shows the server as
     // un-adopted even though automation works on it.
     //
     // Best-effort in both directions: a failed bookkeeping write must not turn a
     // guest we just identified into "OS detection unavailable", which is what
     // happens if the write is allowed to throw.
-    await persistDetection({
-      vpsInstanceId: this.ctx.vpsInstanceId,
-      detected,
-      guestAgentReachable: detected.kind !== "unknown",
-      automationReady: detected.kind !== "unknown",
-      unsupportedReason: detected.kind === "unknown" ? GUEST_ERROR_MESSAGES.OS_DETECTION_UNAVAILABLE : null,
-    }).catch(() => null)
+    //
+    // Skipped entirely when the guest is ephemeral, or the caller asks.
+    //
+    // An ephemeral guest is not a panel service, so it has no adoption row to
+    // write; every call that reached detection without the flag still tried, and
+    // filled an operator's log with foreign-key errors about a VM the panel does
+    // not manage. Enforced here rather than at each call site, because a per-call
+    // flag is exactly the kind of thing the next caller forgets.
+    if (options.persist !== false && this.ctx.ephemeral !== true) {
+      await persistDetection({
+        vpsInstanceId: this.ctx.vpsInstanceId,
+        detected,
+        guestAgentReachable: detected.kind !== "unknown",
+        automationReady: detected.kind !== "unknown",
+        unsupportedReason: detected.kind === "unknown" ? GUEST_ERROR_MESSAGES.OS_DETECTION_UNAVAILABLE : null,
+      }).catch(() => null)
+    }
     return detected
   }
 
@@ -322,7 +360,13 @@ export class GuestAutomationService {
       guestNative(target, "get-timezone").catch(() => null),
     ])
 
-    const parsedInterfaces = networks?.ok ? parseNativeInterfaces(networks.data) : null
+    // The MACs Proxmox assigned to this VM, so the primary interface can be the
+    // NIC the customer was actually sold rather than whichever bridge the guest
+    // happens to be running.
+    const vmConfig = await this.proxmoxClient.getVMConfig(this.ctx.nodeName, this.ctx.vmid).catch(() => null)
+    const parsedInterfaces = networks?.ok
+      ? parseNativeInterfaces(networks.data, { hypervisorMacs: hypervisorMacsFromConfig(vmConfig) })
+      : null
     const parsedHostname = hostname?.ok ? parseHostname(hostname.data) : ""
     const parsedUsers = users?.ok ? parseNativeUsers(users.data) : []
     const parsedFs = fsinfo?.ok ? parseNativeFsInfo(fsinfo.data) : []
@@ -648,23 +692,25 @@ export class GuestAutomationService {
     const actor = input.actor ?? {}
     const runId =
       input.runId ??
-      (
-        await prisma.guestAutomationRun.create({
-          data: {
-            vpsInstanceId: this.ctx.vpsInstanceId,
-            trigger,
-            operations: plan.operations.map((operation) => operation.operation) as any,
-            status: "running",
-            startedAt: new Date(),
-            templateId: plan.template.id,
-            templateVersion: plan.template.version,
-            requestedBy: actor.requestedBy ?? null,
-            requestedRole: actor.role ?? null,
-            backupPoint: this.backupPointFor(plan) as any,
-            metadata: { vmid: this.ctx.vmid, node: this.ctx.nodeName, os: plan.detected.osId } as any,
-          },
-        })
-      ).id
+      (this.persists
+        ? (
+            await prisma.guestAutomationRun.create({
+              data: {
+                vpsInstanceId: this.ctx.vpsInstanceId,
+                trigger,
+                operations: plan.operations.map((operation) => operation.operation) as any,
+                status: "running",
+                startedAt: new Date(),
+                templateId: plan.template.id,
+                templateVersion: plan.template.version,
+                requestedBy: actor.requestedBy ?? null,
+                requestedRole: actor.role ?? null,
+                backupPoint: this.backupPointFor(plan) as any,
+                metadata: { vmid: this.ctx.vmid, node: this.ctx.nodeName, os: plan.detected.osId } as any,
+              },
+            })
+          ).id
+        : this.syntheticRunId())
 
     const steps: OperationOutcome[] = []
     const stopOnFailure = input.stopOnFailure ?? true
@@ -689,7 +735,7 @@ export class GuestAutomationService {
 
       const outcome = await this.executeStep(runId, planned.operation, planned.template!, plan, actor)
       steps.push(outcome)
-      await this.persistStep(runId, outcome, plan)
+      if (this.persists) await this.persistStep(runId, outcome, plan)
 
       const failed = outcome.status === "failed" || outcome.status === "timeout" || outcome.status === "unsupported"
       if (failed) {
@@ -701,16 +747,18 @@ export class GuestAutomationService {
     }
 
     const status = deriveRunStatus(steps)
-    await prisma.guestAutomationRun.update({
-      where: { id: runId },
-      data: {
-        status,
-        completedAt: new Date(),
-        error: steps.find((step) => step.error)?.error ?? null,
-      },
-    })
+    if (this.persists) {
+      await prisma.guestAutomationRun.update({
+        where: { id: runId },
+        data: {
+          status,
+          completedAt: new Date(),
+          error: steps.find((step) => step.error)?.error ?? null,
+        },
+      })
+    }
 
-    if (trigger === "first_boot" && status === "success") {
+    if (trigger === "first_boot" && status === "success" && this.persists) {
       await prisma.vmGuestAdoption
         .updateMany({
           where: { vpsInstanceId: this.ctx.vpsInstanceId },
@@ -730,6 +778,8 @@ export class GuestAutomationService {
       error: steps.find((step) => step.error)?.error ?? null,
       errorCode: steps.find((step) => step.errorCode)?.errorCode ?? null,
     }
+
+    if (!this.persists) return result
 
     await writeAuditLog({
       action: `guest_run_${result.ok ? "succeeded" : "failed"}`,
@@ -961,6 +1011,7 @@ export class GuestAutomationService {
       command?: string | null
       verificationCommand?: string | null
       verificationParser?: string | null
+      verificationArgs?: Record<string, unknown>
       successCondition?: string | null
       dangerLevel?: string
       requiresConfirmation?: boolean
@@ -1049,6 +1100,7 @@ export class GuestAutomationService {
       command?: string | null
       verificationCommand?: string | null
       verificationParser?: string | null
+      verificationArgs?: Record<string, unknown>
       successCondition?: string | null
       dangerLevel?: string
       requiresConfirmation?: boolean
@@ -1085,6 +1137,7 @@ export class GuestAutomationService {
         command: input.draft.command ?? null,
         verificationCommand: input.draft.verificationCommand ?? null,
         verificationParser: (input.draft.verificationParser || null) as any,
+        verificationArgs: input.draft.verificationArgs ?? null,
         successCondition: input.draft.successCondition ?? null,
         dangerLevel: (input.draft.dangerLevel || "safe") as any,
         requiresConfirmation: input.draft.requiresConfirmation === true,
@@ -1112,19 +1165,20 @@ export class GuestAutomationService {
       definition = stored
     }
 
-    const run = await prisma.guestAutomationRun.create({
-      data: {
-        vpsInstanceId: this.ctx.vpsInstanceId,
-        trigger: "admin_test",
-        operations: [input.operation] as any,
-        status: "running",
-        startedAt: new Date(),
-        templateId: definition && "templateId" in definition ? (definition as any).templateId : null,
-        requestedBy: input.actor?.requestedBy ?? null,
-        requestedRole: input.actor?.role ?? null,
-        metadata: { vmid: this.ctx.vmid, node: this.ctx.nodeName, os: detected.osId, operation: input.operation, unsavedDraft: Boolean(input.draft) } as any,
-      },
-    })
+    const run = this.persists
+      ? await prisma.guestAutomationRun.create({
+          data: {
+            vpsInstanceId: this.ctx.vpsInstanceId,
+            trigger: "admin_test",
+            operations: [input.operation] as any,
+            status: "running",
+            templateId: definition && "templateId" in definition ? (definition as any).templateId : null,
+            requestedBy: input.actor?.requestedBy ?? null,
+            requestedRole: input.actor?.role ?? null,
+            metadata: { vmid: this.ctx.vmid, node: this.ctx.nodeName, os: detected.osId, operation: input.operation, unsavedDraft: Boolean(input.draft) } as any,
+          },
+        })
+      : { id: this.syntheticRunId() }
 
     const plan: OperationPlan = {
       vmid: this.ctx.vmid,
@@ -1151,15 +1205,17 @@ export class GuestAutomationService {
     }
 
     const outcome = await this.executeStep(run.id, input.operation, definition, plan, input.actor ?? { requestedBy: "system:admin-test", role: "admin" })
-    await this.persistStep(run.id, outcome, plan)
-    await prisma.guestAutomationRun.update({
-      where: { id: run.id },
-      data: {
-        status: outcome.status === "success" ? "success" : outcome.status === "skipped" ? "success" : "failed",
-        completedAt: new Date(),
-        error: outcome.error,
-      },
-    })
+    if (this.persists) {
+      await this.persistStep(run.id, outcome, plan)
+      await prisma.guestAutomationRun.update({
+        where: { id: run.id },
+        data: {
+          status: outcome.status === "success" ? "success" : outcome.status === "skipped" ? "success" : "failed",
+          completedAt: new Date(),
+          error: outcome.error,
+        },
+      })
+    }
 
     return { ok: true, runId: run.id, outcome }
   }
@@ -1318,9 +1374,15 @@ export class GuestAutomationService {
   private expectedFor(operation: GuestOperation, plan: OperationPlan): Record<string, unknown> {
     const planned = plan.operations.find((entry) => entry.operation === operation)
     const values = planned?.values ?? {}
+    // Get verificationArgs from the template definition if available
+    const templateDef = plan.template?.operations?.get(operation)
+    const verificationArgs = templateDef?.verificationArgs ?? {}
     switch (operation) {
       case "set_ip":
-        return { ip: values.IP, gateway: values.GATEWAY }
+        // For exit-code verification, we need contains to be empty string so the
+        // generic verification passes (it checks for expected.contains or expected.equals).
+        // The exit code is already validated by execGuestCommand.
+        return { ip: values.IP, gateway: values.GATEWAY, contains: "" }
       case "set_gateway":
         return { ip: values.IP }
       case "set_dns":
@@ -1330,6 +1392,9 @@ export class GuestAutomationService {
       case "create_user":
         return { expectedUsername: values.USERNAME }
       case "set_password":
+        // For cmd-output-contains parser, we need to pass the expected string to match in output
+        const contains = verificationArgs.contains as string | undefined
+        if (contains) return { contains, expectedUsername: values.USERNAME }
         return { expectedUsername: values.USERNAME }
       case "timezone":
         return { timezone: values.TIMEZONE }

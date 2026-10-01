@@ -94,7 +94,59 @@ function seedOperationNames(template: SeedTemplate): Set<string> {
   return new Set(template.operations.map((operation) => operation.operation))
 }
 
-async function seedOne(template: SeedTemplate): Promise<SeedReport> {
+/**
+ * Find the Proxmox catalogue template a guest profile belongs to.
+ *
+ * Without this link, the catalogue says a template exists and the guest profiles
+ * say an OS is supported, and nothing joins them: the admin UI cannot show which
+ * test VM proves a profile, and "is there a real test guest for this OS?" is
+ * unanswerable.
+ *
+ * Matched on family and version rather than on name, because the names differ
+ * (`ubuntu-2004-2204` against `Ubuntu-22-04`) and the names are not the identity.
+ * The catalogue's own OS ids are matched against the profile's claimed ids where
+ * possible, which is the same signal guest detection uses — so the link stays
+ * correct even if a name is edited.
+ */
+export async function resolveOsTemplateId(template: SeedTemplate, catalog: Array<{ id: string; osFamily: string | null; osVersion: string | null; name: string | null; slug: string | null; proxmoxTemplateName: string | null; isActive: boolean }>): Promise<{ id: string; how: string } | null> {
+  const family = String(template.family || "").toLowerCase()
+  const wanted = String(template.versionPattern || "").replace(/[$^]/g, "").trim()
+  const versionDigits = wanted.match(/\d+(?:\.\d+)?/)?.[0] || null
+  const claimed = new Set(template.osIds.map((id) => id.toLowerCase()))
+
+  const familyMatches = catalog.filter((row) => {
+    const rowFamily = String(row.osFamily || row.slug || "").toLowerCase()
+    if (!rowFamily) return false
+    if (rowFamily === family) return true
+    // "linux" in the catalogue covers several guests; the profile's claimed ids
+    // decide.
+    if (rowFamily === "linux") return [...claimed].some((id) => row.name?.toLowerCase().includes(id.split("-")[0]) || row.slug?.toLowerCase().includes(id.split("-")[0]))
+    return false
+  })
+  if (!familyMatches.length) return null
+
+  if (versionDigits) {
+    const exact = familyMatches.find((row) => String(row.osVersion || "").includes(versionDigits))
+    if (exact) return { id: exact.id, how: `family=${family} version~${versionDigits}` }
+  }
+  // A profile that spans several versions (ubuntu-2004-2204) takes the newest
+  // matching row, which is the one a new deployment would actually use.
+  const versions = familyMatches
+    .map((row) => ({ row, v: versionNumber(String(row.osVersion || "")) }))
+    .filter((entry) => entry.v !== null)
+    .sort((a, b) => (b.v as number) - (a.v as number))
+  if (versions.length) return { id: versions[0].row.id, how: `family=${family} newest` }
+  return { id: familyMatches[0].id, how: `family=${family} only match` }
+}
+
+function versionNumber(value: string): number | null {
+  const parts = value.match(/\d+(?:\.\d+)?/g)
+  if (!parts?.length) return null
+  const numbers = parts.map(Number)
+  return numbers[0] * 1000 + (numbers[1] || 0)
+}
+
+async function seedOne(template: SeedTemplate, link: { id: string; how: string } | null = null): Promise<SeedReport> {
   const errors = validateSeed(template)
   if (errors.length) return { slug: template.slug, action: "invalid", errors }
 
@@ -135,6 +187,7 @@ async function seedOne(template: SeedTemplate): Promise<SeedReport> {
       engine: template.engine,
       priority: template.priority,
       description: template.description ?? null,
+      osTemplateId: link?.id ?? null,
       version,
     },
     update: {
@@ -147,6 +200,10 @@ async function seedOne(template: SeedTemplate): Promise<SeedReport> {
       engine: template.engine,
       priority: template.priority,
       description: template.description ?? null,
+      // Re-linked on every run. The catalogue is the authority on which
+      // Proxmox template backs a profile; a stale link would point an admin at a
+      // template that no longer carries that OS.
+      ...(link ? { osTemplateId: link.id } : {}),
       version,
     },
   })
@@ -169,13 +226,18 @@ async function seedOne(template: SeedTemplate): Promise<SeedReport> {
 
 async function main() {
   const report: SeedReport[] = []
+  const catalog = await prisma.osTemplate.findMany({
+    where: { proxmoxVmid: { not: null } },
+    select: { id: true, osFamily: true, osVersion: true, name: true, slug: true, proxmoxTemplateName: true, isActive: true },
+  }).catch(() => [])
   for (const template of DEFAULT_GUEST_TEMPLATES) {
     if (verifyOnly) {
       const errors = validateSeed(template)
       report.push({ slug: template.slug, action: errors.length ? "invalid" : "unchanged", errors, operations: template.operations.length })
       continue
     }
-    report.push(await seedOne(template))
+    const link = await resolveOsTemplateId(template, catalog as any)
+    report.push(await seedOne(template, link))
   }
 
   const counts = report.reduce<Record<string, number>>((acc, item) => {
