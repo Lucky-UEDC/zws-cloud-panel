@@ -5,7 +5,7 @@ set -Eeuo pipefail
 # This is the main installer called by install-source.sh
 
 REPO_URL="${ZWS_REPO_URL:-https://github.com/Lucky-UEDC/zws-cloud-panel.git}"
-BRANCH="${ZWS_BRANCH:-main}"
+BRANCH="${BRANCH:-${ZWS_BRANCH:-main}}"
 ROOT_DIR="${ROOT_DIR:-/var/www/myrdphub}"
 ENV_FILE="${ENV_FILE:-$ROOT_DIR/.env}"
 
@@ -222,6 +222,17 @@ sync_repo() {
     fi
     return
   fi
+  
+  # Build authenticated repo URL if GITHUB_TOKEN is provided
+  local clone_url="$REPO_URL"
+  if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+    # Convert https://github.com/owner/repo.git to https://TOKEN@github.com/owner/repo.git
+    clone_url="${REPO_URL/https:\/\/github.com\//https:\/\/${GITHUB_TOKEN}@github.com\/}"
+    log "Using authenticated GitHub clone (token provided)"
+  else
+    log "Using public GitHub clone (no token)"
+  fi
+  
   mkdir -p "$(dirname "$ROOT_DIR")"
   if [[ -d "$ROOT_DIR/.git" ]]; then
     log "Updating repository at $ROOT_DIR"
@@ -231,7 +242,7 @@ sync_repo() {
   else
     log "Cloning repository to $ROOT_DIR"
     rm -rf "$ROOT_DIR"
-    git clone --branch "$BRANCH" "$REPO_URL" "$ROOT_DIR"
+    git clone --branch "$BRANCH" "$clone_url" "$ROOT_DIR"
   fi
 }
 
