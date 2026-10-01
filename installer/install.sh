@@ -215,6 +215,13 @@ prepare_origin_certs() {
 }
 
 sync_repo() {
+  if [[ "${SKIP_GIT_CLONE:-0}" == "1" ]]; then
+    log "Skipping git clone (SKIP_GIT_CLONE=1)"
+    if [[ ! -d "$ROOT_DIR" ]]; then
+      fail "ROOT_DIR $ROOT_DIR does not exist and SKIP_GIT_CLONE=1"
+    fi
+    return
+  fi
   mkdir -p "$(dirname "$ROOT_DIR")"
   if [[ -d "$ROOT_DIR/.git" ]]; then
     log "Updating repository at $ROOT_DIR"
