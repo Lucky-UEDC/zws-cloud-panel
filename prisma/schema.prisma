@@ -861,6 +861,10 @@ model VpsInstance {
   bandwidthUsageAlerts            BandwidthUsageAlert[]
   bandwidthThrottleState          BandwidthThrottleState?
   snapshotCharges                 SnapshotCharge[]
+  guestAdoption                   VmGuestAdoption?
+  guestAutomationRuns             GuestAutomationRun[]
+  guestOperationRuns              GuestOperationRun[]
+  guestDiskSamples                GuestDiskSample[]
 
   @@index([customerId])
   @@index([customerId, deletedAt, status])
@@ -3716,37 +3720,38 @@ model WhatsAppWebhookEvent {
 }
 
 model WhatsAppGatewayMessage {
-  id                String    @id @default(cuid())
-  provider          String    @default("whatsapp_gateway")
-  direction         String    @default("outbound")
-  gatewayId         String?   @map("gateway_id")
-  externalMessageId String?   @map("external_message_id")
-  waMessageId       String?   @map("wa_message_id")
-  contactId         String?   @map("contact_id")
-  contactNo         String    @map("contact_no")
-  contactHash       String?   @map("contact_hash")
-  maskedContact     String    @map("masked_contact")
-  contactName       String?   @map("contact_name")
-  senderNumber      String?   @map("sender_number")
-  senderNumberId    String?   @map("sender_number_id")
-  wabaId            String?   @map("waba_id")
-  messageType       String    @default("text") @map("message_type")
-  message           String?   @db.Text
-  mediaUrl          String?   @map("media_url") @db.Text
-  mediaName         String?   @map("media_name")
-  mediaMimeType     String?   @map("media_mime_type")
-  location          Json      @default("{}")
-  status            String    @default("queued")
-  retryCount        Int       @default(0) @map("retry_count")
-  httpStatus        Int?      @map("http_status")
-  latencyMs         Int?      @map("latency_ms")
-  providerResponse  Json      @default("{}") @map("provider_response")
-  sanitizedError    String?   @map("sanitized_error") @db.Text
-  sentBy            String?   @map("sent_by")
-  createdAt         DateTime  @default(now()) @map("created_at")
-  updatedAt         DateTime  @updatedAt @map("updated_at")
+  id                String   @id @default(cuid())
+  provider          String   @default("whatsapp_gateway")
+  direction         String   @default("outbound")
+  gatewayId         String?  @map("gateway_id")
+  externalMessageId String?  @map("external_message_id")
+  waMessageId       String?  @map("wa_message_id")
+  contactId         String?  @map("contact_id")
+  contactNo         String   @map("contact_no")
+  contactHash       String?  @map("contact_hash")
+  maskedContact     String   @map("masked_contact")
+  contactName       String?  @map("contact_name")
+  senderNumber      String?  @map("sender_number")
+  senderNumberId    String?  @map("sender_number_id")
+  wabaId            String?  @map("waba_id")
+  messageType       String   @default("text") @map("message_type")
+  message           String?  @db.Text
+  mediaUrl          String?  @map("media_url") @db.Text
+  mediaName         String?  @map("media_name")
+  mediaMimeType     String?  @map("media_mime_type")
+  location          Json     @default("{}")
+  status            String   @default("queued")
+  retryCount        Int      @default(0) @map("retry_count")
+  httpStatus        Int?     @map("http_status")
+  latencyMs         Int?     @map("latency_ms")
+  providerResponse  Json     @default("{}") @map("provider_response")
+  sanitizedError    String?  @map("sanitized_error") @db.Text
+  sentBy            String?  @map("sent_by")
+  createdAt         DateTime @default(now()) @map("created_at")
+  updatedAt         DateTime @updatedAt @map("updated_at")
 
   contact WhatsAppGatewayContact? @relation(fields: [contactId], references: [id])
+
   @@index([provider, createdAt])
   @@index([contactNo])
   @@index([contactId])
@@ -3772,6 +3777,7 @@ model WhatsAppGatewayContact {
   updatedAt   DateTime @updatedAt @map("updated_at")
 
   messages WhatsAppGatewayMessage[]
+
   @@index([provider, phoneNumber])
   @@index([provider, createdAt])
   @@index([externalId])
@@ -3779,18 +3785,19 @@ model WhatsAppGatewayContact {
 }
 
 model WhatsAppGatewayWaba {
-  id                          String   @id @default(cuid())
-  provider                    String   @default("whatsapp_gateway")
-  externalId                  String   @map("external_id")
-  name                        String?
-  whatsappBusinessAccountId   String?  @map("whatsapp_business_account_id")
-  isActive                    Boolean  @default(true) @map("is_active")
-  lastSyncedAt                DateTime @map("last_synced_at")
-  createdAt                   DateTime @default(now()) @map("created_at")
-  updatedAt                   DateTime @updatedAt @map("updated_at")
+  id                        String   @id @default(cuid())
+  provider                  String   @default("whatsapp_gateway")
+  externalId                String   @map("external_id")
+  name                      String?
+  whatsappBusinessAccountId String?  @map("whatsapp_business_account_id")
+  isActive                  Boolean  @default(true) @map("is_active")
+  lastSyncedAt              DateTime @map("last_synced_at")
+  createdAt                 DateTime @default(now()) @map("created_at")
+  updatedAt                 DateTime @updatedAt @map("updated_at")
 
   phoneNumbers WhatsAppGatewayPhoneNumber[]
-  templates     WhatsAppGatewayTemplate[]
+  templates    WhatsAppGatewayTemplate[]
+
   @@unique([provider, externalId])
   @@index([provider, isActive])
   @@map("whatsapp_gateway_wabas")
@@ -3810,6 +3817,7 @@ model WhatsAppGatewayPhoneNumber {
   updatedAt          DateTime @updatedAt @map("updated_at")
 
   waba WhatsAppGatewayWaba? @relation(fields: [wabaId], references: [id])
+
   @@unique([provider, externalId])
   @@index([provider, isActive])
   @@index([wabaId])
@@ -3841,6 +3849,7 @@ model WhatsAppGatewayTemplate {
   updatedAt        DateTime @updatedAt @map("updated_at")
 
   waba WhatsAppGatewayWaba? @relation(fields: [wabaId], references: [id])
+
   @@unique([provider, wabaId, templateName])
   @@index([provider, wabaId, createdAt])
   @@index([category])
@@ -5058,11 +5067,255 @@ model OsTemplate {
   proxmoxNode         ProxmoxNode?  @relation(fields: [proxmoxNodeId], references: [id])
   vpsInstances        VpsInstance[]
 
+  guestOsTemplates GuestOSTemplate[]
+  guestAdoption   VmGuestAdoption[]
+
   @@unique([proxmoxNodeId, proxmoxStorage, proxmoxVolumeId])
   @@unique([proxmoxNodeId, proxmoxVmid])
   @@index([proxmoxNodeId, slug])
   @@index([osFamily, osVersion, isActive])
   @@map("os_templates")
+}
+
+// ---------------------------------------------------------------------------
+// Guest automation (qm guest / QEMU Guest Agent) — no cloud-init dependency.
+//
+// Adding a new supported OS is a CONFIGURATION task: an admin creates a
+// GuestOSTemplate plus its GuestOperationTemplate rows. No application code
+// change is required, and the operation definitions are versioned so an
+// upgrade never silently mutates an already-deployed VM.
+// ---------------------------------------------------------------------------
+
+/// One supported operating system family/version, e.g. "ubuntu" + 24.04.
+model GuestOSTemplate {
+  id                 String                   @id @default(cuid())
+  name               String
+  slug               String                   @unique
+  /// QGA `get-osinfo` id-prefix set this template claims, e.g. "ubuntu", "rocky".
+  family             String
+  /// Comma-free list is stored in `osIds` Json; kept indexed via family.
+  osIds              Json                     @default("[]")
+  /// Anchored regular expression source matched against the GATEWAY OS version.
+  versionPattern     String?
+  enabled            Boolean                  @default(false)
+  guestAgentRequired Boolean                  @default(true) @map("guest_agent_required")
+  /// "linux" | "windows" — the ONLY thing that decides which engine may run.
+  engine             String                   @default("linux")
+  /// Higher wins when several templates match the detected OS.
+  priority           Int                      @default(100)
+  description        String?
+  /// Bumped by the admin editor; recorded per-applied-operation.
+  version            Int                      @default(1)
+  lastTestedAt       DateTime?                @map("last_tested_at")
+  lastTestResult     Json?                    @map("last_test_result")
+  /// The Proxmox catalogue template this profile is proven against.
+  ///
+  /// Many-to-one, not one-to-one: one Proxmox template named `Windows Latest`
+  /// backs the 2019, 2022 and 2025 guest profiles, and one `CentOS-8` image
+  /// backs more than one RHEL-family profile. A unique constraint here made the
+  /// link impossible to express and would have left most profiles unlinked.
+  osTemplateId       String?                  @map("os_template_id")
+  createdAt          DateTime                 @default(now())
+  updatedAt          DateTime                 @updatedAt
+  operations         GuestOperationTemplate[]
+  osTemplate         OsTemplate?              @relation(fields: [osTemplateId], references: [id])
+  vms                VmGuestAdoption[]
+
+  @@index([family, engine, enabled])
+  @@index([osTemplateId])
+  @@index([enabled, priority])
+  @@map("guest_os_templates")
+}
+
+/// One admin-defined, OS-specific operation (set_ip, disk_usage, ...).
+model GuestOperationTemplate {
+  id                   String          @id @default(cuid())
+  templateId           String          @map("template_id")
+  operation            String
+  enabled              Boolean         @default(true)
+  /// "guest-native" uses a `qm guest cmd` verb; "guest-exec" runs a shell command.
+  commandType          String          @default("guest-exec") @map("command_type")
+  /// linux-sh | linux-bash | windows-powershell | windows-cmd | windows-netsh
+  shell                String          @default("linux-sh")
+  /// Template command body. Placeholders are resolved server-side only.
+  command              String?
+  /// Structured argv used when commandType is guest-native.
+  arguments            Json            @default("[]")
+  timeoutSeconds       Int             @default(30) @map("timeout_seconds")
+  requiresRunning      Boolean         @default(true) @map("requires_running")
+  requiresStopped      Boolean         @default(false) @map("requires_stopped")
+  requiresGuestAgent   Boolean         @default(true) @map("requires_guest_agent")
+  rebootRequired       Boolean         @default(false) @map("reboot_required")
+  /// safe | caution | dangerous — gates confirmation + auto-rollback.
+  dangerLevel          String          @default("safe") @map("danger_level")
+  requiresConfirmation Boolean         @default(false) @map("requires_confirmation")
+  supportsRollback     Boolean         @default(false) @map("supports_rollback")
+  verificationRequired Boolean         @default(true) @map("verification_required")
+  /// Native QGA verb used for verification, e.g. network-get-interfaces.
+  verificationCommand  String?         @map("verification_command")
+  /// Parser id: df-posix | win-logicaldisk | native-json | exit-code | none
+  verificationParser   String?         @map("verification_parser")
+  successCondition     String?         @map("success_condition")
+  rollbackCommand      String?         @map("rollback_command")
+  rollbackArguments    Json?           @map("rollback_arguments")
+  /// Ordered alternatives attempted when the primary command fails.
+  fallbacks            Json            @default("[]")
+  /// Dotted state key this operation satisfies, used for idempotency checks.
+  stateKey             String?         @map("state_key")
+  notes                String?
+  createdAt            DateTime        @default(now())
+  updatedAt            DateTime        @updatedAt
+  template             GuestOSTemplate @relation(fields: [templateId], references: [id], onDelete: Cascade)
+
+  @@unique([templateId, operation])
+  @@index([templateId, enabled])
+  @@map("guest_operation_templates")
+}
+
+/// Per-VM record of the detected guest state + which template version is live.
+model VmGuestAdoption {
+  id                     String           @id @default(cuid())
+  vpsInstanceId          String           @unique @map("vps_instance_id")
+  osTemplateId           String?          @map("os_template_id")
+  guestTemplateId        String?          @map("guest_template_id")
+  appliedTemplateVersion Int?             @map("applied_template_version")
+  engine                 String           @default("unknown")
+  detectedOsId           String?          @map("detected_os_id")
+  detectedName           String?          @map("detected_name")
+  detectedVersion        String?          @map("detected_version")
+  detectedKernelVersion  String?          @map("detected_kernel_version")
+  /// { interfaces, filesystems, hostname, timezone, users } — last observed truth.
+  state                  Json             @default("{}")
+  automationReady        Boolean          @default(false) @map("automation_ready")
+  guestAgentReachable    Boolean          @default(false) @map("guest_agent_reachable")
+  guestAgentCheckedAt    DateTime?        @map("guest_agent_checked_at")
+  unsupportedReason      String?          @map("unsupported_reason")
+  recoveryRequired       Boolean          @default(false) @map("recovery_required")
+  recoveryReason         String?          @map("recovery_reason")
+  lastDetectedAt         DateTime?        @map("last_detected_at")
+  adoptedAt              DateTime?        @map("adopted_at")
+  createdAt              DateTime         @default(now())
+  updatedAt              DateTime         @updatedAt
+  vpsInstance            VpsInstance      @relation(fields: [vpsInstanceId], references: [id], onDelete: Cascade)
+  osTemplate             OsTemplate?      @relation(fields: [osTemplateId], references: [id])
+  guestTemplate          GuestOSTemplate? @relation(fields: [guestTemplateId], references: [id])
+
+  @@index([guestTemplateId])
+  @@index([engine, automationReady])
+  @@map("vm_guest_adoptions")
+}
+
+/// A planned unit of guest work (first-boot, customer change, or repair).
+model GuestAutomationRun {
+  id              String              @id @default(cuid())
+  vpsInstanceId   String              @map("vps_instance_id")
+  /// first_boot | customer_change | repair | admin_test | scheduled
+  trigger         String
+  /// set_ip,set_dns,... — the plan, in execution order.
+  operations      Json                @default("[]")
+  status          String              @default("pending") // pending|running|success|failed|partial|rolled_back
+  currentStep     String?             @map("current_step")
+  templateId      String?             @map("template_id")
+  templateVersion Int?                @map("template_version")
+  requestedBy     String?             @map("requested_by")
+  requestedRole   String?             @map("requested_role")
+  /// Safety net for destructive ops: old values captured before execution.
+  backupPoint     Json                @default("{}") @map("backup_point")
+  error           String?
+  metadata        Json                @default("{}")
+  startedAt       DateTime?           @map("started_at")
+  completedAt     DateTime?           @map("completed_at")
+  createdAt       DateTime            @default(now())
+  updatedAt       DateTime            @updatedAt
+  vpsInstance     VpsInstance         @relation(fields: [vpsInstanceId], references: [id], onDelete: Cascade)
+  steps           GuestOperationRun[]
+
+  @@index([vpsInstanceId, createdAt])
+  @@index([status, createdAt])
+  @@map("guest_automation_runs")
+}
+
+/// One executed step of a run. Secrets are NEVER written to this table.
+model GuestOperationRun {
+  id              String             @id @default(cuid())
+  runId           String             @map("run_id")
+  vpsInstanceId   String             @map("vps_instance_id")
+  operation       String
+  templateId      String?            @map("template_id")
+  templateVersion Int?               @map("template_version")
+  commandType     String?            @map("command_type")
+  shell           String?            @map("shell")
+  /// Masked command for display/audit — placeholders resolved, secrets redacted.
+  commandMasked   String?            @map("command_masked")
+  /// success | already_applied | skipped | failed | timeout | unsupported
+  status          String
+  changed         Boolean            @default(false)
+  verified        Boolean            @default(false)
+  verificationOk  Boolean            @default(false) @map("verification_ok")
+  proxmoxUpid     String?            @map("proxmox_upid")
+  exitCode        Int?               @map("exit_code")
+  durationMs      Int?               @map("duration_ms")
+  attempts        Int                @default(1)
+  errorCode       String?            @map("error_code")
+  error           String?
+  /// Structured, non-sensitive result payload.
+  result          Json               @default("{}")
+  startedAt       DateTime           @default(now()) @map("started_at")
+  finishedAt      DateTime?          @map("finished_at")
+  createdAt       DateTime           @default(now())
+  run             GuestAutomationRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+  vpsInstance     VpsInstance        @relation(fields: [vpsInstanceId], references: [id], onDelete: Cascade)
+
+  @@index([runId])
+  @@index([vpsInstanceId, operation, createdAt])
+  @@index([status, createdAt])
+  @@map("guest_operation_runs")
+}
+
+/// Cached Proxmox node capability probe — a node is not "Ready" until this passes.
+model NodeGuestCapabilities {
+  id            String      @id @default(cuid())
+  nodeId        String      @unique @map("node_id")
+  status        String      @default("pending") // pending|ready|degraded|failed
+  capabilities  Json        @default("{}")
+  checks        Json        @default("[]")
+  lastCheckedAt DateTime?   @map("last_checked_at")
+  lastSuccessAt DateTime?   @map("last_success_at")
+  lastError     String?     @map("last_error")
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+  node          ProxmoxNode @relation(fields: [nodeId], references: [id], onDelete: Cascade)
+
+  @@map("node_guest_capabilities")
+}
+
+/// Append-only guest disk/telemetry samples. Real measurements only.
+model GuestDiskSample {
+  id            String      @id @default(cuid())
+  vpsInstanceId String      @map("vps_instance_id")
+  proxmoxNodeId String?     @map("proxmox_node_id")
+  vmid          Int?
+  os            String      @default("unknown")
+  engine        String?     @map("engine")
+  templateId    String?     @map("template_id")
+  operation     String      @default("disk_usage")
+  filesystem    String?
+  totalBytes    BigInt      @map("total_bytes")
+  usedBytes     BigInt      @map("used_bytes")
+  freeBytes     BigInt      @map("free_bytes")
+  usedPercent   Decimal     @db.Decimal(6, 2)
+  source        String      @default("guest-agent")
+  status        String      @default("current")
+  errorCode     String?     @map("error_code")
+  error         String?
+  collectionMs  Int?        @map("collection_ms")
+  recordedAt    DateTime    @default(now()) @map("recorded_at")
+  vpsInstance   VpsInstance @relation(fields: [vpsInstanceId], references: [id], onDelete: Cascade)
+
+  @@index([vpsInstanceId, recordedAt])
+  @@index([vpsInstanceId, filesystem, recordedAt])
+  @@index([recordedAt])
+  @@map("guest_disk_samples")
 }
 
 model ProxmoxNode {
@@ -5113,6 +5366,7 @@ model ProxmoxNode {
   duplicateVmIncidents   DuplicateVmIncident[]
   vmActionJobs           VmActionJob[]
   defaultProducts        Product[]                @relation("product_default_node")
+  guestCapabilities      NodeGuestCapabilities?
 
   @@index([nodeClassId])
   @@map("proxmox_nodes")
@@ -5694,8 +5948,24 @@ model VmUsageHistory {
   metadata      Json     @default("{}")
   createdAt     DateTime @default(now()) @map("created_at")
 
+  // Retention tiers. Raw samples are folded into 5m rows after seven days and
+  // into 1h rows after thirty, so the table holds a bounded number of rows per
+  // VM rather than one every thirty seconds forever. Nullable and defaulted so
+  // every existing row stays valid and counts as raw.
+  vpsInstanceId String?   @map("vps_instance_id")
+  /// "raw" | "5m" | "1h" — the resolution of this row.
+  resolution    String    @default("raw")
+  /// The bucket this row represents. Null on pre-existing rows, which are raw
+  /// samples whose bucket is `createdAt`.
+  recordedAt    DateTime? @map("recorded_at")
+  diskFree      BigInt    @default(0) @map("disk_free")
+  /// How many raw samples this rollup folded. 1 on a raw row.
+  sampleCount   Int       @default(1) @map("sample_count")
+
   @@index([vmId, createdAt])
   @@index([createdAt])
+  @@index([vpsInstanceId, resolution, recordedAt])
+  @@index([resolution, recordedAt])
   @@map("vm_usage_history")
 }
 
@@ -5722,33 +5992,33 @@ model ApiKey {
 
 /// Billable backup plan product (admin-configured; not a raw Proxmox concept).
 model BackupPlan {
-  id                  String   @id @default(cuid())
-  name                String
-  slug                String   @unique
-  description         String?
-  active              Boolean  @default(true)
-  archived            Boolean  @default(false)
-  featured            Boolean  @default(false)
-  price               Decimal  @default(0) @db.Decimal(10, 2)
-  currency            String   @default("INR")
-  billingCycle        String   @default("monthly")
-  taxPercent          Decimal  @default(18) @db.Decimal(5, 2)
-  maxBackups          Int      @default(10)
-  storageQuotaGb      Int      @default(100)
-  manualBackupEnabled Boolean  @default(true) @map("manual_backup_enabled")
-  automaticBackupEnabled Boolean @default(true) @map("automatic_backup_enabled")
-  scheduleOptions     Json     @default("[]") @map("schedule_options")
-  retentionCount      Int      @default(10) @map("retention_count")
-  restoreEnabled      Boolean  @default(true) @map("restore_enabled")
-  downloadEnabled     Boolean  @default(false) @map("download_enabled")
-  overageEnabled      Boolean  @default(true) @map("overage_enabled")
-  overagePricePerGb   Decimal  @default(0) @db.Decimal(10, 2) @map("overage_price_per_gb")
-  extraStoragePricePerGb Decimal @default(0) @db.Decimal(10, 2) @map("extra_storage_price_per_gb")
-  gracePeriodDays     Int      @default(3) @map("grace_period_days")
-  maxStorageCapGb     Int?     @map("max_storage_cap_gb")
-  metadata            Json     @default("{}")
-  createdAt           DateTime @default(now()) @map("created_at")
-  updatedAt           DateTime @updatedAt @map("updated_at")
+  id                     String   @id @default(cuid())
+  name                   String
+  slug                   String   @unique
+  description            String?
+  active                 Boolean  @default(true)
+  archived               Boolean  @default(false)
+  featured               Boolean  @default(false)
+  price                  Decimal  @default(0) @db.Decimal(10, 2)
+  currency               String   @default("INR")
+  billingCycle           String   @default("monthly")
+  taxPercent             Decimal  @default(18) @db.Decimal(5, 2)
+  maxBackups             Int      @default(10)
+  storageQuotaGb         Int      @default(100)
+  manualBackupEnabled    Boolean  @default(true) @map("manual_backup_enabled")
+  automaticBackupEnabled Boolean  @default(true) @map("automatic_backup_enabled")
+  scheduleOptions        Json     @default("[]") @map("schedule_options")
+  retentionCount         Int      @default(10) @map("retention_count")
+  restoreEnabled         Boolean  @default(true) @map("restore_enabled")
+  downloadEnabled        Boolean  @default(false) @map("download_enabled")
+  overageEnabled         Boolean  @default(true) @map("overage_enabled")
+  overagePricePerGb      Decimal  @default(0) @map("overage_price_per_gb") @db.Decimal(10, 2)
+  extraStoragePricePerGb Decimal  @default(0) @map("extra_storage_price_per_gb") @db.Decimal(10, 2)
+  gracePeriodDays        Int      @default(3) @map("grace_period_days")
+  maxStorageCapGb        Int?     @map("max_storage_cap_gb")
+  metadata               Json     @default("{}")
+  createdAt              DateTime @default(now()) @map("created_at")
+  updatedAt              DateTime @updatedAt @map("updated_at")
 
   subscriptions BackupSubscription[]
 
@@ -5758,29 +6028,29 @@ model BackupPlan {
 
 /// A customer's purchased backup entitlement attached to a BackupPlan.
 model BackupSubscription {
-  id                  String   @id @default(cuid())
-  customerId          String   @map("customer_id")
-  planId              String   @map("plan_id")
-  orderId             String?  @map("order_id")
-  invoiceId           String?  @map("invoice_id")
-  status              String   @default("active") // active | grace | expired | cancelled
-  startedAt           DateTime @default(now()) @map("started_at")
-  expiresAt           DateTime? @map("expires_at")
-  graceEndsAt         DateTime? @map("grace_ends_at")
-  autoRenew           Boolean  @default(true) @map("auto_renew")
-  termMonths          Int      @default(1) @map("term_months")
-  upgradeStorageGb    Int      @default(0) @map("upgrade_storage_gb")
-  extraStoragePricePerGb Decimal @default(0) @db.Decimal(10, 2) @map("extra_storage_price_per_gb")
-  grandfathered       Boolean  @default(false)
-  metadata            Json     @default("{}")
-  createdAt           DateTime @default(now()) @map("created_at")
-  updatedAt           DateTime @updatedAt @map("updated_at")
+  id                     String    @id @default(cuid())
+  customerId             String    @map("customer_id")
+  planId                 String    @map("plan_id")
+  orderId                String?   @map("order_id")
+  invoiceId              String?   @map("invoice_id")
+  status                 String    @default("active") // active | grace | expired | cancelled
+  startedAt              DateTime  @default(now()) @map("started_at")
+  expiresAt              DateTime? @map("expires_at")
+  graceEndsAt            DateTime? @map("grace_ends_at")
+  autoRenew              Boolean   @default(true) @map("auto_renew")
+  termMonths             Int       @default(1) @map("term_months")
+  upgradeStorageGb       Int       @default(0) @map("upgrade_storage_gb")
+  extraStoragePricePerGb Decimal   @default(0) @map("extra_storage_price_per_gb") @db.Decimal(10, 2)
+  grandfathered          Boolean   @default(false)
+  metadata               Json      @default("{}")
+  createdAt              DateTime  @default(now()) @map("created_at")
+  updatedAt              DateTime  @updatedAt @map("updated_at")
 
-  customer  Customer            @relation(fields: [customerId], references: [id])
-  plan      BackupPlan          @relation(fields: [planId], references: [id])
-  usages    BackupUsage[]
-  overages  BackupOverage[]
-  upgrades  BackupStorageUpgrade[]
+  customer Customer               @relation(fields: [customerId], references: [id])
+  plan     BackupPlan             @relation(fields: [planId], references: [id])
+  usages   BackupUsage[]
+  overages BackupOverage[]
+  upgrades BackupStorageUpgrade[]
 
   @@index([customerId, status])
   @@index([status, expiresAt])
@@ -5789,20 +6059,20 @@ model BackupSubscription {
 
 /// Period snapshot of a subscription's storage/count consumption.
 model BackupUsage {
-  id             String   @id @default(cuid())
-  subscriptionId String   @map("subscription_id")
-  customerId     String   @map("customer_id")
-  periodStart    DateTime @default(now()) @map("period_start")
+  id             String    @id @default(cuid())
+  subscriptionId String    @map("subscription_id")
+  customerId     String    @map("customer_id")
+  periodStart    DateTime  @default(now()) @map("period_start")
   periodEnd      DateTime? @map("period_end")
-  usedBytes      BigInt   @default(0) @map("used_bytes")
-  backupCount    Int      @default(0) @map("backup_count")
-  quotaGb        Int      @default(0) @map("quota_gb")
-  overageGb      Decimal  @default(0) @db.Decimal(10, 2) @map("overage_gb")
-  computedAt     DateTime @default(now()) @map("computed_at")
-  metadata       Json     @default("{}")
+  usedBytes      BigInt    @default(0) @map("used_bytes")
+  backupCount    Int       @default(0) @map("backup_count")
+  quotaGb        Int       @default(0) @map("quota_gb")
+  overageGb      Decimal   @default(0) @map("overage_gb") @db.Decimal(10, 2)
+  computedAt     DateTime  @default(now()) @map("computed_at")
+  metadata       Json      @default("{}")
 
   subscription BackupSubscription @relation(fields: [subscriptionId], references: [id])
-  customer      Customer          @relation(fields: [customerId], references: [id])
+  customer     Customer           @relation(fields: [customerId], references: [id])
 
   @@index([subscriptionId, periodStart, periodEnd])
   @@index([customerId, computedAt])
@@ -5818,15 +6088,15 @@ model BackupOverage {
   periodEnd      DateTime @map("period_end")
   usedBytes      BigInt   @map("used_bytes")
   quotaBytes     BigInt   @map("quota_bytes")
-  overageGb      Decimal  @default(0) @db.Decimal(10, 2) @map("overage_gb")
-  ratePerGb      Decimal  @default(0) @db.Decimal(10, 2) @map("rate_per_gb")
+  overageGb      Decimal  @default(0) @map("overage_gb") @db.Decimal(10, 2)
+  ratePerGb      Decimal  @default(0) @map("rate_per_gb") @db.Decimal(10, 2)
   amount         Decimal  @default(0) @db.Decimal(10, 2)
   invoiceId      String?  @map("invoice_id")
   status         String   @default("unbilled") // unbilled | billed | waived
   createdAt      DateTime @default(now()) @map("created_at")
 
   subscription BackupSubscription @relation(fields: [subscriptionId], references: [id])
-  customer      Customer          @relation(fields: [customerId], references: [id])
+  customer     Customer           @relation(fields: [customerId], references: [id])
 
   @@index([subscriptionId, status])
   @@index([customerId, status])
@@ -5835,22 +6105,22 @@ model BackupOverage {
 
 /// Purchased extra backup storage on top of a plan's included quota.
 model BackupStorageUpgrade {
-  id             String   @id @default(cuid())
-  subscriptionId String   @map("subscription_id")
-  customerId     String   @map("customer_id")
+  id             String    @id @default(cuid())
+  subscriptionId String    @map("subscription_id")
+  customerId     String    @map("customer_id")
   gb             Int
-  pricePerGb     Decimal  @db.Decimal(10, 2) @map("price_per_gb")
-  amount         Decimal  @default(0) @db.Decimal(10, 2)
-  termMonths     Int      @default(1) @map("term_months")
-  orderId        String?  @map("order_id")
-  invoiceId      String?  @map("invoice_id")
-  status         String   @default("pending") // pending | active | expired
+  pricePerGb     Decimal   @map("price_per_gb") @db.Decimal(10, 2)
+  amount         Decimal   @default(0) @db.Decimal(10, 2)
+  termMonths     Int       @default(1) @map("term_months")
+  orderId        String?   @map("order_id")
+  invoiceId      String?   @map("invoice_id")
+  status         String    @default("pending") // pending | active | expired
   effectiveAt    DateTime? @map("effective_at")
   expiresAt      DateTime? @map("expires_at")
-  createdAt      DateTime @default(now()) @map("created_at")
+  createdAt      DateTime  @default(now()) @map("created_at")
 
   subscription BackupSubscription @relation(fields: [subscriptionId], references: [id])
-  customer      Customer          @relation(fields: [customerId], references: [id])
+  customer     Customer           @relation(fields: [customerId], references: [id])
 
   @@index([subscriptionId, status])
   @@index([customerId, status])
@@ -5865,13 +6135,13 @@ model SnapshotPlan {
   description          String?
   active               Boolean  @default(true)
   archived             Boolean  @default(false)
-  model                 String   @default("per_snapshot") // per_snapshot | plan
+  model                String   @default("per_snapshot") // per_snapshot | plan
   price                Decimal  @default(0) @db.Decimal(10, 2)
   currency             String   @default("INR")
   billingCycle         String   @default("monthly")
   taxPercent           Decimal  @default(18) @db.Decimal(5, 2)
   includedSnapshots    Int      @default(0) @map("included_snapshots")
-  overageSnapshotPrice Decimal  @default(0) @db.Decimal(10, 2) @map("overage_snapshot_price")
+  overageSnapshotPrice Decimal  @default(0) @map("overage_snapshot_price") @db.Decimal(10, 2)
   maxSnapshots         Int?     @map("max_snapshots")
   gracePeriodDays      Int      @default(0) @map("grace_period_days")
   restoreEnabled       Boolean  @default(true) @map("restore_enabled")
@@ -5887,26 +6157,26 @@ model SnapshotPlan {
 
 /// One billable snapshot charge (per SnapshotPlan price or per-snapshot pricing).
 model SnapshotCharge {
-  id             String   @id @default(cuid())
-  customerId     String   @map("customer_id")
-  vpsInstanceId  String   @map("vps_instance_id")
-  snapshotId     String?  @map("snapshot_id")
-  planId         String?  @map("plan_id")
-  orderId        String?  @map("order_id")
-  invoiceId      String?  @map("invoice_id")
-  paymentId      String?  @map("payment_id")
-  amount         Decimal  @default(0) @db.Decimal(10, 2)
-  taxAmount      Decimal  @default(0) @db.Decimal(10, 2) @map("tax_amount")
-  totalAmount    Decimal  @default(0) @db.Decimal(10, 2) @map("total_amount")
-  currency       String   @default("INR")
-  status         String   @default("unpaid") // unpaid | paid | refunded | failed
-  snapshotName   String?  @map("snapshot_name")
-  metadata       Json     @default("{}")
-  createdAt      DateTime @default(now()) @map("created_at")
+  id            String   @id @default(cuid())
+  customerId    String   @map("customer_id")
+  vpsInstanceId String   @map("vps_instance_id")
+  snapshotId    String?  @map("snapshot_id")
+  planId        String?  @map("plan_id")
+  orderId       String?  @map("order_id")
+  invoiceId     String?  @map("invoice_id")
+  paymentId     String?  @map("payment_id")
+  amount        Decimal  @default(0) @db.Decimal(10, 2)
+  taxAmount     Decimal  @default(0) @map("tax_amount") @db.Decimal(10, 2)
+  totalAmount   Decimal  @default(0) @map("total_amount") @db.Decimal(10, 2)
+  currency      String   @default("INR")
+  status        String   @default("unpaid") // unpaid | paid | refunded | failed
+  snapshotName  String?  @map("snapshot_name")
+  metadata      Json     @default("{}")
+  createdAt     DateTime @default(now()) @map("created_at")
 
-  customer     Customer     @relation(fields: [customerId], references: [id])
-  vpsInstance  VpsInstance  @relation(fields: [vpsInstanceId], references: [id])
-  plan         SnapshotPlan? @relation(fields: [planId], references: [id])
+  customer    Customer      @relation(fields: [customerId], references: [id])
+  vpsInstance VpsInstance   @relation(fields: [vpsInstanceId], references: [id])
+  plan        SnapshotPlan? @relation(fields: [planId], references: [id])
 
   @@index([customerId, createdAt])
   @@index([vpsInstanceId, createdAt])
@@ -5918,11 +6188,11 @@ model SnapshotCharge {
 model GatewayFeeConfig {
   id         String   @id @default(cuid())
   gateway    String   @unique // razorpay | cashfree
-  feePercent Decimal  @default(0) @db.Decimal(5, 2) @map("fee_percent")
-  fixedFee   Decimal  @default(0) @db.Decimal(10, 2) @map("fixed_fee")
+  feePercent Decimal  @default(0) @map("fee_percent") @db.Decimal(5, 2)
+  fixedFee   Decimal  @default(0) @map("fixed_fee") @db.Decimal(10, 2)
   enabled    Boolean  @default(true)
-  minAmount  Decimal? @db.Decimal(10, 2) @map("min_amount")
-  maxAmount  Decimal? @db.Decimal(10, 2) @map("max_amount")
+  minAmount  Decimal? @map("min_amount") @db.Decimal(10, 2)
+  maxAmount  Decimal? @map("max_amount") @db.Decimal(10, 2)
   updatedBy  String?  @map("updated_by")
   createdAt  DateTime @default(now()) @map("created_at")
   updatedAt  DateTime @updatedAt @map("updated_at")
@@ -5934,23 +6204,23 @@ model GatewayFeeConfig {
 /// success | failed | rolled_back | apply_pending). Additive; no existing
 /// billing/backup/snapshot data is touched.
 model Deployment {
-  id               String    @id @default(cuid())
-  version          String    @map("version")
-  commit           String?   @map("commit")
-  image            String    @map("image")
-  digest           String?   @map("digest")
-  status           String    @default("planned") @map("status") // planned | running | success | failed | rolled_back | apply_pending
-  stage            String?   @map("stage") // preflight | migrate | apply | health | smoke | done | host_apply
-  stageOutput      Json?     @map("stage_output")
-  migrationCount   Int       @default(0) @map("migration_count")
-  startedBy        String?   @map("started_by")
-  error            String?   @map("error")
-  startedAt        DateTime? @map("started_at")
-  completedAt      DateTime? @map("completed_at")
-  rollbackVersion  String?   @map("rollback_version")
-  metadata         Json      @default("{}") @map("metadata")
-  createdAt        DateTime  @default(now()) @map("created_at")
-  updatedAt        DateTime  @updatedAt @map("updated_at")
+  id              String    @id @default(cuid())
+  version         String    @map("version")
+  commit          String?   @map("commit")
+  image           String    @map("image")
+  digest          String?   @map("digest")
+  status          String    @default("planned") @map("status") // planned | running | success | failed | rolled_back | apply_pending
+  stage           String?   @map("stage") // preflight | migrate | apply | health | smoke | done | host_apply
+  stageOutput     Json?     @map("stage_output")
+  migrationCount  Int       @default(0) @map("migration_count")
+  startedBy       String?   @map("started_by")
+  error           String?   @map("error")
+  startedAt       DateTime? @map("started_at")
+  completedAt     DateTime? @map("completed_at")
+  rollbackVersion String?   @map("rollback_version")
+  metadata        Json      @default("{}") @map("metadata")
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime  @updatedAt @map("updated_at")
 
   @@index([status, startedAt])
   @@map("deployments")

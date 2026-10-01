@@ -1,6 +1,7 @@
 import { prisma } from "@/lib/db"
 import { getOsDescription, getOsFamily } from "@/lib/os-icons"
 import { defaultUsernameForOs, isWindowsTemplateName, normalizeOsFamily, normalizeOsTemplate } from "@/lib/os-template-normalization"
+import { guestAgentChannelOpen as proxmoxGuestAgentChannelOpen } from "@/lib/proxmox-agent-flag"
 
 const FAMILY_LABELS: Record<string, string> = {
   almalinux: "AlmaLinux",
@@ -77,6 +78,22 @@ function nodeMatches(row: any, nodeId?: string | null) {
   return row?.proxmoxNodeId === nodeId
 }
 
+/**
+ * Is the QEMU guest agent channel enabled on this template's Proxmox config?
+ *
+ * This is the only guest-agent fact the host can see. Whether the agent binary is
+ * installed in the image is not knowable from here and is proven on first clone.
+ */
+export function guestAgentChannelOpen(row: any): boolean {
+  const config = row?.proxmoxConfig && typeof row.proxmoxConfig === "object" ? row.proxmoxConfig : null
+  // With no Proxmox config to read, the answer is "not open" rather than a
+  // fallback to the legacy `cloudInitSupported` column. That column records
+  // whether an image shipped with Cloud-Init, which says nothing about whether a
+  // guest agent is present, and a template that is wrongly reported as open
+  // cannot be configured — the failure this whole change exists to remove.
+  return proxmoxGuestAgentChannelOpen(config)
+}
+
 export function osTemplateUnavailableReason(row: any, input: AvailabilityInput = {}) {
   const isWindows = isWindowsOsTemplate(row)
   if (!row?.isActive) return "Template is inactive."
@@ -88,7 +105,10 @@ export function osTemplateUnavailableReason(row: any, input: AvailabilityInput =
   if (!row?.proxmoxNodeId && input.nodeId) return null
   if (!nodeMatches(row, input.nodeId)) return isWindows ? "Windows template is not assigned to this node." : "Template is not available on this compute node"
   if (row?.reinstallEnabled === false) return "Template support disabled"
-  if (!isWindows && row?.cloudInitSupported === false) return "Cloud-init support not detected"
+  // Cloud-Init is no longer a requirement. The requirement now is a working
+  // QEMU Guest Agent inside the image, and the host can only prove the channel is
+  // open — so an unopen channel is the one condition that is checked here.
+  if (input.nodeId && !guestAgentChannelOpen(row)) return "Guest agent channel is not enabled on this template"
   return null
 }
 
@@ -175,6 +195,7 @@ const OS_TEMPLATE_SELECT = {
   source: true,
   syncedFromProxmox: true,
   cloudInitSupported: true,
+  proxmoxConfig: true,
   reinstallEnabled: true,
   proxmoxNode: {
     select: {

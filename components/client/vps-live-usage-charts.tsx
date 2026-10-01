@@ -68,8 +68,8 @@ export function VpsLiveUsageCharts({
   isRunning,
 }: {
   metrics: VpsMetricPoint[]
-  range: "1h" | "24h"
-  onRangeChange: (range: "1h" | "24h") => void
+  range: "1h" | "24h" | "48h"
+  onRangeChange: (range: "1h" | "24h" | "48h") => void
   isRunning: boolean
   isProvisioning: boolean
 }) {
@@ -96,6 +96,7 @@ export function VpsLiveUsageCharts({
         <div className="flex gap-2">
           <Button size="sm" variant={range === "1h" ? "default" : "outline"} onClick={() => onRangeChange("1h")}>1h</Button>
           <Button size="sm" variant={range === "24h" ? "default" : "outline"} onClick={() => onRangeChange("24h")}>24h</Button>
+          <Button size="sm" variant={range === "48h" ? "default" : "outline"} onClick={() => onRangeChange("48h")}>48h</Button>
         </div>
       </CardHeader>
       <CardContent className="grid gap-4 xl:grid-cols-2">

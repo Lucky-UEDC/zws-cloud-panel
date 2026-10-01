@@ -1,20 +1,29 @@
+/**
+ * Revenue Analytics — authoritative financial computations.
+ *
+ * All values derived ONLY from authoritative financial records:
+ *   - Invoice (paid service invoices, type="service", status="paid")
+ *   - Payment (completed service payments, purpose != wallet_topup)
+ *   - WalletTransaction (type="topup" for top-ups, type="refund" for refunds)
+ *   - Payment.gateway="wallet" for wallet-funded service purchases
+ *
+ * NO phantom types, NO double-counting, NO made-up formulas.
+ */
+
 import { prisma } from "@/lib/db"
 
 export const SERVICE_INVOICE_TYPE = "service"
 export const WALLET_TOPUP_INVOICE_TYPE = "wallet_topup"
-export const REVENUE_INVOICE_TYPES = [SERVICE_INVOICE_TYPE] as const
 export const PAID_INVOICE_STATUS = "paid"
-export const ACTIVE_PAID_ORDER_STATUSES = ["paid", "active", "completed", "payment_verified", "verification_pending"] as const
+export const ACTIVE_BILLABLE_ORDER_STATUSES = ["paid", "active", "completed", "payment_verified"] as const
 export const EXCLUDED_BILLING_STATUSES = ["deleted", "cancelled", "canceled", "archived", "failed", "expired", "payment_failed"] as const
 export const EXCLUDED_PROVISIONING_STATUSES = ["deleted", "cancelled", "canceled", "archived", "failed", "provisioning_failed", "failed_deleted", "payment_failed"] as const
-export const COMPLETED_PAYMENT_STATUSES = ["completed", "paid", "success", "successful", "captured", "verification_pending"] as const
+export const COMPLETED_PAYMENT_STATUSES = ["completed", "paid", "success", "successful", "captured"] as const
 export const FAILED_PAYMENT_STATUSES = ["failed", "payment_failed"] as const
 export const REFUNDED_PAYMENT_STATUSES = ["refunded", "refund"] as const
 export const WALLET_PAYMENT_PURPOSES = ["wallet_topup", "topup"] as const
 export const PENDING_INVOICE_STATUSES = ["draft", "sent", "pending", "unpaid", "overdue"] as const
 export const CANCELLED_INVOICE_STATUSES = ["cancelled", "failed", "expired"] as const
-export const CREDIT_WALLET_TYPES = ["admin_add", "credit_adjustment", "promotional", "promo_credit"] as const
-export const REFUND_WALLET_TYPES = ["refund", "payment_refund"] as const
 
 export type DateRange = {
   start?: Date | null
@@ -52,19 +61,17 @@ export function paidServiceInvoiceWhere(input: DateRange = {}) {
     : {}
   return {
     status: PAID_INVOICE_STATUS,
-    type: { in: [...REVENUE_INVOICE_TYPES] },
+    type: { in: [SERVICE_INVOICE_TYPE] },
     deletedAt: null,
-    order: {
-      is: activeBillableOrderWhere(),
-    },
+    order: { is: activeBillableOrderWhere() },
     ...range,
   }
 }
 
 export function activeBillableOrderWhere(extra: Record<string, unknown> = {}) {
-  const activeStatuses = [...ACTIVE_PAID_ORDER_STATUSES, ...ACTIVE_PAID_ORDER_STATUSES.map((status) => status.toUpperCase())]
-  const excludedStatuses = [...EXCLUDED_BILLING_STATUSES, ...EXCLUDED_BILLING_STATUSES.map((status) => status.toUpperCase())]
-  const excludedProvisioningStatuses = [...EXCLUDED_PROVISIONING_STATUSES, ...EXCLUDED_PROVISIONING_STATUSES.map((status) => status.toUpperCase())]
+  const activeStatuses = [...ACTIVE_BILLABLE_ORDER_STATUSES]
+  const excludedStatuses = [...EXCLUDED_BILLING_STATUSES]
+  const excludedProvisioningStatuses = [...EXCLUDED_PROVISIONING_STATUSES]
   return {
     deletedAt: null,
     isActive: true,
@@ -107,13 +114,9 @@ export async function getCustomerServiceSpendMap(customerIds: string[]) {
 
   const rows = await prisma.invoice.groupBy({
     by: ["customerId"],
-    where: {
-      customerId: { in: ids },
-      ...paidServiceInvoiceWhere(),
-    },
+    where: { customerId: { in: ids }, ...paidServiceInvoiceWhere() },
     _sum: { totalAmount: true },
   })
-
   return new Map(rows.map((row) => [row.customerId, money(row._sum.totalAmount)]))
 }
 
@@ -144,9 +147,10 @@ export function monthlyRecurringValue(input: {
   order?: { totalAmount?: unknown; subtotal?: unknown; termMonths?: unknown } | null
 }) {
   const renewalAmount = money(input.renewalAmount)
-  const orderTotal = money(input.order?.totalAmount)
   const orderSubtotal = money(input.order?.subtotal)
-  const amount = renewalAmount > 0 ? renewalAmount : orderTotal > 0 ? orderTotal : orderSubtotal
+  const orderTotal = money(input.order?.totalAmount)
+  // Use subtotal (tax-exclusive) for MRR, not totalAmount (GST-inclusive)
+  const amount = renewalAmount > 0 ? renewalAmount : orderSubtotal > 0 ? orderSubtotal : orderTotal
   const termMonths = Math.max(1, Number(input.billingTermMonths || input.order?.termMonths || termMonthsFromCycle(input.billingCycle) || 1))
   return money(amount / termMonths)
 }
@@ -184,3 +188,20 @@ export async function getActiveRecurringRevenueMetrics() {
     dedicatedServices: dedicatedServices.length,
   }
 }
+
+/** Revenue card definitions with distinct semantic meanings */
+export const REVENUE_CARD_DEFINITIONS = [
+  { key: "grossRevenue", label: "Gross Revenue", description: "Sum of paid service invoices (tax-inclusive)", format: "currency" },
+  { key: "netRevenue", label: "Net Revenue", description: "Gross Revenue − GST/Tax collected", format: "currency" },
+  { key: "collectedRevenue", label: "Collected", description: "Actual money collected via completed service payments", format: "currency" },
+  { key: "gatewayFees", label: "Gateway Fees", description: "Sum of WalletTransaction.gatewayFee (top-ups) + GatewaySettlement.feeAmount", format: "currency" },
+  { key: "gstCollected", label: "GST/Tax", description: "Sum of invoice.taxAmount (or gstAmount)", format: "currency" },
+  { key: "refunds", label: "Refunds", description: "Completed wallet refunds + refunded payments (deduped)", format: "currency" },
+  { key: "walletTopups", label: "Wallet Top-ups", description: "WalletTransaction type=topup (liability, NOT revenue)", format: "currency" },
+  { key: "walletServicePayments", label: "Wallet Service Payments", description: "Service payments made via wallet (gateway=wallet)", format: "currency" },
+  { key: "aov", label: "AOV", description: "Paid service revenue / paid service orders (excl. top-ups)", format: "currency" },
+  { key: "mrr", label: "MRR", description: "Monthly Recurring Revenue (recurring services, tax-exclusive)", format: "currency" },
+  { key: "arr", label: "ARR", description: "Annual Recurring Revenue (MRR × 12)", format: "currency" },
+] as const
+
+export type RevenueCardKey = (typeof REVENUE_CARD_DEFINITIONS)[number]["key"]

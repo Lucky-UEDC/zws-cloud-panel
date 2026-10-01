@@ -101,19 +101,20 @@ type VpsStatus = {
   daysToExpire?: number | null
   expiresAt?: string | null
   deadlineAt?: string | null
-  diskUsage?: { usedGb?: number | null; freeGb?: number | null; totalGb?: number | null; percent?: number | null; reported?: boolean; checkedAt?: string | null; source?: string | null }
+  diskUsage?: { usedGb?: number | null; freeGb?: number | null; totalGb?: number | null; percent?: number | null; reported?: boolean; checkedAt?: string | null; source?: string | null; freshness?: { state?: "CURRENT" | "STALE" | "UNAVAILABLE"; source?: string | null; lastUpdatedAt?: string | null; errorCode?: string | null; error?: string | null } }
   netin?: number
   netout?: number
   overloaded?: boolean
-  metricsFreshness?: Record<string, { state?: "LIVE" | "STALE" | "OFFLINE" | "UNAVAILABLE" | string; lastUpdatedAt?: string | null; source?: string | null }>
+  metricsFreshness?: Record<string, { state?: "CURRENT" | "STALE" | "UNAVAILABLE"; lastUpdatedAt?: string | null; source?: string | null }>
   monitoringStatus?: string | null
   guestAgentStatus?: string | null
-  nodeName?: string | null
-  node?: { id?: string; name?: string | null; nodeName?: string | null; location?: string | null } | null
-  template?: { id?: string; name?: string | null; family?: string | null; version?: string | null; cloudInitSupported?: boolean } | null
+  // Deliberately absent: the Proxmox node name, the VMID, and the internal
+  // infrastructure ids. The customer's page shows the server tag, the address,
+  // the region, the status, uptime, days to expiry, the OS and the MAC — nothing
+  // about how or where it is hosted internally.
+  template?: { id?: string; name?: string | null; family?: string | null; version?: string | null } | null
   macAddress?: string | null
   network?: { gateway?: string | null; cidr?: number | null; dns?: string | null; bridge?: string | null; macAddress?: string | null; vlanTag?: number | null; model?: string | null; lastSyncedAt?: string | null; source?: string | null }
-  cloudInit?: { supported?: boolean; configuredIp?: string | null; status?: string | null }
   firewall?: { available?: boolean; rules?: Array<Record<string, unknown>>; status?: string | null }
   snapshots?: { count?: number; items?: Array<{ id?: string; name?: string | null; snapname?: string | null; description?: string | null; status?: string | null; createdAt?: string | null }> }
   backups?: { count?: number; items?: Array<{ id?: string; status?: string | null; schedule?: string | null; fileName?: string | null; sizeBytes?: number | null; startedAt?: string | null; finishedAt?: string | null; completedAt?: string | null; createdAt?: string | null; durationMs?: number | null; error?: string | null }> }
@@ -167,22 +168,23 @@ function expiryStateOf(status?: VpsStatus | null) {
 }
 
 function freshnessLabel(item?: { state?: string; lastUpdatedAt?: string | null }) {
-  const state = String(item?.state || "OFFLINE").toUpperCase()
+  const state = String(item?.state || "UNAVAILABLE").toUpperCase()
   const updated = item?.lastUpdatedAt ? formatDate(item.lastUpdatedAt, true) : "No live sample"
   return { state, updated }
 }
 
-function diskFreshnessLabel(item?: { state?: string; checkedAt?: string | null; source?: string | null }) {
-  const state = String(item?.state || "OFFLINE").toUpperCase()
-  const checked = item?.checkedAt ? formatDate(item.checkedAt, true) : "Never"
-  const src = item?.source || "unknown"
-  return { state, checked, source: src }
+function diskFreshnessLabel(item: any) {
+  const f = item?.freshness || item
+  const state = String(f?.state || "UNAVAILABLE").toUpperCase()
+  const checked = (f?.lastUpdatedAt || f?.checkedAt) ? formatDate((f?.lastUpdatedAt || f?.checkedAt)!, true) : "Never"
+  const src = f?.source || item?.source || "unknown"
+  return { state, checked, source: src, errorCode: f?.errorCode, error: f?.error }
 }
 
 function metricUnavailable(item?: { state?: string; source?: string | null }) {
   const state = String(item?.state || "").toUpperCase()
   const source = String(item?.source || "").toLowerCase()
-  return state === "OFFLINE" || state === "UNAVAILABLE" || source === "unavailable"
+  return state === "UNAVAILABLE" || source === "unavailable"
 }
 
 function normalizeMetricPoint(point: any): MetricPoint | null {
@@ -260,7 +262,7 @@ export default function VPSControlPanel() {
   const { id } = useParams()
   const [status, setStatus] = useState<VpsStatus | null>(null)
   const [metrics, setMetrics] = useState<MetricPoint[]>([])
-  const [range, setRange] = useState<"1h" | "24h">("1h")
+  const [range, setRange] = useState<"1h" | "24h" | "48h">("1h")
   const [, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [loadingAction, setLoadingAction] = useState<string | null>(null)
@@ -758,7 +760,40 @@ export default function VPSControlPanel() {
             <div className="grid min-w-0 gap-4 sm:grid-cols-2 xl:grid-cols-4">
               <ResourceCard title="CPU" icon={Gauge} value={isRunning ? metricUnavailable(status?.metricsFreshness?.cpu) ? "Monitoring unavailable" : formatPercent(status?.cpuPercent) : currentState === "provisioning" ? "Preparing server" : "Server offline"} subvalue={`${status?.resources?.cpuCores || status?.cpuCores || "-"} cores`} freshness={status?.metricsFreshness?.cpu} metricKey="cpuPercent" data={metricSeries} paused={!isRunning} accent="#22c55e" />
               <ResourceCard title="RAM" icon={MemoryStick} value={isRunning ? metricUnavailable(status?.metricsFreshness?.memory) ? "Monitoring unavailable" : `${formatBytesDecimal(status?.ramUsedBytes, { fallback: "0 MB" })} / ${formatBytesDecimal(status?.ramTotalBytes, { fallback: "0 MB" })}` : currentState === "provisioning" ? "Preparing server" : "Server offline"} subvalue={isRunning && !metricUnavailable(status?.metricsFreshness?.memory) ? formatPercent(status?.ramPercent) : ""} freshness={status?.metricsFreshness?.memory} metricKey="ramPercent" data={metricSeries} paused={!isRunning} accent="#38bdf8" progress={status?.ramPercent} />
-              <ResourceCard title="Disk" icon={HardDrive} value={isRunning && status?.diskUsage?.reported ? status.diskUsage.usedGb === null || status.diskUsage.usedGb === undefined ? "Usage unavailable" : `${formatGbDecimal(status.diskUsage.usedGb)} used` : currentState === "provisioning" ? "Preparing server" : "Server offline"} subvalue={status?.diskUsage?.reported ? `${status.diskUsage.freeGb === null || status.diskUsage.freeGb === undefined ? "Usage unavailable" : `${formatGbDecimal(status.diskUsage.freeGb, "0 GB")} free`} / ${formatGbDecimal(status.diskUsage.totalGb, "-")} · ${formatByteRateDecimal(diskReadRate)} read · ${formatByteRateDecimal(diskWriteRate)} write` : ""} freshness={status?.diskUsage} metricKey="diskPercent" data={metricSeries} paused={!isRunning} accent="#a78bfa" progress={status?.diskUsage?.percent} />
+              {(() => {
+                const du = status?.diskUsage
+                const fresh = du?.freshness
+                const unavailable = fresh?.state === "UNAVAILABLE"
+                const usedGb = du?.usedGb
+                const totalGb = du?.totalGb
+                const freeGb = du?.freeGb
+                return (
+                  <ResourceCard
+                    title="Disk"
+                    icon={HardDrive}
+                    value={isRunning
+                      ? unavailable
+                        ? fresh?.error
+                          ? `${fresh.errorCode}: ${fresh.error}`
+                          : "Usage unavailable"
+                        : usedGb === null || usedGb === undefined
+                          ? "Usage unavailable"
+                          : `${formatGbDecimal(usedGb)} used`
+                      : currentState === "provisioning"
+                        ? "Preparing server"
+                        : "Server offline"}
+                    subvalue={isRunning && du?.reported
+                      ? `${freeGb === null || freeGb === undefined ? "Usage unavailable" : `${formatGbDecimal(freeGb, "0 GB")} free`} / ${formatGbDecimal(totalGb, "-")} · ${formatByteRateDecimal(diskReadRate)} read · ${formatByteRateDecimal(diskWriteRate)} write`
+                      : ""}
+                    freshness={du}
+                    metricKey="diskPercent"
+                    data={metricSeries}
+                    paused={!isRunning}
+                    accent="#a78bfa"
+                    progress={du?.percent}
+                  />
+                )
+              })()}
               <ResourceCard title="Network" icon={BarChart3} value={isRunning ? metricUnavailable(status?.metricsFreshness?.network) || (!networkDownRate && !networkUpRate) ? "No traffic sample" : `${formatRateDecimal(networkDownRate)} down` : currentState === "provisioning" ? "Preparing server" : "Server offline"} subvalue={isRunning && !metricUnavailable(status?.metricsFreshness?.network) && (networkDownRate || networkUpRate) ? `${formatRateDecimal(networkUpRate)} up` : ""} freshness={status?.metricsFreshness?.network} metricKey="networkInBytesRate" data={metricSeries} paused={!isRunning} accent="#14b8a6" />
             </div>
 
@@ -1034,23 +1069,29 @@ function ActionButton({ icon: Icon, label, onClick, busy, disabled }: { icon: an
   )
 }
 
-function ResourceCard({ title, icon: Icon, value, subvalue, freshness, data, metricKey, paused, accent = "#60a5fa", progress }: { title: string; icon: any; value: string; subvalue?: string; freshness?: { state?: string; lastUpdatedAt?: string | null; checkedAt?: string | null; source?: string | null }; data: MetricPoint[]; metricKey: string; paused?: boolean; accent?: string; progress?: number | null }) {
+function ResourceCard({ title, icon: Icon, value, subvalue, freshness, data, metricKey, paused, accent = "#60a5fa", progress }: { title: string; icon: any; value: string; subvalue?: string; freshness?: any; data: MetricPoint[]; metricKey: string; paused?: boolean; accent?: string; progress?: number | null }) {
   const isDisk = title === "Disk"
   const fresh = isDisk ? diskFreshnessLabel(freshness) : freshnessLabel(freshness)
-  const live = fresh.state === "LIVE"
+  const current = fresh.state === "CURRENT"
   const stale = fresh.state === "STALE"
+  const unavailable = fresh.state === "UNAVAILABLE"
+  const diskFresh = fresh as { state: string; checked?: string; source?: string; errorCode?: string | null; error?: string | null }
+  const metricFresh = fresh as { state: string; updated?: string }
   return (
     <Card className="overflow-hidden border-border/40 bg-background/80">
       <CardContent className="space-y-3 p-4">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2 text-sm font-medium"><Icon className="h-4 w-4" style={{ color: accent }} />{title}</div>
-          <Badge variant="outline" className={live ? "border-emerald-400/30 bg-emerald-400/10 text-emerald-200" : stale ? "border-amber-400/30 bg-amber-400/10 text-amber-200" : ""}>{fresh.state}</Badge>
+          <Badge variant="outline" className={current ? "border-emerald-400/30 bg-emerald-400/10 text-emerald-200" : stale ? "border-amber-400/30 bg-amber-400/10 text-amber-200" : "border-zinc-400/30 bg-zinc-400/10 text-zinc-200"}>
+            {fresh.state}
+          </Badge>
         </div>
         <div>
           <div className="text-lg font-semibold">{value}</div>
           {subvalue ? <div className="text-xs text-muted-foreground">{subvalue}</div> : null}
           <div className="text-xs text-muted-foreground">
-            {isDisk && "checked" in fresh && fresh.checked ? `Last checked ${fresh.checked} (${fresh.source})` : "updated" in fresh && fresh.updated ? `Last update ${fresh.updated}` : ""}
+            {isDisk && diskFresh.checked ? `Last checked ${diskFresh.checked} (${diskFresh.source})` : metricFresh.updated ? `Last update ${metricFresh.updated}` : ""}
+            {unavailable && diskFresh.errorCode ? ` · ${diskFresh.errorCode}: ${diskFresh.error}` : ""}
           </div>
         </div>
         {progress !== undefined && progress !== null ? <Progress value={Math.max(0, Math.min(100, Number(progress || 0)))} /> : null}

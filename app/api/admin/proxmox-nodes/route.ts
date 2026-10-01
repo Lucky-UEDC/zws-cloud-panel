@@ -3,6 +3,8 @@ import { getAdminFromCookies } from "@/lib/server-auth"
 import { prisma } from "@/lib/db"
 import { canAccessAdminApi } from "@/lib/admin-rbac"
 import { invalidateComputeNodeCache } from "@/lib/compute-node-monitoring"
+import { createPanelLog } from "@/lib/panel-log"
+import { capabilityHeadline, refreshNodeCapabilities } from "@/lib/guest-automation/node-capabilities"
 import { defaultCloneLimitForNodeClass } from "@/lib/node-workers"
 import {
   boolValue,
@@ -27,6 +29,7 @@ export async function GET() {
     const [nodes, templateGroups] = await Promise.all([
       prisma.proxmoxNode.findMany({
         orderBy: { createdAt: "desc" },
+        include: { guestCapabilities: true },
       }),
       prisma.osTemplate.groupBy({
         by: ["proxmoxNodeId"],
@@ -95,6 +98,9 @@ export async function POST(request: NextRequest) {
         sshUsername: textValue(body.sshUsername) || null,
         sshPassword: textValue(body.sshPassword) || null,
         resolvedIp: test.resolvedIp,
+        // "connected" now means exactly that: the API answered. Whether the
+        // node can actually carry guest automation is a separate, measured
+        // answer, and the node is not schedulable until it is.
         status: "connected",
         lastCheckedAt: new Date(),
       },
@@ -106,6 +112,49 @@ export async function POST(request: NextRequest) {
       update: { maxTasks: { set: defaultCloneLimitForNodeClass(node.nodeClass) }, health: "connected" },
     }).catch(() => null)
     invalidateComputeNodeCache(node.id)
+
+    // Measure the node before anyone schedules work onto it. This is deliberately
+    // after the create: a node that turns out to be unusable must exist in the
+    // database so the admin can read the report and fix it, rather than vanish
+    // with an error they cannot act on. What it must never do is stay
+    // schedulable.
+    const capabilities = await refreshNodeCapabilities({
+      id: node.id,
+      nodeName: node.nodeName,
+      host: node.host,
+      tokenId: node.tokenId,
+      tokenSecret: node.tokenSecret,
+      allowInsecureTls: node.allowInsecureTls,
+    })
+    if (capabilities.status !== "ready") {
+      // Drain rather than delete: the admin needs the node to fix it, and an
+      // unmeasured node must never receive a provisioning job.
+      await prisma.proxmoxNode.update({
+        where: { id: node.id },
+        data: {
+          schedulingEnabled: false,
+          drainReason: capabilities.status === "pending"
+            ? "Guest capabilities not yet measured. Start a server with a guest agent, then re-run diagnostics."
+            : `Guest automation unavailable: ${capabilities.blockers[0] || "required capabilities failed"}`,
+        },
+      }).catch(() => null)
+      await (prisma as any).nodeWorker.update({ where: { nodeId: node.id }, data: { health: "draining" } }).catch(() => null)
+      invalidateComputeNodeCache(node.id)
+    }
+    await createPanelLog({
+      category: "Compute Node",
+      message: `Compute node ${node.name} added`,
+      actorType: "admin",
+      actorEmail: String(admin.email),
+      metadata: {
+        nodeId: node.id,
+        nodeName: node.nodeName,
+        host: node.host,
+        capabilitiesStatus: capabilities.status,
+        capabilitiesSummary: capabilities.summary,
+        blockers: capabilities.blockers,
+      },
+    }).catch(() => null)
 
     const templatesCount = await prisma.osTemplate.count({
       where: {
@@ -120,8 +169,18 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({
       node: nodeResponse({
         ...node,
+        schedulingEnabled: capabilities.status === "ready",
         templatesCount,
       }),
+      capabilities,
+      capabilitiesHeadline: capabilityHeadline(capabilities),
+      // The wizard surfaces this on the final step rather than silently
+      // finishing, so an admin always sees what was and was not verified.
+      warning: capabilities.status === "ready"
+        ? null
+        : capabilities.status === "pending"
+          ? "The node was added but is not schedulable yet: no running guest was available to measure the QEMU guest agent against. Clone a template with a guest agent, start a server, then re-run diagnostics."
+          : `The node was added but is not schedulable: ${capabilities.blockers.join("; ")}`,
     }, { headers: NO_CACHE_HEADERS })
   } catch (error: any) {
     return errorResponse(error)

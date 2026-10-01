@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-REPO_URL="${ZWS_REPO_URL:-https://github.com/samvpslio/myrdphub-platform.git}"
+REPO_URL="${ZWS_REPO_URL:-https://github.com/Lucky-UEDC/zws-cloud-panel.git}"
 BRANCH="${ZWS_BRANCH:-main}"
 
 export ROOT_DIR="${ROOT_DIR:-/var/www/myrdphub}"
@@ -29,6 +29,6 @@ if ! command -v git >/dev/null 2>&1; then
   fi
 fi
 
-git clone --depth 1 --branch "$BRANCH" "$REPO_URL" "$tmp_dir/myrdphub-platform"
+git clone --depth 1 --branch "$BRANCH" "$REPO_URL" "$tmp_dir/zws-cloud-panel"
 
-exec bash "$tmp_dir/myrdphub-platform/installer/install.sh" "$@"
+exec bash "$tmp_dir/zws-cloud-panel/installer/install.sh" "$@"

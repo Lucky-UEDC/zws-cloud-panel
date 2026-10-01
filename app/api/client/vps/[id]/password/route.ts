@@ -2,6 +2,8 @@ import { NextRequest, NextResponse } from "next/server"
 import { getClientFromCookies } from "@/lib/server-auth"
 import { prisma } from "@/lib/db"
 import { createProxmoxClient } from "@/lib/proxmox"
+import { GuestAutomationService, osMetadataForVps } from "@/lib/guest-automation/service"
+import { guestContextFor } from "@/lib/guest-automation/first-boot"
 import { decryptSecret, encryptSecret } from "@/lib/provision"
 import { createProxmoxVncProxy, getProxmoxPasswordTicket } from "@/lib/proxmox-vnc"
 import { writeAuditLog } from "@/lib/audit-log"
@@ -294,32 +296,32 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
     }
 
     if (action === "reset") {
-      const client = createProxmoxClient(vps.proxmoxNode.host, vps.proxmoxNode.tokenId, vps.proxmoxNode.tokenSecret, {
-        allowInsecureTls: vps.proxmoxNode.allowInsecureTls,
+      // The browser submits intent only — a username and a password. Which
+      // command runs, in which shell, against which OS is resolved here from the
+      // guest's own OS report and the enabled template for that OS. No command,
+      // shell or argument is ever taken from the request.
+      const windows = isWindowsVps(vps)
+      const service = new GuestAutomationService(
+        guestContextFor({ vpsInstanceId: vps.id, vmid: vps.vmid, node: vps.proxmoxNode }),
+      )
+      const result = await service.setPassword({
+        username,
+        password,
+        metadata: osMetadataForVps(vps),
+        actor: { requestedBy: `client:${customerId}`, role: "customer" },
       })
-      try {
-        await client.pingVMGuestAgent(vps.proxmoxNode.nodeName, vps.vmid)
-        await client.setVMGuestPassword(vps.proxmoxNode.nodeName, vps.vmid, username, password, false)
-        await prisma.vpsInstance.update({ where: { id: vps.id }, data: { username, adminUsername: username, passwordEncrypted: encrypted } })
-        await writeAuditLog({ action: "client_console_password_guest_agent_reset", customerId, targetType: "vps", targetId: vps.id, metadata: { username, liveGuestChanged: true }, ...meta })
-        return NextResponse.json({
-          success: true,
-          message: "Password reset through QEMU guest agent.",
-          recovery: { status: "guest_agent_reset", message: "Live guest password reset." },
-        })
-      } catch (error: any) {
-        const windows = isWindowsVps(vps)
+      if (!result.ok) {
         await writeAuditLog({
-          action: "client_console_password_guest_agent_unavailable",
+          action: "client_console_password_guest_automation_failed",
           customerId,
           targetType: "vps",
           targetId: vps.id,
-          metadata: { username, windows, message: error?.message || String(error) },
+          metadata: { username, windows, errorCode: result.errorCode, runId: result.runId || null },
           ...meta,
         })
         return NextResponse.json({
           success: false,
-          error: "Guest agent password reset is unavailable.",
+          error: "This server cannot be changed from the panel right now.",
           recovery: {
             status: windows ? "windows_guided_recovery_required" : "linux_terminal_recovery_required",
             message: windows ? "Windows guided recovery required." : "Linux terminal recovery required.",
@@ -327,20 +329,53 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
           },
         }, { status: 409 })
       }
+      await prisma.vpsInstance.update({ where: { id: vps.id }, data: { username, adminUsername: username, passwordEncrypted: encrypted } })
+      await writeAuditLog({
+        action: "client_console_password_guest_automation_reset",
+        customerId,
+        targetType: "vps",
+        targetId: vps.id,
+        metadata: {
+          username,
+          liveGuestChanged: true,
+          runId: result.runId,
+          os: result.detected.osId,
+          template: result.template?.name || null,
+          templateVersion: result.template?.version || null,
+          status: result.status,
+        },
+        ...meta,
+      })
+      return NextResponse.json({
+        success: true,
+        message: "Password reset on your server.",
+        recovery: { status: "guest_automation_reset", message: "Live guest password reset." },
+      })
     }
 
-    const client = createProxmoxClient(vps.proxmoxNode.host, vps.proxmoxNode.tokenId, vps.proxmoxNode.tokenSecret, {
-      allowInsecureTls: vps.proxmoxNode.allowInsecureTls,
+    // There is no Cloud-Init fallback any more, and there must not be: writing
+    // `cipassword` and reporting success told the customer the password had
+    // changed when nothing in the guest had. The only remaining honest options
+    // are the template-driven guest reset above, or telling the customer their
+    // guest cannot be changed from the panel.
+    const windows = isWindowsVps(vps)
+    await writeAuditLog({
+      action: "client_console_password_guest_change_unavailable",
+      customerId,
+      targetType: "vps",
+      targetId: vps.id,
+      metadata: { username, windows, action },
+      ...meta,
     })
-    await client.updateVMConfig(vps.proxmoxNode.nodeName, vps.vmid, { cipassword: password }).catch(() => undefined)
-    await prisma.vpsInstance.update({ where: { id: vps.id }, data: { username, adminUsername: username, passwordEncrypted: encrypted } })
-    await writeAuditLog({ action: "client_console_password_legacy_update", customerId, targetType: "vps", targetId: vps.id, metadata: { username, liveGuestChanged: "cloud-init-pending" }, ...meta })
-
     return NextResponse.json({
-      success: true,
-      message: "Password updated. Reboot may be required for the OS to apply it.",
-      recovery: { status: "legacy_update", message: "Password stored and cloud-init config updated." },
-    })
+      success: false,
+      error: "This server cannot be changed from the panel right now.",
+      recovery: {
+        status: windows ? "windows_guided_recovery_required" : "linux_terminal_recovery_required",
+        message: windows ? "Windows guided recovery required." : "Linux terminal recovery required.",
+        guidance: recoveryGuidance(windows),
+      },
+    }, { status: 409 })
   } catch (error: any) {
     await writeAuditLog({ action: "client_console_password_update_failed", customerId, targetType: "vps", targetId: vps.id, metadata: { action, message: error?.message || String(error) }, ...meta })
     return NextResponse.json({ success: false, error: error?.message || "Password action failed" }, { status: 500 })

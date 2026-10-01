@@ -346,15 +346,35 @@ function proxmoxDetailText(value: unknown): string {
   }
 }
 
+/**
+ * Per-call request logging.
+ *
+ * Off by default. Every `getVMConfig` and every guest verb logged a line, so a
+ * 30-second telemetry sweep or a QA run buried its own output — the tool's result
+ * became unreadable in the middle of the transport chatter it was trying to
+ * report through. Failures are never suppressed: those are what an operator is
+ * looking for.
+ *
+ * Set `PROXMOX_LOG=all` (or `=requests`, `=ok`, `=fail`) when debugging a call.
+ */
+const PROXMOX_LOG_LEVELS = (() => {
+  const raw = String(process.env.PROXMOX_LOG || "").trim().toLowerCase()
+  if (!raw || raw === "off" || raw === "none") return { request: false, ok: false, fail: true }
+  if (raw === "all" || raw === "true" || raw === "1") return { request: true, ok: true, fail: true }
+  const set = new Set(raw.split(",").map((entry) => entry.trim()))
+  return { request: set.has("request") || set.has("requests"), ok: set.has("ok"), fail: set.has("fail") || set.has("all") }
+})()
+
 function proxmoxLog(event: "request" | "ok" | "fail", fields: Record<string, unknown>) {
   if (event === "request") {
-    console.log("[proxmox] request", { endpoint: fields.endpoint, attempt: fields.attempt, timeoutMs: fields.timeoutMs })
+    if (PROXMOX_LOG_LEVELS.request) console.log("[proxmox] request", { endpoint: fields.endpoint, attempt: fields.attempt, timeoutMs: fields.timeoutMs })
     return
   }
   if (event === "ok") {
-    console.log("[proxmox] ok", { endpoint: fields.endpoint, ms: fields.ms })
+    if (PROXMOX_LOG_LEVELS.ok) console.log("[proxmox] ok", { endpoint: fields.endpoint, ms: fields.ms })
     return
   }
+  if (!PROXMOX_LOG_LEVELS.fail) return
   console.warn("[proxmox] fail", {
     layer: fields.layer,
     endpoint: fields.endpoint,
@@ -928,7 +948,7 @@ export async function runProxmoxDiagnostics(input: {
   steps.push(storage.step)
 
   // Capability checks
-  const capabilities = await diagnosticCapabilities({
+  const capabilities = await runProxmoxFeatureDiagnostics({
     ...input,
     host: normalizedHost,
     timeoutMs,
@@ -950,7 +970,18 @@ export async function runProxmoxDiagnostics(input: {
   }
 }
 
-async function diagnosticCapabilities(input: {
+/**
+ * Feature probes: console, snapshot, backup and the reported guest-agent flag.
+ *
+ * Exported because the node capability model reports each of these as its own
+ * named check rather than as one lumped "capabilities" step, and because an admin
+ * adding a node needs to see which of them failed. Note what the guest-agent
+ * probe actually does: it reads Proxmox's own `agent` flag from the VM list. That
+ * is the hypervisor saying the channel is open — not proof that an agent is
+ * installed in the image and answering. `node-capabilities.ts` proves that part
+ * for real, and does not accept this flag as a substitute.
+ */
+export async function runProxmoxFeatureDiagnostics(input: {
   host: string
   nodeName: string
   tokenId: string
@@ -1288,12 +1319,59 @@ class ProxmoxClient {
     return this.request(`/nodes/${encodeURIComponent(node)}/qemu/${vmid}/agent/network-get-interfaces`)
   }
 
+  /**
+   * Native `qm guest cmd` verbs. Native-first is a hard requirement for guest
+   * automation: a shell is only spawned when no native verb exists for the job,
+   * which keeps the guest-agent attack surface minimal.
+   */
+  async getVMGuestHostName(node: string, vmid: number): Promise<any> {
+    return this.request(`/nodes/${encodeURIComponent(node)}/qemu/${vmid}/agent/get-host-name`)
+  }
+
+  async getVMGuestUsers(node: string, vmid: number): Promise<any> {
+    return this.request(`/nodes/${encodeURIComponent(node)}/qemu/${vmid}/agent/get-users`)
+  }
+
+  async getVMGuestTime(node: string, vmid: number): Promise<any> {
+    return this.request(`/nodes/${encodeURIComponent(node)}/qemu/${vmid}/agent/get-time`)
+  }
+
+  async getVMGuestTimeZone(node: string, vmid: number): Promise<any> {
+    return this.request(`/nodes/${encodeURIComponent(node)}/qemu/${vmid}/agent/get-timezone`)
+  }
+
+  async getVMGuestVcpus(node: string, vmid: number): Promise<any> {
+    return this.request(`/nodes/${encodeURIComponent(node)}/qemu/${vmid}/agent/get-vcpus`)
+  }
+
+  async getVMGuestMemoryBlocks(node: string, vmid: number): Promise<any> {
+    return this.request(`/nodes/${encodeURIComponent(node)}/qemu/${vmid}/agent/get-memory-blocks`)
+  }
+
+  async getVMGuestFsInfo(node: string, vmid: number): Promise<any> {
+    return this.request(`/nodes/${encodeURIComponent(node)}/qemu/${vmid}/agent/get-fsinfo`)
+  }
+
+  async trimVMGuestFilesystems(node: string, vmid: number): Promise<any> {
+    return this.request(`/nodes/${encodeURIComponent(node)}/qemu/${vmid}/agent/fstrim`, "POST", {}, PROXMOX_LONG_TIMEOUT_MS)
+  }
+
+  /** Generic native guest verb dispatch, used by the guest automation engine. */
+  async guestCmd(node: string, vmid: number, verb: string, body?: Record<string, any>, timeoutMs?: number): Promise<any> {
+    const path = `/nodes/${encodeURIComponent(node)}/qemu/${vmid}/agent/${verb}`
+    // Some verbs (like ping) require POST even without a body.
+    const requiresPost = ["ping"].includes(verb)
+    return (body && Object.keys(body).length) || requiresPost
+      ? this.request(path, "POST", body, timeoutMs)
+      : this.request(path, "GET", undefined, timeoutMs)
+  }
+
   async getVMGuestInfo(node: string, vmid: number): Promise<any> {
     return this.request(`/nodes/${encodeURIComponent(node)}/qemu/${vmid}/agent/get-osinfo`)
   }
 
-  async pingVMGuestAgent(node: string, vmid: number): Promise<any> {
-    return this.request(`/nodes/${encodeURIComponent(node)}/qemu/${vmid}/agent/ping`, "POST", undefined, PROXMOX_VM_TIMEOUT_MS)
+  async pingVMGuestAgent(node: string, vmid: number, timeoutMs: number = PROXMOX_VM_TIMEOUT_MS): Promise<any> {
+    return this.request(`/nodes/${encodeURIComponent(node)}/qemu/${vmid}/agent/ping`, "POST", undefined, timeoutMs)
   }
 
   async setVMGuestPassword(node: string, vmid: number, username: string, password: string, crypted = false): Promise<any> {
@@ -1308,39 +1386,38 @@ class ProxmoxClient {
     return this.execVMGuestCommandWithInput(node, vmid, command, undefined)
   }
 
-  async execVMGuestCommandWithInput(node: string, vmid: number, command: string[], inputData?: string): Promise<{ pid: number }> {
+  async execVMGuestCommandWithInput(node: string, vmid: number, command: string[], inputData?: string, timeoutMs: number = PROXMOX_LONG_TIMEOUT_MS): Promise<{ pid: number }> {
     const endpoint = `/nodes/${encodeURIComponent(node)}/qemu/${vmid}/agent/exec`
-    const build = (arrayStyle: boolean, capture: boolean, includeInput: boolean) => {
+    // This Proxmox version does not support capture-output or input-data parameters.
+    // Use minimal parameters: command array only.
+    const build = (includeInput: boolean) => {
       const params = new URLSearchParams()
-      for (const part of command) params.append(arrayStyle ? "command[]" : "command", part)
-      if (capture) params.set("capture-output", "1")
-      if (includeInput && typeof inputData === "string" && inputData.length > 0) params.set("input-data", inputData)
+      for (const part of command) params.append("command", part)
+      if (typeof inputData === "string" && inputData.length > 0) params.set("input-data", inputData)
       return params.toString()
     }
     const hasInput = typeof inputData === "string" && inputData.length > 0
     const candidates = [
-      build(true, true, true),
-      build(false, true, true),
-      build(false, false, true),
+      build(true),
+      build(false),
     ]
-    if (!hasInput) candidates.push(build(false, false, false))
 
     let lastError: any = null
     for (const candidate of candidates) {
       try {
-        return await this.request(endpoint, "POST", candidate)
+        return await this.request(endpoint, "POST", candidate, timeoutMs)
       } catch (error: any) {
         lastError = error
         const detail = proxmoxDetailText(error?.proxmoxResponse || error?.proxmoxMessage || error?.message)
-        const schemaError = /command\[\]|capture-output|input-data|property is not defined|property is missing|is not optional/i.test(detail)
+        const schemaError = /command\[\]|input-data|property is not defined|property is missing|is not optional/i.test(detail)
         if (!schemaError) throw error
       }
     }
     throw lastError
   }
 
-  async getVMGuestExecStatus(node: string, vmid: number, pid: number): Promise<any> {
-    return this.request(`/nodes/${encodeURIComponent(node)}/qemu/${vmid}/agent/exec-status?pid=${encodeURIComponent(String(pid))}`)
+  async getVMGuestExecStatus(node: string, vmid: number, pid: number, timeoutMs: number = PROXMOX_VM_TIMEOUT_MS): Promise<any> {
+    return this.request(`/nodes/${encodeURIComponent(node)}/qemu/${vmid}/agent/exec-status?pid=${encodeURIComponent(String(pid))}`, "GET", undefined, timeoutMs)
   }
 
   // VM power operations
@@ -1456,23 +1533,16 @@ class ProxmoxClient {
     })
   }
 
-  // Cloud-init
-  async setCloudInit(node: string, vmid: number, config: {
-    ciuser?: string
-    cipassword?: string
-    sshkeys?: string
-    ipconfig0?: string
-  }): Promise<any> {
-    return this.updateVMConfig(node, vmid, config)
-  }
-
-  async updateCloudInit(node: string, vmid: number): Promise<any> {
-    return this.request(`/nodes/${encodeURIComponent(node)}/qemu/${vmid}/cloudinit`, "PUT")
-  }
-
-  async dumpCloudInit(node: string, vmid: number, type: "user" | "network"): Promise<any> {
-    return this.request(`/nodes/${encodeURIComponent(node)}/qemu/${vmid}/cloudinit/dump?type=${encodeURIComponent(type)}`, "GET")
-  }
+  /**
+   * Cloud-Init is not callable from this client.
+   *
+   * `setCloudInit`, `updateCloudInit` and `dumpCloudInit` were removed. There is
+   * no code path that needs them any more, and leaving them here meant a
+   * `qm cloudinit update` was one import away from being reintroduced by
+   * someone who assumed the capability was still supported. Guests are
+   * configured through the QEMU guest agent — see `guestCmd` and
+   * `execVMGuestCommand` above.
+   */
 
   // Reinstall
   async reinstallVM(node: string, vmid: number, isoPath: string): Promise<any> {

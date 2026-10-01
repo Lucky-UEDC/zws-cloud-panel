@@ -512,100 +512,44 @@ function nextCicustomValue(existing: unknown, userSnippet: string) {
   return [`user=${userSnippet}`, ...parts].join(",")
 }
 
-async function repairLinuxGuestViaCloudInit(
-  node: NonNullable<ProxmoxNodeRow>,
-  vps: VpsRow,
-  client: ReturnType<typeof createProxmoxClient>,
-  vmConfig: Record<string, any>,
-  checks: ConsoleCheck[],
-  timeoutMs: number,
-) {
-  const storageRows = await client.getNodeStorage(node.nodeName).catch(() => [])
-  const storage = storageRows.find((row: any) => String(row?.content || "").split(",").includes("snippets"))?.storage || "local"
-  const filename = `zws-console-${vps.vmid}.yaml`
-  const userSnippet = `${storage}:snippets/${filename}`
-  try {
-    await uploadSnippet({
-      host: node.host,
-      node: node.nodeName,
-      storage,
-      filename,
-      content: buildSerialCloudInit(),
-      tokenId: node.tokenId,
-      tokenSecret: node.tokenSecret,
-      allowInsecureTls: node.allowInsecureTls,
-      timeoutMs,
-    })
-    const cicustom = nextCicustomValue(vmConfig.cicustom, userSnippet)
-    await client.updateVMConfig(node.nodeName, vps.vmid, { cicustom })
-    await client.updateCloudInit(node.nodeName, vps.vmid).catch(() => undefined)
-    addCheck(checks, "linux_guest_cloudinit", true, "Uploaded serial repair cloud-init snippet", { evidence: { storage, filename, cicustom: `user=${userSnippet}` } })
-    return { ok: true, rebootNeeded: true, cicustom }
-  } catch (error) {
-    addCheck(checks, "linux_guest_cloudinit", false, safeError(error), { evidence: { storage, filename } })
-    return { ok: false, rebootNeeded: false, cicustom: null }
-  }
+/**
+ * The cloud-init snippet path is gone.
+ *
+ * It uploaded a `#cloud-config` snippet, attached it via `cicustom` and ran
+ * `qm cloudinit update`. That made console repair depend on Cloud-Init being
+ * present and working, which is exactly the dependency this change removes — and
+ * it ran only when both SSH and the guest agent had already failed, so it was
+ * repairing a guest the platform could otherwise not reach at all.
+ *
+ * There is now nothing to do here beyond recording why the path is unavailable.
+ * A guest with no agent cannot be repaired by guest automation, and the seed ISO
+ * fallback below is the last remaining option.
+ */
+function reportCloudInitPathUnavailable(checks: ConsoleCheck[]) {
+  addCheck(checks, "linux_guest_cloudinit", false, "Console repair via cloud-init has been removed: guest automation uses the QEMU guest agent only", {
+    evidence: { removedAt: "guest-automation-v2", replacement: "linux_guest_agent" },
+  })
 }
 
-async function buildSeedIso(vps: VpsRow) {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), `zws-console-${vps.vmid}-`))
-  const isoPath = path.join(dir, "seed.iso")
-  try {
-    const hostname = String(vps.hostname || vps.name || `vm-${vps.vmid}`).replace(/[^A-Za-z0-9.-]/g, "-")
-    await fs.writeFile(path.join(dir, "user-data"), buildSerialCloudInit(), "utf8")
-    await fs.writeFile(path.join(dir, "meta-data"), `instance-id: zws-console-${vps.vmid}-${Date.now()}\nlocal-hostname: ${hostname}\n`, "utf8")
-    await execFileAsync("genisoimage", ["-quiet", "-output", isoPath, "-volid", "CIDATA", "-joliet", "-rock", path.join(dir, "user-data"), path.join(dir, "meta-data")], { timeout: 30000 })
-    return { dir, isoPath, data: await fs.readFile(isoPath) }
-  } catch (error) {
-    await fs.rm(dir, { recursive: true, force: true }).catch(() => undefined)
-    throw error
-  }
-}
-
-async function repairLinuxGuestViaSeedIso(
-  node: NonNullable<ProxmoxNodeRow>,
-  vps: VpsRow,
-  client: ReturnType<typeof createProxmoxClient>,
-  vmConfig: Record<string, any>,
-  checks: ConsoleCheck[],
-  timeoutMs: number,
-) {
-  const storageRows = await client.getNodeStorage(node.nodeName).catch(() => [])
-  const storage = storageRows.find((row: any) => String(row?.content || "").split(",").includes("iso"))?.storage || "local"
-  const filename = `zws-console-${vps.vmid}.iso`
-  const drive = pickSeedIsoDrive(vmConfig) || pickCloudInitDrive(vmConfig)
-  let seed: Awaited<ReturnType<typeof buildSeedIso>> | null = null
-  try {
-    seed = await buildSeedIso(vps)
-    await uploadStorageFile({
-      host: node.host,
-      node: node.nodeName,
-      storage,
-      filename,
-      contentType: "iso",
-      data: seed.data,
-      tokenId: node.tokenId,
-      tokenSecret: node.tokenSecret,
-      allowInsecureTls: node.allowInsecureTls,
-      timeoutMs,
-    })
-    const value = `${storage}:iso/${filename},media=cdrom`
-    try {
-      await client.updateVMConfig(node.nodeName, vps.vmid, { [drive]: value })
-    } catch (error) {
-      const latestConfig = await client.getVMConfig(node.nodeName, vps.vmid).catch(() => null)
-      if (!String(latestConfig?.[drive] || "").includes(`iso/${filename}`)) throw error
-    }
-    addCheck(checks, "linux_guest_seed_iso", true, "Uploaded and attached serial repair NoCloud seed ISO", {
-      evidence: { storage, filename, drive, previous: vmConfig[drive] || null },
-    })
-    return { ok: true, rebootNeeded: true, drive, value }
-  } catch (error) {
-    addCheck(checks, "linux_guest_seed_iso", false, safeError(error), { evidence: { storage, filename, drive } })
-    return { ok: false, rebootNeeded: false, drive, value: null }
-  } finally {
-    if (seed) await fs.rm(seed.dir, { recursive: true, force: true }).catch(() => undefined)
-  }
+/**
+ * The NoCloud seed-ISO repair is gone.
+ *
+ * It built a `user-data`/`meta-data` pair, burned it into a `CIDATA` ISO and
+ * attached it to a customer's VM. That is cloud-init — a different mechanism from
+ * the one this platform now uses, reached only when both SSH and the guest agent
+ * had already failed.
+ *
+ * It is removed rather than kept as a last resort because it is exactly the
+ * dependency this work exists to eliminate: a guest that has been left with a
+ * Cloud-Init ISO attached, on a platform that does not configure guests that way,
+ * is a guest whose real state nobody can reason about. A guest the guest agent
+ * cannot reach is reported as such, which is an honest answer; a silent
+ * Cloud-Init injection is not.
+ */
+function reportSeedIsoPathUnavailable(checks: ConsoleCheck[]) {
+  addCheck(checks, "linux_guest_seed_iso", false, "Console repair via a Cloud-Init seed ISO has been removed: guest automation uses the QEMU guest agent only", {
+    evidence: { removedAt: "guest-automation-v2", replacement: "linux_guest_agent" },
+  })
 }
 
 function wsBuffer(data: WebSocket.RawData) {
@@ -1141,25 +1085,17 @@ async function auditVm(node: NonNullable<ProxmoxNodeRow>, vps: VpsRow, options: 
         if (agent.ok) {
           repairs.push("repair linux serial console through QEMU guest agent")
         } else {
-          const cloudInit = await repairLinuxGuestViaCloudInit(node, vps, client, vmConfig, checks, timeoutMs)
-          guestReboot = guestReboot || cloudInit.rebootNeeded
-          if (cloudInit.ok) {
-            repairs.push("install linux serial repair cloud-init snippet")
-            vmConfig = {
-              ...vmConfig,
-              cicustom: cloudInit.cicustom || vmConfig.cicustom,
-            }
-          } else {
-            const seedIso = await repairLinuxGuestViaSeedIso(node, vps, client, vmConfig, checks, timeoutMs)
-            guestReboot = guestReboot || seedIso.rebootNeeded
-            if (seedIso.ok) {
-              repairs.push("attach linux serial repair seed ISO")
-              vmConfig = {
-                ...vmConfig,
-                [seedIso.drive]: seedIso.value || vmConfig[seedIso.drive],
-              }
-            }
-          }
+          // Both remaining fallbacks are removed. A guest the agent cannot
+          // reach is reported as unreachable, which is the answer.
+          reportCloudInitPathUnavailable(checks)
+          reportSeedIsoPathUnavailable(checks)
+          addCheck(
+            checks,
+            "linux_guest_reachability",
+            false,
+            "Neither SSH nor the guest agent could reach this guest, so the console cannot be repaired from the panel",
+            { evidence: { vmid: vps.vmid, remedy: "Open the hypervisor console directly, or install the QEMU guest agent in the image." } },
+          )
         }
       }
     } else {

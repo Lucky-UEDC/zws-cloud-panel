@@ -1,12 +1,11 @@
 type ProxmoxClientLike = {
   getVMConfig(node: string, vmid: number): Promise<Record<string, any>>
   getVMGuestNetworkInterfaces?(node: string, vmid: number): Promise<any>
-  dumpCloudInit?(node: string, vmid: number, type: "user" | "network"): Promise<any>
 }
 
 export type VmIpDiscoveryResult = {
   ipAddress: string | null
-  source: "guest_agent" | "cloud_init_config" | "cloud_init_dump" | "panel_allocation" | "dhcp_lease" | "none"
+  source: "guest_agent" | "panel_allocation" | "dhcp_lease" | "none"
   metadata?: Record<string, unknown>
 }
 
@@ -45,15 +44,6 @@ function ipsFromGuestAgent(value: any): string[] {
     }
   }
   return [...new Set(out)]
-}
-
-function ipFromCloudInitDump(value: unknown) {
-  const text = typeof value === "string" ? value : JSON.stringify(value || "")
-  const candidates = [
-    ...Array.from(text.matchAll(/\baddress(?:es)?:\s*[\["']*((?:\d{1,3}\.){3}\d{1,3})/gi)).map((match) => match[1]),
-    ...Array.from(text.matchAll(/\bip=([^,\s/]+)/gi)).map((match) => match[1]),
-  ]
-  return candidates.find(isUsableIpv4) || null
 }
 
 function macCandidates(config: Record<string, any> | null | undefined) {
@@ -106,14 +96,10 @@ export async function discoverVmIpAddress(input: {
     }
   }
 
-  const configIp = ipFromIpConfig(config?.ipconfig0)
-  if (configIp) return { ipAddress: configIp, source: "cloud_init_config" }
-
-  if (input.client.dumpCloudInit) {
-    const networkDump = await input.client.dumpCloudInit(input.nodeName, input.vmid, "network").catch(() => null)
-    const dumpIp = ipFromCloudInitDump(networkDump)
-    if (dumpIp) return { ipAddress: dumpIp, source: "cloud_init_dump" }
-  }
+  // `ipconfig0` and `qm cloudinit dump` are no longer sources: nothing writes
+  // them, so reading them would report a stale address from before adoption.
+  // The guest agent is authoritative; the panel allocation is the fallback
+  // because it is what the guest was asked to configure.
 
   if (isUsableIpv4(input.allocatedIp)) return { ipAddress: String(input.allocatedIp), source: "panel_allocation" }
 
@@ -123,6 +109,13 @@ export async function discoverVmIpAddress(input: {
   return { ipAddress: null, source: "none" }
 }
 
+/**
+ * Read a legacy `ipconfig0` value.
+ *
+ * Only for reconciliation of VMs that were configured before guest automation.
+ * It is never used to decide a new VM's address — the guest agent is the only
+ * authority for a VM the guest has configured itself.
+ */
 export function extractConfiguredVmIp(config: Record<string, any> | null | undefined) {
   return ipFromIpConfig(config?.ipconfig0)
 }

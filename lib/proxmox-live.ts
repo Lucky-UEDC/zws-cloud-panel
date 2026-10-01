@@ -5,6 +5,7 @@ import { safeJson } from "@/lib/safe-json"
 import { publishRealtimeEvent, realtimeChannels } from "@/lib/realtime-telemetry"
 import { writeStructuredLog } from "@/lib/structured-logger"
 import { collectGuestDiskUsage, configuredMemoryBytes, type GuestDiskUsage } from "@/lib/vm-guest-disk"
+import { resolveVmGuestOs, type VmGuestOsKind } from "@/lib/vm-os-detection"
 import { dbStatusFromPowerState } from "@/lib/vm-runtime-status"
 import { instanceDisplayName, internalVmHostname } from "@/lib/vm-hostname"
 
@@ -117,7 +118,7 @@ export async function loadLiveVmSnapshot(vpsId: string, options: { syncDatabase?
       customer: { select: { id: true, email: true, name: true } },
       order: { select: { id: true, orderNumber: true, status: true, customerId: true, proxmoxNode: true, osName: true } },
       product: { select: { id: true, name: true, cpuCores: true, ramGb: true, storageGb: true, bandwidthTb: true } },
-      operatingSystem: { select: { id: true, name: true, osFamily: true, osType: true } },
+      operatingSystem: { select: { id: true, name: true, osFamily: true, osType: true, category: true } },
     },
   })
   if (!vps) {
@@ -147,14 +148,16 @@ export async function loadLiveVmSnapshot(vpsId: string, options: { syncDatabase?
     runtime ? client.getVMGuestInfo(nodeName, vps.vmid) : Promise.resolve(null),
   ])
   const runtimeStatus = String(runtime?.status || "").toLowerCase()
-  const osHint = [
-    vps.operatingSystem?.name,
-    vps.operatingSystem?.osFamily,
-    vps.operatingSystem?.osType,
-    vps.order?.osName,
-  ].filter(Boolean).join(" ")
+  const vmOsKind = resolveVmGuestOs({
+    osType: vps.operatingSystem?.osType,
+    osFamily: vps.operatingSystem?.osFamily,
+    category: vps.operatingSystem?.category,
+    osName: vps.operatingSystem?.name,
+    vmOsFamily: vps.vmOsFamily,
+    orderOsName: vps.order?.osName,
+  })
   const diskUsage = runtimeStatus === "running"
-    ? await collectGuestDiskUsage({ client, nodeName, vmid: vps.vmid, osHint }).catch(() => null)
+    ? await collectGuestDiskUsage({ client, nodeName, vmid: vps.vmid, os: vmOsKind }).catch(() => null)
     : null
   const discovered = await discoverVmIpAddress({
     client,

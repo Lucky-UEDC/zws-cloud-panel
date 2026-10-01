@@ -12,6 +12,19 @@ export type ProvisioningStep =
   | "RESIZING_DISK"
   | "ASSIGNING_IP"
   | "STARTING_VM"
+  // The guest-automation pipeline. The server configures itself here, through
+  // the QEMU guest agent and the OS profile that matches the OS it reports.
+  | "WAITING_GUEST_AGENT"
+  | "DETECTING_OS"
+  | "LOADING_OS_TEMPLATE"
+  | "CONFIGURING_NETWORK"
+  | "CONFIGURING_ACCESS"
+  | "CONFIGURING_GUEST"
+  | "VERIFYING_NETWORK"
+  | "COLLECTING_METRICS"
+  | "VERIFYING_GUEST"
+  | "SERVICE_ACTIVE"
+  | "SERVICE_FAILED"
   | "VERIFYING_VM"
   | "ACTIVE"
   | "STOPPED"
@@ -36,6 +49,17 @@ export const STEP_LABELS: Record<ProvisioningStep, string> = {
   RESIZING_DISK: "Configuring storage",
   ASSIGNING_IP: "Allocating IP & network",
   STARTING_VM: "Starting server services",
+  WAITING_GUEST_AGENT: "Waiting for your server to respond",
+  DETECTING_OS: "Checking your server's operating system",
+  LOADING_OS_TEMPLATE: "Loading OS profile",
+  CONFIGURING_NETWORK: "Configuring network",
+  CONFIGURING_ACCESS: "Configuring access",
+  CONFIGURING_GUEST: "Configuring your server",
+  VERIFYING_NETWORK: "Verifying network",
+  COLLECTING_METRICS: "Collecting resource usage",
+  VERIFYING_GUEST: "Confirming your server is configured",
+  SERVICE_ACTIVE: "Your cloud server is ready",
+  SERVICE_FAILED: "Your server needs attention",
   VERIFYING_VM: "Final server optimization",
   ACTIVE: "Your cloud server is ready",
   STOPPED: "Stopped",
@@ -133,6 +157,53 @@ const CUSTOMER_STEP_MESSAGES: Record<ProvisioningStep, CustomerProvisioningStep>
   STARTING_VM: {
     title: "Starting server services",
     message: "Your server services are starting.",
+  },
+  WAITING_GUEST_AGENT: {
+    title: "Waiting for your server to respond",
+    // The single most common honest wait in the whole pipeline: the guest agent
+    // boots after the operating system, and until it answers nothing can be
+    // configured. Saying so beats a spinner with no explanation.
+    message: "Your server is starting up. We wait for it to report in before configuring it — this usually takes under a minute.",
+  },
+  DETECTING_OS: {
+    title: "Checking your server's operating system",
+    message: "We are confirming which operating system your server is running, so we configure it the right way.",
+  },
+  CONFIGURING_GUEST: {
+    title: "Configuring your server",
+    message: "Your network, access and system settings are being applied from inside your server.",
+  },
+  VERIFYING_GUEST: {
+    title: "Confirming your server is configured",
+    message: "We are reading your server back to confirm the settings took effect.",
+  },
+  LOADING_OS_TEMPLATE: {
+    title: "Loading OS profile",
+    message: "We are loading the operating system profile for your server.",
+  },
+  CONFIGURING_NETWORK: {
+    title: "Configuring network",
+    message: "Your network settings are being applied from inside the server.",
+  },
+  CONFIGURING_ACCESS: {
+    title: "Configuring access",
+    message: "Your credentials are being configured inside the server.",
+  },
+  VERIFYING_NETWORK: {
+    title: "Verifying network",
+    message: "We are confirming your network settings took effect.",
+  },
+  COLLECTING_METRICS: {
+    title: "Collecting resource usage",
+    message: "We are collecting initial resource usage from your server.",
+  },
+  SERVICE_ACTIVE: {
+    title: "Your cloud server is ready",
+    message: "Your cloud server is running and configured. You can sign in now.",
+  },
+  SERVICE_FAILED: {
+    title: "Your server needs attention",
+    message: "We could not finish configuring your server. Our team has been notified and will take it from here.",
   },
   VERIFYING_VM: {
     title: "Final server optimization",

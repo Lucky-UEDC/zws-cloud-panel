@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server"
 import { getAdminFromCookies } from "@/lib/server-auth"
 import { prisma } from "@/lib/db"
 import { createPanelLog } from "@/lib/panel-log"
+import { measureNodeCapabilities } from "@/lib/guest-automation/node-capabilities"
 import { canAccessAdminApi } from "@/lib/admin-rbac"
 import {
   boolValue,
@@ -60,7 +61,32 @@ export async function POST(request: NextRequest) {
       metadata: { nodeId: id || null, nodeName: textValue(body.nodeName), host: test.host },
     })
 
-    return NextResponse.json(test, { headers: NO_CACHE_HEADERS })
+    // The wizard asks for the capability report before the node exists, so the
+    // admin sees the verdict before committing rather than discovering it during
+    // a customer's first provisioning job. The authoritative measurement is
+    // still taken on create; this one is a pre-flight.
+    let capabilities: unknown = null
+    if (body.capabilitiesOnly === true) {
+      const measured = await measureNodeCapabilities({
+        host: test.host,
+        tokenId,
+        tokenSecret,
+        nodeName: textValue(body.nodeName),
+        allowInsecureTls,
+      })
+      capabilities = {
+        status: measured.status,
+        checks: measured.checks,
+        summary: measured.summary,
+        blockers: measured.blockers,
+        lastCheckedAt: new Date().toISOString(),
+        headline: `${measured.status === "ready"
+          ? "Ready — guest agent and guest-exec verified"
+          : measured.blockers[0] || "Guest capabilities have not been measured"}`,
+      }
+    }
+
+    return NextResponse.json({ ...test, capabilities }, { headers: NO_CACHE_HEADERS })
   } catch (error: any) {
     await createPanelLog({
       category: "Compute Node",

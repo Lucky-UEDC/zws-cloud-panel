@@ -9,20 +9,37 @@ import {
 import { createProxmoxClient } from "@/lib/proxmox"
 import { markRuntimeCompleteIfReady, probeVmRuntimeHealth } from "@/lib/vm-runtime-health"
 
+/**
+ * The deployment stages a customer sees.
+ *
+ * These are the real pipeline, in order, with the guest-automation steps spelled
+ * out rather than collapsed into one "configuring" row. A customer watching a
+ * server take four minutes to become usable deserves to know that the wait is
+ * their operating system booting, not a spinner with no explanation.
+ *
+ * `SERVICE_ACTIVE` and `SERVICE_FAILED` are terminal. The customer page only
+ * auto-redirects on `SERVICE_ACTIVE`, because a redirect to a server that is not
+ * ready is a worse experience than watching the last step.
+ *
+ * The `matches` lists are the internal step tokens, including legacy ones. A
+ * token that is absent simply leaves that stage pending rather than erroring.
+ */
 const DEPLOYMENT_STAGES = [
-  { key: "payment_pending", title: "Payment pending", matches: ["payment_pending", "pending_payment", "payment_processing"] },
-  { key: "payment_confirmed", title: "Payment confirmed", matches: ["paid", "payment_success", "payment_confirmed"] },
-  { key: "order_accepted", title: "Order accepted", matches: ["order_accepted", "queued", "QUEUED"] },
-  { key: "selecting_location", title: "Selecting deployment location", matches: ["SELECTING_NODE", "WAITING_FOR_CAPACITY", "WAITING_FOR_ADMIN"] },
-  { key: "preparing_image", title: "Installing operating system", matches: ["CLONING_TEMPLATE", "CLONE_COMPLETE"] },
-  { key: "configuring_instance", title: "Configuring server", matches: ["CONFIGURING_VM", "RESIZING_DISK"] },
-  { key: "installing_os", title: "Installing operating system", matches: ["APPLYING_CLOUD_INIT"] },
-  { key: "configuring_network", title: "Configuring network", matches: ["ASSIGNING_IP", "ip_reserved"] },
-  { key: "starting_server", title: "Starting server", matches: ["STARTING_VM"] },
-  { key: "detecting_ip", title: "Detecting IP address", matches: ["VERIFYING_VM", "starting", "configuring"] },
-  { key: "configuring_access", title: "Configuring access", matches: ["STOPPED"] },
-  { key: "final_verification", title: "Final verification", matches: ["delivered"] },
-  { key: "service_active", title: "Completed", matches: ["ACTIVE"] },
+  { key: "PAYMENT_PENDING", title: "Payment pending", matches: ["payment_pending", "pending_payment", "payment_processing"] },
+  { key: "PAYMENT_CONFIRMED", title: "Payment confirmed", matches: ["paid", "payment_success", "payment_confirmed", "QUEUED"] },
+  { key: "ORDER_ACCEPTED", title: "Order accepted", matches: ["order_accepted", "queued", "QUEUED"] },
+  { key: "NODE_SELECTED", title: "Choosing a location", matches: ["SELECTING_NODE", "WAITING_FOR_CAPACITY", "WAITING_FOR_ADMIN"] },
+  { key: "VM_CREATED", title: "Server created", matches: ["CLONING_TEMPLATE", "CLONE_COMPLETE"] },
+  { key: "VM_STARTED", title: "Server starting", matches: ["CONFIGURING_VM", "RESIZING_DISK", "ASSIGNING_IP", "STARTING_VM"] },
+  { key: "WAITING_GUEST_AGENT", title: "Waiting for your server to respond", matches: ["WAITING_GUEST_AGENT"] },
+  { key: "DETECTING_OS", title: "Checking the operating system", matches: ["DETECTING_OS"] },
+  { key: "LOADING_OS_TEMPLATE", title: "Preparing the right configuration", matches: ["APPLYING_CLOUD_INIT"] },
+  { key: "CONFIGURING_NETWORK", title: "Setting up the network", matches: ["CONFIGURING_NETWORK"] },
+  { key: "CONFIGURING_ACCESS", title: "Setting up access", matches: ["CONFIGURING_ACCESS"] },
+  { key: "CONFIGURING_GUEST", title: "Applying system settings", matches: ["CONFIGURING_GUEST"] },
+  { key: "VERIFYING_GUEST", title: "Confirming everything worked", matches: ["VERIFYING_GUEST", "VERIFYING_VM"] },
+  { key: "COLLECTING_METRICS", title: "Collecting resource usage", matches: ["COLLECTING_METRICS"] },
+  { key: "SERVICE_ACTIVE", title: "Ready", matches: ["ACTIVE", "SERVICE_ACTIVE"] },
 ]
 
 const INTERNAL_PROVISIONING_TEXT =
@@ -73,7 +90,7 @@ function clientSafeRuntimeHealth(health: any) {
     completionEligible: Boolean(health.completionEligible),
     pingOk: Boolean(health.pingOk),
     sshOk: Boolean(health.sshOk),
-    cloudInitOk: Boolean(health.cloudInitOk),
+    guestConfiguredOk: Boolean(health.guestConfiguredOk),
     checkedAt: health.checkedAt || null,
   }
 }
@@ -84,6 +101,12 @@ function stageStatus(stage: (typeof DEPLOYMENT_STAGES)[number], index: number, a
   if (index === activeIndex) return "running"
   return "pending"
 }
+
+/** The only state in which a customer's server is usable. */
+const SERVICE_ACTIVE_TOKENS = new Set(["ACTIVE", "SERVICE_ACTIVE", "COMPLETED", "RUNNING"])
+
+/** States where the pipeline stopped and will not proceed on its own. */
+const FAILED_TOKENS = new Set(["FAILED", "START_FAILED", "SERVICE_FAILED", "REPAIR_NEEDED", "UPGRADE_FAILED", "CANCELLED", "CANCELED"])
 
 function activeStageIndex(current: string) {
   const normalized = current.toLowerCase()
@@ -122,7 +145,7 @@ export async function getClientDeploymentSnapshot(input: { id: string; customerI
 
   const job = order.provisioningJobs[0] || null
   let current = String(job?.currentStep || order.provisioningStatus || order.status || "pending")
-  const failed = ["failed", "FAILED", "START_FAILED", "UPGRADE_FAILED"].includes(current) || ["failed"].includes(String(job?.status || ""))
+  const jobFailed = ["failed", "FAILED", "START_FAILED", "UPGRADE_FAILED"].includes(current) || ["failed"].includes(String(job?.status || ""))
   let runtimeHealth = null as Awaited<ReturnType<typeof probeVmRuntimeHealth>> | null
   if (order.vpsInstance?.proxmoxNode && order.vpsInstance.vmid) {
     const node = order.vpsInstance.proxmoxNode
@@ -148,7 +171,13 @@ export async function getClientDeploymentSnapshot(input: { id: string; customerI
     }
   }
   const activeIndex = Math.max(0, activeStageIndex(current))
-  const complete = String(current).toUpperCase() === "ACTIVE" || Boolean(runtimeHealth?.completionEligible)
+  // `SERVICE_ACTIVE` is the only state that means "usable". A runtime probe that
+  // says the guest answers is supporting evidence, not the definition: the
+  // definition is that the pipeline reached its terminal stage.
+  const reachedActiveStage = SERVICE_ACTIVE_TOKENS.has(String(current).toUpperCase())
+  const failed = FAILED_TOKENS.has(String(current).toUpperCase())
+  const complete = reachedActiveStage || String(current).toUpperCase() === "ACTIVE" || Boolean(runtimeHealth?.completionEligible)
+  const failedState = failed || jobFailed
   const progress = complete ? 100 : job?.progress ?? (order.vpsInstance ? 100 : Math.round(((activeIndex + 1) / DEPLOYMENT_STAGES.length) * 100))
   const metadata = job?.metadata && typeof job.metadata === "object" && !Array.isArray(job.metadata) ? job.metadata as Record<string, any> : {}
 
@@ -188,7 +217,7 @@ export async function getClientDeploymentSnapshot(input: { id: string; customerI
       nextRetryAt: job?.nextRetryAt || null,
       retryCountdownSeconds: job?.nextRetryAt ? Math.max(0, Math.ceil((new Date(job.nextRetryAt).getTime() - Date.now()) / 1000)) : null,
     },
-    failure: failed ? {
+    failure: failedState ? {
       reason: friendlyFailureReason(order.provisioningError || job?.error || "Deployment requires attention."),
       code: null,
       suggestedFix: (() => {
@@ -213,8 +242,11 @@ export async function getClientDeploymentSnapshot(input: { id: string; customerI
     stages: DEPLOYMENT_STAGES.map((stage, index) => ({
       key: stage.key,
       title: stage.title,
-      status: stageStatus(stage, index, activeIndex === -1 ? 0 : activeIndex, failed, complete),
+      status: stageStatus(stage, index, activeIndex === -1 ? 0 : activeIndex, failedState, complete),
     })),
+    // The terminal stage, named explicitly, so the client page can decide to
+    // redirect on SERVICE_ACTIVE and on nothing else.
+    terminal: complete ? "SERVICE_ACTIVE" : failedState ? "SERVICE_FAILED" : null,
     steps: serializeSteps(job?.steps || [], job?.type),
     logs: (job?.logs || []).map((log) => serializeLog(log, job?.type)),
     createdAt: order.createdAt,

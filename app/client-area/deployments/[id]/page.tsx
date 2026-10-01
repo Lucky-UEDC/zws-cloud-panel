@@ -25,6 +25,8 @@ type Deployment = {
   vm: { id?: string | null; instanceId?: string | null; hostname?: string | null; ipAddress?: string | null; os?: string | null; plan?: string | null; status?: string | null }
   network: { status: string; ipAssigned: boolean; infrastructureZone?: string | null }
   stages: Array<{ key: string; title: string; status: string }>
+  /** "SERVICE_ACTIVE" | "SERVICE_FAILED" | null — the only two terminal states. */
+  terminal?: "SERVICE_ACTIVE" | "SERVICE_FAILED" | null
   logs: Array<{ id: string; createdAt: string; level: string; title?: string; message: string }>
   createdAt: string
   updatedAt: string
@@ -67,8 +69,15 @@ export default function ClientDeploymentTrackerPage() {
     return () => source.close()
   }, [id, load])
 
-  const ready = String(deployment?.status || deployment?.serviceStatus || "").toUpperCase() === "ACTIVE"
-  const failed = Boolean(deployment?.failure)
+  /**
+   * `SERVICE_ACTIVE` is the only state that means the server is usable.
+   *
+   * The auto-redirect below fires on this and nothing else. Redirecting on
+   * "almost ready" sends a customer to a login prompt for a server that is not
+   * answering yet, which is worse than watching the last two stages finish.
+   */
+  const ready = deployment?.terminal === "SERVICE_ACTIVE"
+  const failed = deployment?.terminal === "SERVICE_FAILED" || Boolean(deployment?.failure)
   const retryLabel = useMemo(() => {
     const seconds = deployment?.retryState?.retryCountdownSeconds
     if (seconds === null || seconds === undefined) return null
@@ -82,6 +91,8 @@ export default function ClientDeploymentTrackerPage() {
   useEffect(() => {
     if (ready && deployment?.vm?.id && !redirected) {
       setRedirected(true)
+      // A short pause so the customer sees "Ready" land rather than the page
+      // changing under them mid-animation.
       window.setTimeout(() => {
         window.location.href = `/client-area/vps/${deployment.vm.id}`
       }, 1500)
@@ -111,7 +122,17 @@ export default function ClientDeploymentTrackerPage() {
           <div className="space-y-4">
             <div className="flex flex-wrap items-center gap-2">
               <Badge variant={statusVariant(deployment?.automationState || "")}>{deployment?.automationState || "pending"}</Badge>
-              <Badge variant={ready ? "default" : failed ? "destructive" : "secondary"}>{ready ? "Your cloud server is ready" : failed ? "Manual intervention required" : "Automation active"}</Badge>
+              <Badge variant={ready ? "default" : failed ? "destructive" : "secondary"}>
+                {ready ? "Your cloud server is ready" : failed ? "Manual intervention required" : "Automation active"}
+              </Badge>
+              {/* Named, so the page states the state machine rather than letting
+                  the customer infer readiness from a progress bar. */}
+              <Badge variant="outline" title="The only states that are final">
+                {deployment?.terminal || deployment?.currentStage || "in progress"}
+              </Badge>
+              {ready && deployment?.vm?.id ? (
+                <span className="text-xs text-muted-foreground">Taking you to your server…</span>
+              ) : null}
               {retryLabel ? <Badge variant="outline">{retryLabel}</Badge> : null}
             </div>
             <Progress value={deployment?.progress || 0} />
