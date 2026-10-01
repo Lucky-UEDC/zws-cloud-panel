@@ -22,6 +22,8 @@
 
 import { prisma } from "@/lib/db"
 import { createProxmoxClient, runProxmoxDiagnostics, runProxmoxFeatureDiagnostics, type ProxmoxDiagnosticStep } from "@/lib/proxmox"
+import { classifyGuestOsInfo } from "./os-detection"
+import type { GuestEngine } from "./constants"
 
 export const NODE_CAPABILITIES = [
   "api_connectivity",
@@ -316,12 +318,16 @@ export async function measureGuestCapabilities(input: {
     return
   }
 
-  // A VM whose Proxmox-reported agent flag is on is the only sensible candidate.
-  // The flag is then ignored: the guest either answers or it does not.
   const candidates = vms.filter((vm: any) => String(vm?.status || "") === "running" && Number(vm?.vmid) > 0)
-  const preferred = candidates.find((vm: any) => Number(vm.agent) === 1) || candidates[0] || null
+  // Ordered so the most likely to answer comes first. The Proxmox-reported flag
+  // is only a hint about where to start — the guest either answers or it does
+  // not, and the flag is never taken as the answer.
+  const ordered = [
+    ...candidates.filter((vm: any) => Number(vm.agent) === 1),
+    ...candidates.filter((vm: any) => Number(vm.agent) !== 1).sort((a: any, b: any) => Number(a.vmid) - Number(b.vmid)),
+  ]
 
-  if (!preferred) {
+  if (!ordered.length) {
     for (const key of ["guest_agent", "guest_exec", "guest_password", "guest_fsinfo", "guest_network"] as NodeCapability[]) {
       checks.push(check(key, {
         state: "skip",
@@ -334,7 +340,48 @@ export async function measureGuestCapabilities(input: {
     return
   }
 
-  const vmid = Number(preferred.vmid)
+  // Try each candidate until one answers.
+  //
+  // Probing only the first is how a node full of working guests came to be
+  // reported as having no agent at all: the lowest-numbered running VM was a
+  // router image with no agent, and the conclusion drawn from it was about the
+  // node when it was only about that one image.
+  let vmid = 0
+  let osInfo: Awaited<ReturnType<typeof timed>> | null = null
+  const tried: number[] = []
+  for (const candidate of ordered) {
+    const candidateVmid = Number(candidate.vmid)
+    tried.push(candidateVmid)
+    const attempt = await timed(() => client.guestCmd(nodeName, candidateVmid, "get-osinfo"))
+    if (!("error" in attempt)) {
+      vmid = candidateVmid
+      osInfo = attempt
+      break
+    }
+  }
+  if (!osInfo || "error" in osInfo) {
+    const lastError = osInfo && "error" in osInfo ? describeError(osInfo.error) : "no candidate answered"
+    const notInstalled = /not installed|no qemu guest agent|guest agent is not|guest agent.*not running/i.test(lastError)
+    checks.push(check("guest_agent", {
+      state: "fail",
+      detail: notInstalled
+        ? `No running guest on this node answered the guest agent (tried ${tried.join(", ")}). Those images carry no working QEMU Guest Agent, so guest automation cannot configure servers cloned from them.`
+        : `No running guest on this node answered the guest agent (tried ${tried.join(", ")}): ${lastError}`,
+      durationMs: osInfo && "durationMs" in osInfo ? (osInfo as any).durationMs : null,
+      measured: true,
+    }))
+    for (const key of ["guest_exec", "guest_password", "guest_fsinfo", "guest_network"] as NodeCapability[]) {
+      checks.push(check(key, { state: "skip", detail: "Not attempted: no guest on this node answered the guest agent", durationMs: null, measured: false }))
+    }
+    return
+  }
+  checks.push(check("guest_agent", {
+    state: "pass",
+    detail: `VM ${vmid} answered get-osinfo as ${(osInfo.value as any)?.result?.name || "an operating system"}${tried.length > 1 ? ` (first of ${tried.length} running guests tried)` : ""}`,
+    durationMs: osInfo.durationMs,
+    measured: true,
+  }))
+
   // The shared feature diagnostic probes the console against a hard-coded VMID
   // that may not exist on this node. Probing a VMID that is not there tells us
   // nothing about whether the node's console works, and reporting "VNC not
@@ -360,33 +407,6 @@ export async function measureGuestCapabilities(input: {
     checks.push(check("console", { state: "skip", detail: "This client cannot open a VNC websocket, so the console was not probed", durationMs: null, measured: false }))
   }
 
-  const osInfo = await timed(() => client.guestCmd(nodeName, vmid, "get-osinfo"))
-  if ("error" in osInfo) {
-    const detail = describeError(osInfo.error)
-    // "The agent is not installed" and "the agent could not run" are different
-    // problems for an admin, so they are reported differently.
-    const notInstalled = /not installed|no qemu guest agent|guest agent is not|guest agent.*not running/i.test(detail)
-    checks.push(check("guest_agent", {
-      state: "fail",
-      detail: notInstalled
-        ? `VM ${vmid} did not answer the guest agent. Its image has no working QEMU Guest Agent, so guest automation cannot configure it.`
-        : `VM ${vmid} did not answer the guest agent: ${detail}`,
-      durationMs: osInfo.durationMs,
-      measured: true,
-    }))
-    for (const key of ["guest_exec", "guest_password", "guest_fsinfo", "guest_network"] as NodeCapability[]) {
-      checks.push(check(key, { state: "skip", detail: "Not attempted: the guest agent did not answer", durationMs: null, measured: false }))
-    }
-    return
-  }
-
-  checks.push(check("guest_agent", {
-    state: "pass",
-    detail: `VM ${vmid} answered get-osinfo as ${(osInfo.value as any)?.result?.name || "an operating system"}`,
-    durationMs: osInfo.durationMs,
-    measured: true,
-  }))
-
   // Native verbs, each called for real. None is inferred from the version.
   for (const [key, verb] of [
     ["guest_password", "get-users"],
@@ -399,7 +419,17 @@ export async function measureGuestCapabilities(input: {
       : { state: "pass", detail: `${verb} returned a result`, durationMs: result.durationMs, measured: true }))
   }
 
-  checks.push(check("guest_exec", await measureGuestExec({ client, nodeName, vmid, timeoutMs: execTimeoutMs })))
+  // The engine comes from the guest's own `get-osinfo`, taken in the loop above,
+  // so the probe cannot guess wrong about which shell this image has.
+  const classified = classifyGuestOsInfo(
+    (osInfo as any).value?.result ?? (osInfo as any).value?.data ?? (osInfo as any).value,
+  )
+  // An unrecognised OS still gets probed, because a guest we cannot classify is
+  // not automatically a guest we cannot drive. Linux is the far more likely
+  // default on this fleet, and the fallback is reported in the detail line.
+  const probeEngine: GuestEngine = classified.engine === "windows" ? "windows" : "linux"
+
+  checks.push(check("guest_exec", await measureGuestExec({ client, nodeName, vmid, timeoutMs: execTimeoutMs, engine: probeEngine })))
 }
 
 /**
@@ -415,14 +445,31 @@ async function measureGuestExec(input: {
   nodeName: string
   vmid: number
   timeoutMs: number
+  /** The guest's own OS, as reported by the guest. */
+  engine: GuestEngine
 }): Promise<Omit<CapabilityCheck, "key" | "label">> {
   const startedAt = Date.now()
   try {
-    const started: any = await input.client
-      .execVMGuestCommand(input.nodeName, input.vmid, ["/bin/sh", "-c", "exit 0"])
-      // Not every guest image has /bin/sh at a path the agent can resolve, so
-      // fall back to a bare builtin. A failure of both is about the channel.
-      .catch(() => input.client.execVMGuestCommand(input.nodeName, input.vmid, ["true"]))
+    // The shell has to be the guest's, not this file's idea of one.
+    //
+    // A single `/bin/sh` here reported "guest-exec broken" on a node whose
+    // Windows guests run guest-exec perfectly well — the channel was fine and the
+    // probe was wrong. A node is not unusable because one of its images is not
+    // Linux.
+    const attempts: string[][] = input.engine === "windows"
+      ? [["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", "exit 0"], ["cmd.exe", "/c", "exit 0"]]
+      : [["/bin/sh", "-c", "exit 0"], ["/bin/sh", "-c", "exit 0"]]
+    let started: any = null
+    let lastError: unknown = null
+    for (const command of attempts) {
+      try {
+        started = await input.client.execVMGuestCommand(input.nodeName, input.vmid, command)
+        break
+      } catch (error) {
+        lastError = error
+      }
+    }
+    if (!started && lastError) throw lastError
     const pid = Number(started?.pid)
     if (!Number.isInteger(pid)) {
       return { state: "fail", detail: "guest-exec did not return a pid, so no result could be polled", durationMs: Date.now() - startedAt, measured: true }
@@ -441,8 +488,8 @@ async function measureGuestExec(input: {
     return {
       state: exitCode === 0 ? "pass" : "fail",
       detail: exitCode === 0
-        ? `guest-exec started pid ${pid} and it exited 0`
-        : `guest-exec started pid ${pid} but it exited ${exitCode}`,
+        ? `guest-exec started pid ${pid} on a ${input.engine} guest and it exited 0`
+        : `guest-exec started pid ${pid} on a ${input.engine} guest but it exited ${exitCode}`,
       durationMs: Date.now() - startedAt,
       measured: true,
     }

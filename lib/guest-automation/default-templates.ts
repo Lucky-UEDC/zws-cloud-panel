@@ -38,11 +38,13 @@ export type SeedOperation = {
   verificationRequired?: boolean
   verificationCommand?: string | null
   verificationParser?: string | null
+  verificationArgs?: Record<string, unknown>
   successCondition?: string | null
   rollbackCommand?: string | null
+  rollbackArguments?: unknown[] | null
   stateKey?: string | null
   notes?: string | null
-  fallbacks?: Array<{ command: string; notes?: string; verificationParser?: string | null }>
+  fallbacks?: Array<{ command: string; notes?: string; verificationParser?: string | null; shell?: string }>
 }
 
 /**
@@ -461,16 +463,31 @@ const LINUX_ACCESS: SeedOperation[] = [
 const WINDOWS_ACCESS: SeedOperation[] = [
   {
     operation: "set_password",
-    commandType: "guest-native",
-    shell: "windows-powershell",
-    command: "set-user-password",
+    commandType: "guest-exec",
+    shell: "windows-cmd",
+    command: "net user {{USERNAME}} {{PASSWORD}}",
     timeoutSeconds: 45,
     requiresRunning: true,
+    requiresGuestAgent: true,
+    dangerLevel: "safe",
+    requiresConfirmation: false,
+    supportsRollback: false,
     verificationRequired: true,
-    verificationCommand: "get-users",
-    verificationParser: "native-users",
+    verificationCommand: "net user {{USERNAME}}",
+    verificationParser: "cmd-output-contains",
+    verificationArgs: { expected: "The command completed successfully" },
+    successCondition: "exit-code-0",
+    rollbackCommand: null,
+    rollbackArguments: null,
+    fallbacks: [
+      {
+        notes: "Fallback to PowerShell if cmd fails.",
+        command: "net user {{USERNAME}} {{PASSWORD}}",
+        shell: "windows-powershell",
+      },
+    ],
     stateKey: "access.password",
-    notes: "Native QGA verb. No shell, no plaintext in argv.",
+    notes: "Uses net user via guest-exec. Native QGA set-user-password verb is unreliable on Windows Server 2022. USERNAME defaults to Administrator.",
   },
   {
     operation: "create_user",
@@ -619,45 +636,46 @@ const WINDOWS_ACCESS: SeedOperation[] = [
   },
 ]
 
-/** Windows network configuration via PowerShell + netsh. */
+/** Windows network configuration via PowerShell with dynamic adapter discovery.
+ *  Each operation is separate to avoid QGA command length limits and ensure reliability. */
 const WINDOWS_NETWORK: SeedOperation[] = [
   {
     operation: "set_ip",
     shell: "windows-powershell",
     command:
-      "New-NetIPAddress -InterfaceAlias '{{NIC}}' -IPAddress '{{IP}}' -PrefixLength {{PREFIX}} -DefaultGateway '{{GATEWAY}}' -ErrorAction Stop",
+      '$ErrorActionPreference="Stop"; $a=(Get-NetAdapter|Where-Object{$_.Status -eq "Up" -and $_.HardwareInterface})|Select-Object -First 1 ifIndex,Name; if(-not $a){throw "WINDOWS_NETWORK_ADAPTER_NOT_FOUND"}; $idx=$a.ifIndex; $cur=(Get-NetIPAddress -InterfaceIndex $idx -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object{$_.PrefixOrigin -ne "WellKnown"}).IPAddress; if($cur){Remove-NetIPAddress -InterfaceIndex $idx -AddressFamily IPv4 -Confirm:$false -ErrorAction SilentlyContinue}; New-NetIPAddress -InterfaceIndex $idx -IPAddress "{{IP}}" -PrefixLength {{PREFIX}}',
     timeoutSeconds: 60,
     requiresRunning: true,
     dangerLevel: "caution",
     supportsRollback: true,
     verificationRequired: true,
-    verificationCommand: "network-get-interfaces",
-    verificationParser: "native-interfaces",
-    rollbackCommand: "Remove-NetIPAddress -InterfaceAlias '{{NIC}}' -IPAddress '{{IP}}' -Confirm:$false -ErrorAction SilentlyContinue",
+    verificationCommand: "Get-NetIPAddress -InterfaceIndex $idx -AddressFamily IPv4 | Select-Object IPAddress,PrefixLength,InterfaceIndex | ConvertTo-Json -Compress",
+    verificationParser: "native-json",
+    rollbackCommand: "Remove-NetIPAddress -InterfaceIndex $idx -IPAddress '{{IP}}' -Confirm:$false -ErrorAction SilentlyContinue",
     stateKey: "network.ipv4",
-    notes: "Interface alias comes from network-get-interfaces, so 'Ethernet' is never assumed.",
+    notes: "Interface discovered dynamically via Get-NetAdapter. Only IP address is configured here.",
   },
   {
     operation: "set_gateway",
     shell: "windows-powershell",
-    command: "Set-NetIPInterface -InterfaceAlias '{{NIC}}' -Dhcp Disabled; Remove-NetRoute -InterfaceAlias '{{NIC}}' -DestinationPrefix '0.0.0.0/0' -Confirm:$false -ErrorAction SilentlyContinue; New-NetRoute -InterfaceAlias '{{NIC}}' -DestinationPrefix '0.0.0.0/0' -NextHop '{{GATEWAY}}'",
+    command: '$ErrorActionPreference="Stop"; $a=(Get-NetAdapter|Where-Object{$_.Status -eq "Up" -and $_.HardwareInterface})|Select-Object -First 1 ifIndex,Name; if(-not $a){throw "WINDOWS_NETWORK_ADAPTER_NOT_FOUND"}; $idx=$a.ifIndex; Remove-NetRoute -InterfaceIndex $idx -DestinationPrefix "0.0.0.0/0" -Confirm:$false -ErrorAction SilentlyContinue; New-NetRoute -InterfaceIndex $idx -DestinationPrefix "0.0.0.0/0" -NextHop "{{GATEWAY}}"',
     timeoutSeconds: 60,
     requiresRunning: true,
     dangerLevel: "caution",
     verificationRequired: true,
-    verificationCommand: "network-get-interfaces",
-    verificationParser: "native-interfaces",
+    verificationCommand: "Get-NetRoute -DestinationPrefix '0.0.0.0/0' -InterfaceIndex $idx | Select-Object NextHop,InterfaceIndex | ConvertTo-Json -Compress",
+    verificationParser: "native-json",
     stateKey: "network.gateway",
   },
   {
     operation: "set_dns",
     shell: "windows-powershell",
-    command: "Set-DnsClientServerAddress -InterfaceAlias '{{NIC}}' -ServerAddresses ('{{DNS1}}')",
+    command: '$ErrorActionPreference="Stop"; $a=(Get-NetAdapter|Where-Object{$_.Status -eq "Up" -and $_.HardwareInterface})|Select-Object -First 1 ifIndex,Name; if(-not $a){throw "WINDOWS_NETWORK_ADAPTER_NOT_FOUND"}; $idx=$a.ifIndex; Set-DnsClientServerAddress -InterfaceIndex $idx -ServerAddresses "8.8.8.8","1.1.1.1"',
     timeoutSeconds: 45,
     requiresRunning: true,
     verificationRequired: true,
-    verificationCommand: "get-time",
-    verificationParser: "exit-code",
+    verificationCommand: "Get-DnsClientServerAddress -InterfaceIndex $idx -AddressFamily IPv4 | Select-Object InterfaceIndex,ServerAddresses | ConvertTo-Json -Compress",
+    verificationParser: "native-json",
     stateKey: "network.dns",
   },
 ]

@@ -54,6 +54,7 @@ import {
 } from "@/lib/provisioning-identity"
 import { findProxmoxVmsByOrder, scanDuplicateManagedVms } from "@/lib/vm-duplicate-quarantine"
 import { paymentFlowError, paymentFlowLog } from "@/lib/payment-flow-log"
+import { guestAgentChannelOpen } from "@/lib/proxmox-agent-flag"
 
 type ProxmoxClient = ReturnType<typeof createProxmoxClient>
 
@@ -4330,7 +4331,7 @@ export async function processProvisioningJob(jobId: string) {
     await runReinstallOperation("guest_agent_preflight_failed", "APPLYING_CLOUD_INIT", async () => {
       const vmConfigForPreflight = await client.getVMConfig(nodeName, vmid).catch(() => null)
       const agentChannel = vmConfigForPreflight
-        ? Object.entries(vmConfigForPreflight).some(([key, value]) => /^agent(\d+)?$/i.test(key) && Number(value) === 1)
+        ? guestAgentChannelOpen(vmConfigForPreflight)
         : false
       if (!agentChannel) {
         await logJob(running.id, {

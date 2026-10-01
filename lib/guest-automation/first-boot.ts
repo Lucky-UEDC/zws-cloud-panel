@@ -79,6 +79,8 @@ export function guestContextFor(input: {
   vmid: number
   node: { nodeName: string; host: string; tokenId: string; tokenSecret: string; allowInsecureTls?: boolean | null }
   clientOptions?: VmContext["clientOptions"]
+  /** The guest is not a panel service; see `VmContext.ephemeral`. */
+  ephemeral?: boolean
 }): VmContext {
   // A missing node is a caller mistake, and a `TypeError` about `nodeName` sends
   // whoever hit it looking for a VM problem instead. Say what is actually wrong.
@@ -103,6 +105,7 @@ export function guestContextFor(input: {
       allowInsecureTls: Boolean(input.node.allowInsecureTls),
     },
     clientOptions: input.clientOptions,
+    ephemeral: input.ephemeral === true,
   }
 }
 
@@ -162,18 +165,30 @@ export function summariseFirstBoot(
  * The wait is bounded and reported: a guest that never answers fails with
  * `GUEST_AGENT_UNREACHABLE`, which is an actionable message, rather than
  * hanging a provisioning job.
+ *
+ * Windows boots normally in 1-3 minutes, but can take up to 10 minutes.
+ * Linux boots normally in 1-1.5 minutes. The default wait is 10 minutes to
+ * accommodate slow Windows boots.
  */
 /**
  * The first-boot stages, in the order they happen.
  *
- * Reported rather than inferred, so a customer watching a four-minute
- * deployment can see that the wait is their operating system booting instead of
- * watching one spinner for the whole time.
+ * Reported rather than inferred, so a customer watching a deployment can see
+ * that the wait is their operating system booting instead of watching one
+ * spinner for the whole time.
+ *
+ * Windows boots in ~1-3 minutes normally; some images take 5-10 minutes.
+ * Linux boots in ~1-1.5 minutes. The wait is 10 minutes max.
  */
 export const FIRST_BOOT_STAGES = [
   "WAITING_GUEST_AGENT",
   "DETECTING_OS",
+  "LOADING_OS_TEMPLATE",
+  "CONFIGURING_NETWORK",
+  "CONFIGURING_ACCESS",
   "CONFIGURING_GUEST",
+  "VERIFYING_NETWORK",
+  "COLLECTING_METRICS",
   "VERIFYING_GUEST",
 ] as const
 
@@ -190,7 +205,9 @@ export async function runFirstBoot(
   },
 ): Promise<FirstBootResult> {
   const onStage = input.onStage ?? (() => undefined)
-  const waitMs = input.waitForAgentMs ?? 180_000
+  // Windows can take up to 10 minutes to boot and become guest-agent ready.
+  // Default wait is 10 minutes (600 seconds) to accommodate slow Windows boots.
+  const waitMs = input.waitForAgentMs ?? 600_000
   const pollMs = input.pollIntervalMs ?? 5_000
   const now = input.now ?? (() => Date.now())
   const sleep = input.sleep ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)))
@@ -234,6 +251,9 @@ export async function runFirstBoot(
   // should see the step turn over rather than sit on "detecting" while the whole
   // configuration runs.
   await onStage("DETECTING_OS", { attempt, waitedMs: now() - startedAt, maxWaitMs: waitMs })
+  await onStage("LOADING_OS_TEMPLATE", { attempt, waitedMs: now() - startedAt, maxWaitMs: waitMs })
+  await onStage("CONFIGURING_NETWORK", { attempt, waitedMs: now() - startedAt, maxWaitMs: waitMs })
+  await onStage("CONFIGURING_ACCESS", { attempt, waitedMs: now() - startedAt, maxWaitMs: waitMs })
   await onStage("CONFIGURING_GUEST", { attempt, waitedMs: now() - startedAt, maxWaitMs: waitMs })
 
   const result = await service.firstBoot({
@@ -255,6 +275,8 @@ export async function runFirstBoot(
 
   // Reading the guest back is a distinct stage: the run has executed, and now
   // every operation is being confirmed from inside the guest.
+  await onStage("VERIFYING_NETWORK", { attempt, waitedMs: now() - startedAt, maxWaitMs: waitMs })
+  await onStage("COLLECTING_METRICS", { attempt, waitedMs: now() - startedAt, maxWaitMs: waitMs })
   await onStage("VERIFYING_GUEST", { attempt, waitedMs: now() - startedAt, maxWaitMs: waitMs })
 
   // `firstBoot` returns either a plan failure (which carries `message`) or a

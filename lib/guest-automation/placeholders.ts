@@ -153,8 +153,12 @@ export function renderTemplate(input: {
   const masked = String(input.template || "").replace(PLACEHOLDER_PATTERN, (_all, rawName: string) => {
     const name = rawName as PlaceholderName
     if (SECRET_PLACEHOLDERS.has(name)) {
-      required.add(name)
-      secrets.push(String(values.PASSWORD ?? ""))
+      const raw = values[name]
+      if (raw === undefined || raw === null || String(raw).trim() === "") {
+        required.add(name)
+        return SECRET_MASK
+      }
+      secrets.push(String(raw))
       return SECRET_MASK
     }
     const raw = values[name]
@@ -187,9 +191,10 @@ export function renderTemplate(input: {
     return { ok: false, masked, resolved: null, stdin: null, errors }
   }
 
-  if (secrets.length) {
-    // A secret-consuming template must read the value from stdin.
-    return { ok: false, masked, resolved: null, stdin: null, errors: ["Secret placeholders require the template's stdin payload."] }
+  if (secrets.length && input.engine === "linux") {
+    // Linux templates must read secrets from stdin (e.g., chpasswd reads from stdin).
+    // Windows commands like `net user` take the password as an argument.
+    return { ok: false, masked, resolved: null, stdin: null, errors: ["Secret placeholders require the template's stdin payload on Linux."] }
   }
 
   return { ok: true, masked, resolved: masked, stdin: null, errors: [] }

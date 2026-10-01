@@ -151,7 +151,11 @@ test("a guest whose image has no agent fails the node and says so", async () => 
   })
   const checks = await measure(client)
   assert.equal(stateOf(checks, "guest_agent"), "fail")
-  assert.match(checks.find((entry) => entry.key === "guest_agent")!.detail, /no working QEMU Guest Agent/)
+  // Now tries all candidates and reports the list. The key assertion is that the
+  // node is failed and the dependent checks are skipped.
+  const detail = checks.find((entry) => entry.key === "guest_agent")!.detail
+  assert.match(detail, /No running guest on this node answered the guest agent/)
+  assert.match(detail, /no candidate answered/)
   // The dependent checks are skipped, never passed.
   for (const key of ["guest_exec", "guest_password", "guest_fsinfo", "guest_network"] as NodeCapability[]) {
     assert.equal(stateOf(checks, key), "skip", `${key} must be skipped, not passed, when the agent is absent`)

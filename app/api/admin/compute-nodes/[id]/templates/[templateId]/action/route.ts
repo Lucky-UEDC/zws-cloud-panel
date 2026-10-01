@@ -6,6 +6,7 @@ import { canAccessAdminApi } from "@/lib/admin-rbac"
 import { createProxmoxClient, PROXMOX_LONG_TIMEOUT_MS } from "@/lib/proxmox"
 import { serializeOperatingSystem } from "@/app/api/admin/os-templates/serializers"
 import { syncSingleNodeOperatingSystems } from "@/lib/os-template-sync"
+import { guestAgentChannelOpen } from "@/lib/proxmox-agent-flag"
 
 export const dynamic = "force-dynamic"
 export const revalidate = 0
@@ -183,7 +184,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
     })
     const config = await client.getVMConfig(node.nodeName, vmid).catch(() => null)
     const agentChannelEnabled = config
-      ? Object.entries(config).some(([key, value]) => /^agent(\d+)?$/i.test(key) && Number(value) === 1)
+      ? guestAgentChannelOpen(config)
       : false
     if (config && !agentChannelEnabled) {
       await client.updateVMConfig(node.nodeName, vmid, { agent: "1" }).catch(() => null)
@@ -193,7 +194,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
       vmid,
       agentChannelEnabledBefore: agentChannelEnabled,
       agentChannelEnabledAfter: refreshed
-        ? Object.entries(refreshed).some(([key, value]) => /^agent(\d+)?$/i.test(key) && Number(value) === 1)
+        ? guestAgentChannelOpen(refreshed)
         : false,
       note: "Guest automation configures the guest through qm guest; the QEMU guest agent must be installed inside the image.",
     }

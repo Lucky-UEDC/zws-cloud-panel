@@ -38,6 +38,7 @@ export type ResolvedOperation = {
   verificationRequired: boolean
   verificationCommand: string | null
   verificationParser: string | null
+  verificationArgs: Record<string, unknown> | null
   successCondition: string | null
   rollbackCommand: string | null
   rollbackArguments: unknown[] | null
@@ -104,6 +105,7 @@ function mapOperation(row: any): ResolvedOperation {
     verificationRequired: row.verificationRequired,
     verificationCommand: row.verificationCommand,
     verificationParser: row.verificationParser,
+    verificationArgs: row.verificationArgs ?? null,
     successCondition: row.successCondition,
     rollbackCommand: row.rollbackCommand,
     rollbackArguments: Array.isArray(row.rollbackArguments) ? row.rollbackArguments : null,
@@ -144,35 +146,85 @@ function toResolved(row: any): ResolvedTemplate {
   }
 }
 
-/** Score a candidate against the detected OS. Higher is better, 0 = no match. */
+/**
+ * Score a candidate against the detected OS, or reject it.
+ *
+ * The one rule that matters: **a profile that states which versions it handles
+ * does not handle the others.** `versionPattern` is the row's own claim about its
+ * scope, so a guest outside that scope is not a weaker match — it is not a match.
+ *
+ * This was found against a real guest. A CentOS 7 clone resolved to the *RHEL 9*
+ * profile, and would have been configured with RHEL 9 commands. It happened
+ * because a version mismatch only cost 100 points while the profiles' priorities
+ * differed by 110: `rhel-9` (declared `^9`, wrong for a CentOS 7 guest) scored
+ * 200+310 = 510 and beat `centos-7` (declared `^7`, exactly right) on 300+200 =
+ * 500. Scoring a mismatch instead of rejecting it means any profile can be
+ * outvoted by a higher-priority profile that does not apply, which for a
+ * configuration layer means running the wrong commands on a customer machine.
+ *
+ * Ranked, strongest claim first:
+ *
+ *   1. the os id is claimed and the version satisfies the declared pattern
+ *   2. the version satisfies the pattern, under an alias id
+ *   3. the os id is claimed but the version could not be checked — a profile whose
+ *      `family` is the detected family is more specific than one that lists the
+ *      id only as an alias
+ *   4. an alias id with no version claim to test
+ */
 export function scoreTemplate(row: any, detected: DetectedOs): { score: number; matchedBy: "os-id" | "version-pattern" | "family" } | null {
   if (row.engine !== detected.engine) return null
 
   const ids = osIdList(row.osIds)
   const osId = (detected.osId || "").toLowerCase()
-  const version = detected.version || ""
+  const version = String(detected.version || "").trim()
 
-  // Version-specific match on the exact os id is the strongest signal.
-  if (osId && ids.includes(osId)) {
-    const pattern = safePattern(row.versionPattern)
-    if (pattern && version) {
-      return pattern.test(version) ? { score: 300 + row.priority, matchedBy: "os-id" } : { score: 200 + row.priority, matchedBy: "os-id" }
-    }
-    return { score: 250 + row.priority, matchedBy: "os-id" }
-  }
-
-  // Alias coverage: an os id may be claimed via prefix (e.g. "rocky" vs
-  // "rocky-linux") without being a literal match.
-  if (osId && ids.some((id) => osId.startsWith(id) || id.startsWith(osId))) {
-    return { score: 150 + row.priority, matchedBy: "family" }
-  }
+  const exactId = Boolean(osId) && ids.includes(osId)
+  const aliasId = Boolean(osId) && ids.some((id) => osId.startsWith(id) || id.startsWith(osId))
+  if (!exactId && !aliasId) return null
 
   const pattern = safePattern(row.versionPattern)
-  if (pattern && version && ids.length === 0) {
-    return pattern.test(version) ? { score: 120 + row.priority, matchedBy: "version-pattern" } : null
-  }
+  const versionKnown = version.length > 0
+  const versionMatches = pattern ? (versionKnown ? pattern.test(version) : null) : null
 
-  return null
+  // Declared scope, enforced. No scoring shortcut past this.
+  if (pattern && versionKnown && !versionMatches) return null
+
+  // Ranked into tiers, with `priority` ordering only *within* a tier.
+  //
+  // Adding priority to a base score lets a far more specific profile be outvoted
+  // by a broader one whenever priorities differ enough — which is the same
+  // failure as the version mismatch above, one level up: a CentOS guest whose
+  // version could not be read landed on whichever RHEL-family profile carried
+  // the highest priority instead of the CentOS one. Specificity decides first;
+  // priority decides between profiles of equal specificity, which is the only
+  // thing a priority number can honestly mean here.
+  const familySpecific = Boolean(row.family) && osFamilyFor(osId) === String(row.family).toLowerCase()
+  const tier = exactId
+    ? versionMatches ? 4 : familySpecific ? 2 : 1
+    : versionMatches ? 3 : 0
+  if (tier === 0 && !aliasId) return null
+
+  const matchedBy: "os-id" | "version-pattern" | "family" = exactId ? "os-id" : versionMatches ? "version-pattern" : "family"
+  return { score: tier * 1000 + (Number(row.priority) || 0), matchedBy }
+}
+
+/**
+ * The family a guest id belongs to, for the specificity tie-break.
+ *
+ * Derived from the id itself rather than from the profile, so it is the same
+ * answer whoever asks. Anything unrecognised maps to its own id, which compares
+ * equal to no profile family and therefore adds no specificity — the correct
+ * outcome for an OS nobody here has an opinion about.
+ */
+function osFamilyFor(osId: string): string {
+  const known: Record<string, string> = {
+    ubuntu: "ubuntu", debian: "debian", centos: "centos", "centos-stream": "centos",
+    rhel: "rhel", redhat: "rhel", ol: "rhel", oracle: "rhel",
+    rocky: "rhel", "rocky-linux": "rhel", almalinux: "rhel", alma: "rhel",
+    fedora: "rhel", opensuse: "suse", sles: "suse", suse: "suse",
+    arch: "arch", archlinux: "arch", alpine: "alpine", kali: "kali",
+  }
+  return known[osId] ?? osId
 }
 
 export async function resolveTemplate(

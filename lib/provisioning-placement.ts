@@ -8,6 +8,7 @@ import { cachedJson } from "@/lib/runtime-cache"
 import { safeJson } from "@/lib/safe-json"
 import { resolveStoragePoolForPurchase } from "@/lib/storage-pools"
 import { provisionBlocked } from "@/lib/compute-node-monitoring"
+import { guestAgentChannelOpen } from "@/lib/proxmox-agent-flag"
 
 const MIN_SAFE_VMID = 100
 const MAX_SAFE_VMID = 999999
@@ -527,9 +528,7 @@ export async function validateProvisioningPreflight(input: PlacementInput) {
   // server through the QEMU guest agent, so the channel being open is what
   // matters. Whether the agent is installed inside the image cannot be checked
   // from the host and is proven on the first clone.
-  const guestAgentChannel = Object.entries((templateConfig as any) || {}).some(
-    ([key, value]) => /^agent(\d+)?$/i.test(key) && Number(value) === 1,
-  )
+  const guestAgentChannel = guestAgentChannelOpen((templateConfig as any) || {})
   checks.push({
     name: "guest_agent",
     ok: guestAgentChannel,

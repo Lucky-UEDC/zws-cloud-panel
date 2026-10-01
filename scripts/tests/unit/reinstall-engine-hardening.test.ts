@@ -18,43 +18,32 @@ test("generateVmHostnames falls back to slug format without ips", () => {
   assert.match(src, /zws\./, "fallback must still produce zws.plan.customer-N format")
 })
 
-test("validateCloudInitPreBoot is exported from cloud-init-config", () => {
-  const src = read("lib/cloud-init-config.ts")
-  assert.match(src, /export function validateCloudInitPreBoot/)
-  assert.match(src, /ipconfig0.*ip=.*gw=|ip=.*gw=.*ipconfig0/, "must check ipconfig0 contains ip= and gw=")
-  assert.match(src, /missing\.push\("ciuser"\)/)
-  assert.match(src, /missing\.push\("cipassword"\)/)
-  assert.match(src, /missing\.push\("nameserver"\)/)
-  assert.match(src, /missing\.push\("searchdomain"\)/)
-  assert.match(src, /missing\.push\("cloudinit_drive"\)/)
+test("no reinstall path checks Cloud-Init fields", () => {
+  // The reinstall flow used to assert that `ciuser`, `cipassword`, `ipconfig0`,
+  // `nameserver` and `searchdomain` were present in the Proxmox config before
+  // booting. None of those are written any more, so the check could only ever
+  // fail, and the module that implemented it has been deleted.
+  // Comments and the two remaining legitimate mentions — disk-key detection that
+  // must keep skipping a legacy cloudinit drive, and a legacy error token for
+  // jobs already in flight — are allowed. What must not exist is a check for
+  // those fields, or a call to a Cloud-Init helper.
+  const strip = (text: string) => text.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "")
+  for (const file of ["lib/provision.ts", "lib/vps-control.ts"]) {
+    const code = strip(read(file))
+    // Word-bounded, so `ciUserForTemplate` (a username picker that merely
+    // contains the substring) is not mistaken for the `ciuser` key.
+    assert.doesNotMatch(code, /\bciuser\b/, `${file} still handles the ciuser key`)
+    assert.doesNotMatch(code, /\bcipassword\b\s*[:=]/, `${file} still writes a cipassword value`)
+    // `normalized === "cipassword"` in the redaction list is a read that protects
+    // logs. It is the only place the string may appear.
+    const redactionOnly = code.match(/cipassword/g) || []
+    assert.ok(redactionOnly.length <= 1, `${file} refers to cipassword outside the redaction list`)
+    assert.doesNotMatch(code, /\b(updateCloudInit|dumpCloudInit|setCloudInit|buildCloudInitConfig|validateCloudInitPreBoot|validateCloudInitDump|applyCloudInitConfig|ensureCloudInitBeforeStart|selfHealBeforeStart)\s*\(/, `${file} still calls a Cloud-Init helper`)
+    assert.doesNotMatch(code, /missing\.push\("ci/, `${file} still checks for a Cloud-Init field`)
+  }
+  // The module that implemented the check is gone, not merely unreferenced.
+  assert.throws(() => read("lib/cloud-init-config.ts"), /ENOENT/)
 })
-
-test("validateCloudInitPreBoot returns ok:false for missing fields", async () => {
-  const { validateCloudInitPreBoot } = await import("../../../lib/cloud-init-config.js")
-  const result = validateCloudInitPreBoot({})
-  assert.equal(result.ok, false)
-  assert.ok(result.missing.includes("ipconfig0"))
-  assert.ok(result.missing.includes("ciuser"))
-  assert.ok(result.missing.includes("cipassword"))
-  assert.ok(result.missing.includes("nameserver"))
-  assert.ok(result.missing.includes("searchdomain"))
-  assert.ok(result.missing.includes("cloudinit_drive"))
-})
-
-test("validateCloudInitPreBoot returns ok:true for valid config", async () => {
-  const { validateCloudInitPreBoot } = await import("../../../lib/cloud-init-config.js")
-  const result = validateCloudInitPreBoot({
-    ipconfig0: "ip=10.0.0.5/24,gw=10.0.0.1",
-    ciuser: "root",
-    cipassword: "secret123",
-    nameserver: "1.1.1.1",
-    searchdomain: "example.com",
-    ide2: "local:cloudinit",
-  })
-  assert.equal(result.ok, true)
-  assert.deepEqual(result.missing, [])
-})
-
 test("hostnameFromIp produces ip-x-x-x-x format", async () => {
   const { hostnameFromIp } = await import("../../../lib/vm-hostname.js")
   assert.equal(hostnameFromIp("10.0.0.5"), "ip-10-0-0-5")

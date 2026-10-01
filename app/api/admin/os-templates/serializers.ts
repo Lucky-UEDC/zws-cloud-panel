@@ -1,6 +1,7 @@
 import { defaultUsernameForOs, normalizeOsTemplate } from "@/lib/os-template-normalization"
 import { isWindowsOsTemplate, osTemplateUnavailableReason } from "@/lib/os-template-availability"
 import { normalizeConsoleType, resolveConsoleType } from "@/lib/console-resolution"
+import { guestAgentChannelOpen } from "@/lib/proxmox-agent-flag"
 
 type AnyRecord = Record<string, any>
 
@@ -18,9 +19,7 @@ export function unsupportedTemplateReason(row: AnyRecord): string | null {
  */
 export function guestAgentChannelEnabled(row: AnyRecord): boolean {
   const config = row?.proxmoxConfig && typeof row.proxmoxConfig === "object" ? row.proxmoxConfig : {}
-  return Object.entries(config as Record<string, unknown>).some(
-    ([key, value]) => /^agent(\d+)?$/i.test(key) && Number(value) === 1,
-  )
+  return guestAgentChannelOpen(config)
 }
 
 function templateWarnings(row: AnyRecord, _isWindows: boolean) {

@@ -1,6 +1,7 @@
 import { prisma } from "@/lib/db"
 import { getOsDescription, getOsFamily } from "@/lib/os-icons"
 import { defaultUsernameForOs, isWindowsTemplateName, normalizeOsFamily, normalizeOsTemplate } from "@/lib/os-template-normalization"
+import { guestAgentChannelOpen as proxmoxGuestAgentChannelOpen } from "@/lib/proxmox-agent-flag"
 
 const FAMILY_LABELS: Record<string, string> = {
   almalinux: "AlmaLinux",
@@ -85,10 +86,12 @@ function nodeMatches(row: any, nodeId?: string | null) {
  */
 export function guestAgentChannelOpen(row: any): boolean {
   const config = row?.proxmoxConfig && typeof row.proxmoxConfig === "object" ? row.proxmoxConfig : null
-  if (!config) return Boolean(row?.cloudInitSupported)
-  return Object.entries(config as Record<string, unknown>).some(
-    ([key, value]) => /^agent(\d+)?$/i.test(key) && Number(value) === 1,
-  )
+  // With no Proxmox config to read, the answer is "not open" rather than a
+  // fallback to the legacy `cloudInitSupported` column. That column records
+  // whether an image shipped with Cloud-Init, which says nothing about whether a
+  // guest agent is present, and a template that is wrongly reported as open
+  // cannot be configured — the failure this whole change exists to remove.
+  return proxmoxGuestAgentChannelOpen(config)
 }
 
 export function osTemplateUnavailableReason(row: any, input: AvailabilityInput = {}) {

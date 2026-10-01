@@ -20,6 +20,7 @@ import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, D
 import { Textarea } from "@/components/ui/textarea"
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu"
 import { bytesToDecimalGb, formatByteRateDecimal, formatBytesDecimal } from "@/lib/format-units"
+import { guestAgentChannelOpen } from "@/lib/proxmox-agent-flag"
 
 type NodeDetail = {
   node: { id: string; name: string; host: string; nodeName: string; location: string | null; lastCheckedAt: string | null }
@@ -341,25 +342,39 @@ function templateStatus(template: Pick<NodeTemplateRow, "isActive" | "isDefault"
  * which recorded that the image shipped with Cloud-Init — useful history, but not
  * evidence that a guest agent is installed. The badge is deliberately split so an
  * admin is never told a template is ready to automate when the host can only
- * prove the channel is open.
+ * prove the channel is open, and so an admin's own claim is never presented as a
+ * probe result.
  */
 function templateGuestAgentBadge(template: Pick<NodeTemplateRow, "cloudInitSupported" | "supportsCloudInit" | "proxmoxConfig">) {
   const config = (template.proxmoxConfig || {}) as Record<string, unknown>
-  const channelEnabled = Object.entries(config).some(([key, value]) => /^agent(\d+)?$/i.test(key) && Number(value) === 1)
+  const channelEnabled = guestAgentChannelOpen(config)
   const verified = Boolean(template.cloudInitSupported ?? template.supportsCloudInit)
 
-  if (channelEnabled && verified) return <Badge variant="default">Verified</Badge>
-  if (channelEnabled) {
+  if (!channelEnabled) {
     return (
-      <Badge variant="secondary" title="The guest agent channel is enabled on this template, but the image has not been verified to carry a working QEMU Guest Agent.">
-        Unverified
+      <Badge variant="destructive" title="No guest agent channel is enabled on this template. Guest automation cannot configure servers cloned from it.">
+        No channel
       </Badge>
     )
   }
+  // The channel is a fact. Whether the agent binary is installed in the image is
+  // not knowable from the host, so an admin's own claim about that is shown as a
+  // claim and never as a probe result.
   return (
-    <Badge variant="destructive" title="No guest agent channel is enabled on this template. Guest automation cannot configure servers cloned from it.">
-      Missing
-    </Badge>
+    <span className="inline-flex items-center gap-1">
+      <Badge variant="default" title="Proxmox reports agent=1 on this template, so the channel is open. Whether an agent is installed in the image is proven on the first clone.">
+        Channel open
+      </Badge>
+      {verified ? (
+        <Badge variant="outline" title="An administrator has marked this template as carrying a working QEMU Guest Agent. This is a claim recorded against the template, not a probe; the first clone proves it.">
+          Agent claimed
+        </Badge>
+      ) : (
+        <Badge variant="secondary" title="The channel is open, but nobody has claimed the image carries a working agent. It will be proven on the first clone.">
+          Agent unproven
+        </Badge>
+      )}
+    </span>
   )
 }
 

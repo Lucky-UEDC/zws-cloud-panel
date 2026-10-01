@@ -89,7 +89,6 @@ test("every remaining Cloud-Init reference in the repo is a read, a label, or a 
   const allowed = new Map<string, string>([
     // -- legacy reads of pre-adoption VM state --------------------------------
     ["lib/proxmox.ts", "the client methods themselves, kept for read-only legacy inspection"],
-    ["lib/cloud-init-config.ts", "the legacy builder, retained for old template baking and display"],
     ["lib/vm-ip-discovery.ts", "reads a legacy ipconfig0 when reconciling pre-adoption VMs"],
     ["lib/admin-vm-management.ts", "reads a legacy ipconfig0 to display a VM's configured address"],
     ["lib/production-vps-reconciliation.ts", "reads legacy ipconfig0 to reconcile pre-adoption VMs"],
@@ -112,7 +111,7 @@ test("every remaining Cloud-Init reference in the repo is a read, a label, or a 
     // -- documentation of the removal itself ----------------------------------
     ["lib/guest-automation/first-boot.ts", "comments describing the host/guest split that replaced it"],
     ["lib/vps-control.ts", "none — asserted to be clean below"],
-    ["lib/proxmox-console-repair.ts", "a recorded diagnostic explaining the path was removed"],
+    ["lib/proxmox-console-repair.ts", "recorded diagnostics explaining the two repair paths that were removed"],
     ["lib/vm-runtime-health.ts", "comments describing the replacement"],
     ["lib/vm-network-orchestrator.ts", "none — asserted to be clean below"],
     ["app/api/admin/compute-nodes/[id]/templates/[templateId]/action/route.ts", "comments describing the replaced action"],
@@ -121,6 +120,10 @@ test("every remaining Cloud-Init reference in the repo is a read, a label, or a 
     ["app/admin/compute-nodes/[id]/page.tsx", "the legacy cloudInitSupported column, relabelled as guest-agent readiness"],
     ["lib/provisioning-placement.ts", "a comment describing the check that replaced the Cloud-Init one"],
     ["lib/guest-automation/adoption.ts", "a comment explaining which servers predate the removal"],
+    // -- cross-OS guard tokens ----------------------------------------------------
+    ["lib/guest-automation/constants.ts", "Linux-only tokens (cloud-init, cloudinit) that Windows must reject"],
+    // -- shared Proxmox agent flag helper ----------------------------------------
+    ["lib/proxmox-agent-flag.ts", "reads the Proxmox agent flag; no Cloud-Init writes"],
   ])
 
   const offenders: string[] = []

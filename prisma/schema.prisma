@@ -5067,7 +5067,7 @@ model OsTemplate {
   proxmoxNode         ProxmoxNode?  @relation(fields: [proxmoxNodeId], references: [id])
   vpsInstances        VpsInstance[]
 
-  guestOsTemplate GuestOSTemplate?
+  guestOsTemplates GuestOSTemplate[]
   guestAdoption   VmGuestAdoption[]
 
   @@unique([proxmoxNodeId, proxmoxStorage, proxmoxVolumeId])
@@ -5108,7 +5108,13 @@ model GuestOSTemplate {
   version            Int                      @default(1)
   lastTestedAt       DateTime?                @map("last_tested_at")
   lastTestResult     Json?                    @map("last_test_result")
-  osTemplateId       String?                  @unique @map("os_template_id")
+  /// The Proxmox catalogue template this profile is proven against.
+  ///
+  /// Many-to-one, not one-to-one: one Proxmox template named `Windows Latest`
+  /// backs the 2019, 2022 and 2025 guest profiles, and one `CentOS-8` image
+  /// backs more than one RHEL-family profile. A unique constraint here made the
+  /// link impossible to express and would have left most profiles unlinked.
+  osTemplateId       String?                  @map("os_template_id")
   createdAt          DateTime                 @default(now())
   updatedAt          DateTime                 @updatedAt
   operations         GuestOperationTemplate[]
