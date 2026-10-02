@@ -75,6 +75,39 @@ prisma_validate_migrations() {
   ./node_modules/.bin/tsx scripts/validate-migrations.ts
 }
 
+# True when the target database holds no application tables, i.e. a fresh
+# install. Detected from the data itself rather than a flag, so it can never
+# trigger against a populated database.
+database_is_fresh() {
+  local url count
+  url="${DATABASE_URL%%\?*}"   # psql rejects the ?schema= query string
+  count=$(psql "$url" -tAc \
+    "SELECT count(*) FROM pg_tables WHERE schemaname='public' AND tablename <> '_prisma_migrations';" \
+    2>/dev/null | tr -d '[:space:]' || echo "")
+  [[ "$count" == "0" ]]
+}
+
+# A fresh install cannot replay migrations in order: the earliest ones
+# (e.g. 0_multi_disk_storage) reference tables that a later migration creates,
+# so `migrate deploy` dies with "relation does not exist". Create the current
+# schema from schema.prisma instead, then record every existing migration as
+# already applied so _prisma_migrations stays consistent for future deploys.
+bootstrap_fresh_database() {
+  log "Fresh database detected - creating schema from prisma/schema.prisma"
+
+  ./node_modules/.bin/prisma db push --accept-data-loss --skip-generate
+
+  local migrations=0
+  local name
+  while read -r name; do
+    [[ -n "$name" ]] || continue
+    ./node_modules/.bin/prisma migrate resolve --applied "$name" >/dev/null 2>&1 || true
+    migrations=$((migrations + 1))
+  done < <(find prisma/migrations -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sort)
+
+  log "Recorded ${migrations} existing migration(s) as applied"
+}
+
 strict_integrations() {
   if [[ "${ZWS_STARTUP_STRICT:-1}" == "1" ]]; then
     ./node_modules/.bin/tsx scripts/docker-strict-integrations.ts
@@ -116,6 +149,9 @@ seed_uploads() {
 case "${1:-app}" in
   migrate)
     prepare_runtime
+    if database_is_fresh; then
+      bootstrap_fresh_database
+    fi
     log "deploying Prisma migrations"
     ./node_modules/.bin/prisma migrate deploy
     prisma_validate_migrations

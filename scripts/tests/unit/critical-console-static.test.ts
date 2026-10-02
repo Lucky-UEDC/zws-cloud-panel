@@ -15,7 +15,10 @@ test("Docker worker owns the console proxy and exposes health", () => {
 
   assert.match(compose, /command: \["worker"\]/)
   assert.match(compose, /WORKER_HEALTH_PORT/)
-  assert.match(nginx, /server worker:3001/)
+  // Nginx must route the console proxy at the worker's port. This is expressed
+  // as a per-request resolved variable rather than an `upstream` block so a
+  // recreated worker container is picked up without a manual nginx reload.
+  assert.match(nginx, /worker:3001/)
   assert.match(worker, /CONSOLE_PROXY_EMBEDDED === "1"/)
   assert.match(worker, /scripts\/vnc-proxy-server\.ts/)
   assert.match(supervisor, /\/api\/health/)

@@ -145,5 +145,39 @@ test("validation enforces OTP button rules and variable example counts", () => {
 test("migrations folder contains no ad hoc schema push", () => {
   const dockerEntry = read("docker-entrypoint.sh")
   assert.match(dockerEntry, /prisma migrate deploy/)
-  assert.doesNotMatch(dockerEntry, /db push/)
+
+  // `db push` is permitted in exactly one place: the fresh-install bootstrap.
+  // A fresh database cannot replay migrations in order, so the schema is created
+  // from schema.prisma and the existing migrations are then baselined. It is
+  // gated on the database being empty (zero application tables), which is
+  // detected from the data itself, so it can never run against production or
+  // any populated database. It still executes through the compose `migrate`
+  // service, never as an ad hoc production push.
+  const pushLines = dockerEntry
+    .split("\n")
+    .map((line, i) => ({ line, n: i + 1 }))
+    .filter(({ line }) => /db push/.test(line))
+
+  assert.ok(pushLines.length > 0, "fresh-install bootstrap should use db push")
+
+  const lines = dockerEntry.split("\n")
+  for (const { n } of pushLines) {
+    // Nearest preceding function definition, not the first one in the file.
+    const defs: number[] = []
+    for (let i = 0; i < n - 1; i++) {
+      if (/^[a-z_]+\(\) \{/.test(lines[i]!)) defs.push(i)
+    }
+    const fnName = lines[defs[defs.length - 1] ?? -1]?.trim().split("(")[0]
+    assert.equal(
+      fnName,
+      "bootstrap_fresh_database",
+      `db push on line ${n} must only appear inside bootstrap_fresh_database (found ${fnName})`
+    )
+  }
+
+  // The bootstrap must stay behind the emptiness check in the migrate case.
+  assert.match(dockerEntry, /if database_is_fresh; then\s*\n\s*bootstrap_fresh_database\s*\n\s*fi/)
+
+  // Never reset the database outright.
+  assert.doesNotMatch(dockerEntry, /migrate reset/)
 })

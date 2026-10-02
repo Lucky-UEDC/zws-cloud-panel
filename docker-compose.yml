@@ -77,6 +77,11 @@ x-zws-service: &zws-service
     - zws_backups:/app/backups
     - zws_reports:/app/deployment-reports
     - zws_uploads:/app/uploads
+    # Release archives are mounted rather than baked into the image so that
+    # publishing a new release does not require rebuilding the app image.
+    # Next.js standalone chdirs into .next/standalone, which is where the
+    # /api/install/release routes resolve public/releases from.
+    - ./public/releases:/app/.next/standalone/public/releases:ro
   depends_on:
     redis:
       condition: service_healthy
@@ -293,8 +298,9 @@ services:
     volumes:
       - ./config/nginx/docker.conf:/etc/nginx/templates/default.conf.template:ro
       - ${SSL_CERT_DIR:-./certs}:/etc/nginx/certs:ro
+      - ${ACME_WEBROOT_DIR:-/var/www/html}:/var/www/html:ro
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/api/health >/dev/null"]
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/nginx-health >/dev/null"]
       interval: 20s
       timeout: 10s
       retries: 10
