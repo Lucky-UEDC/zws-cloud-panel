@@ -1,5 +1,7 @@
 import nodemailer from "nodemailer"
-import type { Attachment } from "nodemailer/lib/mailer"
+// nodemailer 10 removed lib/ and re-exports the mail types from the package
+// root; the old deep "nodemailer/lib/mailer" path no longer resolves.
+import type { Attachment } from "nodemailer"
 import { createPanelLog } from "@/lib/panel-log"
 import { getEmailConfig, publicToLegacySmtp, type EmailConfigResolved } from "@/lib/email/config"
 import { recordEmailLog } from "@/lib/email/log"
