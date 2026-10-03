@@ -19,7 +19,10 @@ const securityHeaders = [
       "font-src 'self' data:",
       "script-src 'self' 'unsafe-inline' https://sdk.cashfree.com https://checkout.razorpay.com https://cdn.razorpay.com https://www.googletagmanager.com https://www.google-analytics.com https://challenges.cloudflare.com https://static.cloudflareinsights.com",
       "style-src 'self' 'unsafe-inline'",
-      "connect-src 'self' https://api.cashfree.com https://sandbox.cashfree.com https://api.phonepe.com https://api-preprod.phonepe.com https://secure.phonepe.com https://mercury.phonepe.com https://api.razorpay.com https://checkout.razorpay.com https://cdn.razorpay.com https://www.google-analytics.com https://www.google.com https://challenges.cloudflare.com https://static.cloudflareinsights.com https://cloudflareinsights.com wss:",
+      // lumberjack.razorpay.com is Razorpay Checkout's own event/log endpoint
+      // (called by checkout.js on modal open). It is connect-src only: never
+      // needed by script-src, frame-src or img-src.
+      "connect-src 'self' https://api.cashfree.com https://sandbox.cashfree.com https://api.phonepe.com https://api-preprod.phonepe.com https://secure.phonepe.com https://mercury.phonepe.com https://api.razorpay.com https://checkout.razorpay.com https://cdn.razorpay.com https://lumberjack.razorpay.com https://www.google-analytics.com https://www.google.com https://challenges.cloudflare.com https://static.cloudflareinsights.com https://cloudflareinsights.com wss:",
     ].join("; "),
   },
   { key: "X-Frame-Options", value: "DENY" },
