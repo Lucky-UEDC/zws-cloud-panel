@@ -57,7 +57,9 @@ tsconfig.tsbuildinfo
 *.log
 *.log.*
 logs/
-uploads
+# Root-anchored: runtime upload dirs stay ignored, but app/uploads/ is app
+# source (the /uploads/[...slug] route handler) and must stay trackable.
+/uploads
 core
 core.*
 npm-debug.log*
