@@ -28,7 +28,8 @@ export const CANCELLED_INVOICE_STATUSES = ["cancelled", "failed", "expired"] as 
 export type DateRange = {
   start?: Date | null
   end?: Date | null
-  field?: "createdAt" | "paidAt" | "completedAt"
+  // GatewaySettlement records its date in settledAt rather than completedAt.
+  field?: "createdAt" | "paidAt" | "completedAt" | "settledAt"
 }
 
 export function money(value: unknown) {

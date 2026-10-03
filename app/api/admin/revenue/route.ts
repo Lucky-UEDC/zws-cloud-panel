@@ -261,7 +261,13 @@ export async function GET(request: NextRequest) {
     }).catch(() => []),
 
     prisma.gatewaySettlement.findMany({
-      where: { status: "completed", ...completedDateWhere },
+      // GatewaySettlement records the settlement date in settledAt; there is no
+      // completedAt column on this model, so reuse the shared completedAt range
+      // would fail validation and silently drop gateway settlement fees.
+      where: {
+        status: "completed",
+        ...dateRangeWhere({ start: window.start, end: window.end, field: "settledAt" }),
+      },
       select: { feeAmount: true, createdAt: true },
     }).catch(() => []),
 
